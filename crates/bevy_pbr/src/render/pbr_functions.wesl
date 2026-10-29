@@ -20,7 +20,7 @@ import package::{
     ssr::raymarch,
 };
 import package::render::mesh_view_bindings::globals;
-import package::render::view_transformations::{position_world_to_ndc};
+import package::render::view_transformations::{position_world_to_ndc, position_ndc_to_world};
 import bevy_render::maths::{E, powsafe};
 
 @if(STANDARD_MATERIAL_SPECULAR_TRANSMISSION) import package::transmission;
@@ -317,7 +317,14 @@ fn calculate_contact_shadow(
 
     let rm_result = raymarch::depth_ray_march_march(&rm);
     if rm_result.hit {
-        return clamp((rm_result.hit_penetration_frac - 0.5) / (1.0 - 0.5), 0.0, 1.0);
+        let visibility = clamp((rm_result.hit_penetration_frac - 0.5) / (1.0 - 0.5), 0.0, 1.0);
+        // MPS: fade by the hit's world distance along the ray (hit_t interpolates the clipped NDC ends, not
+        // metres): tight contacts stay dark, blockers further along, the hard lines a soft light would not
+        // draw, fade out by the end of the ray.
+        let hit = position_ndc_to_world(mix(rm.ray_start_cs, rm.ray_end_cs, rm_result.hit_t));
+        let along = max(dot(hit - world_position, light_dir), 0.0);
+        let weight = 1.0 - smoothstep(0.0, view_bindings::contact_shadows_settings.length, along);
+        return 1.0 - weight * (1.0 - visibility);
     }
     return 1.0;
 }
