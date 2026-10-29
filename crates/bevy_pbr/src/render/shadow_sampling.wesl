@@ -271,6 +271,126 @@ fn sample_shadow_map(
     return 0.0;
 }
 
+// MPS: receiver-plane PCSS. `depth_gradient` is d(depth)/d(shadow uv) of the receiver's plane, so a tap at
+// offset o compares with depth + dot(depth_gradient, o): a tilted receiver no longer finds its own texels as
+// blockers (the self-shadowing combs of grazing light) far from the centre. Each tap's hardware 2x2 PCF still
+// compares its four texels with one depth, so a small constant bias stays.
+
+/// The receiver plane's depth at a tap. The offset is measured to the uv the sampler actually reads (it clamps to
+/// the map's edge), and the depth is kept within [depth / 2, 2 depth]: far along a steep plane the extrapolation can
+/// leave the forward half-space, and a negative depth would take the empty map as a blocker.
+fn plane_tap_depth(light_local: vec2<f32>, depth: f32, depth_gradient: vec2<f32>, offset: vec2<f32>) -> f32 {
+    let read_offset = clamp(light_local + offset, vec2(0.0), vec2(1.0)) - light_local;
+    return clamp(depth + dot(depth_gradient, read_offset), 0.5 * depth, 2.0 * depth);
+}
+
+fn search_for_blockers_in_shadow_map_plane(
+    light_local: vec2<f32>,
+    depth: f32,
+    depth_gradient: vec2<f32>,
+    array_index: i32,
+    texel_size: f32,
+    search_size: f32,
+) -> f32 {
+    let shadow_map_size = vec2<f32>(textureDimensions(view_bindings::directional_shadow_textures));
+    let uv_offset_scale = search_size / (texel_size * shadow_map_size);
+
+    let offset0 = D3D_SAMPLE_POINT_POSITIONS[0] * uv_offset_scale;
+    let offset1 = D3D_SAMPLE_POINT_POSITIONS[1] * uv_offset_scale;
+    let offset2 = D3D_SAMPLE_POINT_POSITIONS[2] * uv_offset_scale;
+    let offset3 = D3D_SAMPLE_POINT_POSITIONS[3] * uv_offset_scale;
+    let offset4 = D3D_SAMPLE_POINT_POSITIONS[4] * uv_offset_scale;
+    let offset5 = D3D_SAMPLE_POINT_POSITIONS[5] * uv_offset_scale;
+    let offset6 = D3D_SAMPLE_POINT_POSITIONS[6] * uv_offset_scale;
+    let offset7 = D3D_SAMPLE_POINT_POSITIONS[7] * uv_offset_scale;
+
+    var sum = vec2(0.0);
+    sum += search_for_blockers_in_shadow_map_hardware(
+        light_local + offset0, plane_tap_depth(light_local, depth, depth_gradient, offset0), array_index);
+    sum += search_for_blockers_in_shadow_map_hardware(
+        light_local + offset1, plane_tap_depth(light_local, depth, depth_gradient, offset1), array_index);
+    sum += search_for_blockers_in_shadow_map_hardware(
+        light_local + offset2, plane_tap_depth(light_local, depth, depth_gradient, offset2), array_index);
+    sum += search_for_blockers_in_shadow_map_hardware(
+        light_local + offset3, plane_tap_depth(light_local, depth, depth_gradient, offset3), array_index);
+    sum += search_for_blockers_in_shadow_map_hardware(
+        light_local + offset4, plane_tap_depth(light_local, depth, depth_gradient, offset4), array_index);
+    sum += search_for_blockers_in_shadow_map_hardware(
+        light_local + offset5, plane_tap_depth(light_local, depth, depth_gradient, offset5), array_index);
+    sum += search_for_blockers_in_shadow_map_hardware(
+        light_local + offset6, plane_tap_depth(light_local, depth, depth_gradient, offset6), array_index);
+    sum += search_for_blockers_in_shadow_map_hardware(
+        light_local + offset7, plane_tap_depth(light_local, depth, depth_gradient, offset7), array_index);
+
+    if (sum.y == 0.0) {
+        return 0.0;
+    }
+    return sum.x / sum.y;
+}
+
+fn sample_shadow_map_jimenez_fourteen_plane(
+    light_local: vec2<f32>,
+    depth: f32,
+    depth_gradient: vec2<f32>,
+    array_index: i32,
+    frag_coord_xy: vec2<f32>,
+    texel_size: f32,
+    blur_size: f32,
+    temporal: bool,
+) -> f32 {
+    let rotation_matrix = random_rotation_matrix(frag_coord_xy, temporal);
+    let uv_offset_scale = calculate_uv_offset_scale_jimenez_fourteen(texel_size, blur_size);
+
+    let sample_offset0 = (rotation_matrix * utils::SPIRAL_OFFSET_0_) * uv_offset_scale;
+    let sample_offset1 = (rotation_matrix * utils::SPIRAL_OFFSET_1_) * uv_offset_scale;
+    let sample_offset2 = (rotation_matrix * utils::SPIRAL_OFFSET_2_) * uv_offset_scale;
+    let sample_offset3 = (rotation_matrix * utils::SPIRAL_OFFSET_3_) * uv_offset_scale;
+    let sample_offset4 = (rotation_matrix * utils::SPIRAL_OFFSET_4_) * uv_offset_scale;
+    let sample_offset5 = (rotation_matrix * utils::SPIRAL_OFFSET_5_) * uv_offset_scale;
+    let sample_offset6 = (rotation_matrix * utils::SPIRAL_OFFSET_6_) * uv_offset_scale;
+    let sample_offset7 = (rotation_matrix * utils::SPIRAL_OFFSET_7_) * uv_offset_scale;
+
+    var sum = 0.0;
+    sum += sample_shadow_map_hardware(
+        light_local + sample_offset0, plane_tap_depth(light_local, depth, depth_gradient, sample_offset0), array_index);
+    sum += sample_shadow_map_hardware(
+        light_local + sample_offset1, plane_tap_depth(light_local, depth, depth_gradient, sample_offset1), array_index);
+    sum += sample_shadow_map_hardware(
+        light_local + sample_offset2, plane_tap_depth(light_local, depth, depth_gradient, sample_offset2), array_index);
+    sum += sample_shadow_map_hardware(
+        light_local + sample_offset3, plane_tap_depth(light_local, depth, depth_gradient, sample_offset3), array_index);
+    sum += sample_shadow_map_hardware(
+        light_local + sample_offset4, plane_tap_depth(light_local, depth, depth_gradient, sample_offset4), array_index);
+    sum += sample_shadow_map_hardware(
+        light_local + sample_offset5, plane_tap_depth(light_local, depth, depth_gradient, sample_offset5), array_index);
+    sum += sample_shadow_map_hardware(
+        light_local + sample_offset6, plane_tap_depth(light_local, depth, depth_gradient, sample_offset6), array_index);
+    sum += sample_shadow_map_hardware(
+        light_local + sample_offset7, plane_tap_depth(light_local, depth, depth_gradient, sample_offset7), array_index);
+    return sum / 8.0;
+}
+
+/// `sample_shadow_map_pcss` with the receiver plane's depth at every tap (spot lights).
+fn sample_shadow_map_pcss_plane(
+    light_local: vec2<f32>,
+    depth: f32,
+    depth_gradient: vec2<f32>,
+    array_index: i32,
+    frag_coord_xy: vec2<f32>,
+    texel_size: f32,
+    light_size: f32,
+) -> f32 {
+    let z_blocker = search_for_blockers_in_shadow_map_plane(
+        light_local, depth, depth_gradient, array_index, texel_size, light_size);
+    let blur_size = max((z_blocker - depth) * light_size / depth, 0.5);
+    @if(SHADOW_FILTER_METHOD_TEMPORAL)
+    return sample_shadow_map_jimenez_fourteen_plane(
+        light_local, depth, depth_gradient, array_index, frag_coord_xy, texel_size, blur_size, true);
+    @else
+    return sample_shadow_map_jimenez_fourteen_plane(
+        light_local, depth, depth_gradient, array_index, frag_coord_xy, texel_size, blur_size, false);
+}
+
 /// Samples the shadow map for a directional light when percentage-closer soft
 /// shadows are being used.
 ///

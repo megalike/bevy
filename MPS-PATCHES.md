@@ -25,3 +25,4 @@ of a Bevy release. Everything else is Bevy as released. MPS's rules for this for
 
 | Patch | Kind | Crate | What | Upstream |
 | --- | --- | --- | --- | --- |
+| Receiver-plane depth for spot-light PCSS | fix | bevy_pbr | Every blocker-search and filter tap of spot-light PCSS compares with the receiver plane's depth at the uv it reads, not one depth for all taps: grazing-lit walls no longer show self-shadowing combs. Forward rendering only (Bevy's deferred lighting pass has the normal-mapped normal and keeps one depth); the plane comes from the interpolated vertex normal | not filed (candidate after a minimal repro and deferred and smooth-mesh coverage) |

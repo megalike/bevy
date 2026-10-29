@@ -3,7 +3,7 @@ import package::render::{
     mesh_view_bindings as view_bindings,
     shadow_sampling::{
         SPOT_SHADOW_TEXEL_SIZE, sample_shadow_cubemap, sample_shadow_cubemap_pcss,
-        sample_shadow_map, sample_shadow_map_pcss,
+        sample_shadow_map, sample_shadow_map_pcss, sample_shadow_map_pcss_plane,
     }
 };
 
@@ -112,9 +112,30 @@ fn fetch_spot_shadow(
     // If soft shadows are enabled, use the PCSS path.
     let array_index = i32(light_id) + view_bindings::lights.spot_light_shadowmap_offset;
     if ((*light).soft_shadow_size > 0.0) {
-        return sample_shadow_map_pcss(
+        // MPS: the receiver plane n.p = c in light view space. A point of it seen at shadow NDC s has
+        // 1 / w = (t n.x s.x + t n.y s.y - n.z) / c (t: the tangent of the cone, w = -z), so its depth
+        // near_z / w is linear in s; uv = (s.x, -s.y) / 2 + 1/2.
+        // The deferred lighting pass gets the normal-mapped N as its world normal, not the geometry's plane: no
+        // correction there (taps compare with one depth, as before).
+        var depth_gradient = vec2(0.0);
+        @if(!DEFERRED_LIGHTING_PIPELINE) {
+        let n = surface_normal.xyz * light_inv_rot;
+        let c = dot(n, projected_position);
+        let t = (*light).spot_light_tan_angle;
+        if (abs(c) > 1e-6) {
+            depth_gradient = vec2(2.0, -2.0) * (near_z * t / c) * n.xy;
+            // Edge-on to the light the plane says little: limit the slope (to about 84 degrees on the light's axis).
+            let limit = 20.0 * t * depth;
+            let len = length(depth_gradient);
+            if (len > limit) {
+                depth_gradient *= limit / len;
+            }
+        }
+        }
+        return sample_shadow_map_pcss_plane(
             shadow_uv,
             depth,
+            depth_gradient,
             array_index,
             frag_coord_xy,
             SPOT_SHADOW_TEXEL_SIZE,
