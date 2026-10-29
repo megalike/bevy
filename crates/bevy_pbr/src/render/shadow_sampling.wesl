@@ -370,6 +370,14 @@ fn sample_shadow_map_jimenez_fourteen_plane(
     return sum / 8.0;
 }
 
+/// MPS: the smallest penumbra of spot-light PCSS with the receiver plane, in `blur_size` units (an outer tap
+/// radius of about 3.7 shadow-map texels, against Bevy's 0.5, about 0.9 texels). Like EEVEE's per-light shadow filter
+/// radius it is an antialiasing control, not a physical penumbra: it softens casters a texel or two wide, which a wide
+/// spot's map otherwise draws as aliased streaks, and also softens real contacts by that footprint. The receiver-plane
+/// taps keep the wider filter mostly free of self-shadowing (not where a plane clamp acts). Callers without the plane
+/// (Bevy's deferred lighting pass) pass Bevy's 0.5.
+const SPOT_PCSS_MIN_BLUR: f32 = 2.0;
+
 /// `sample_shadow_map_pcss` with the receiver plane's depth at every tap (spot lights).
 fn sample_shadow_map_pcss_plane(
     light_local: vec2<f32>,
@@ -379,10 +387,11 @@ fn sample_shadow_map_pcss_plane(
     frag_coord_xy: vec2<f32>,
     texel_size: f32,
     light_size: f32,
+    min_blur: f32,
 ) -> f32 {
     let z_blocker = search_for_blockers_in_shadow_map_plane(
         light_local, depth, depth_gradient, array_index, texel_size, light_size);
-    let blur_size = max((z_blocker - depth) * light_size / depth, 0.5);
+    let blur_size = max((z_blocker - depth) * light_size / depth, min_blur);
     @if(SHADOW_FILTER_METHOD_TEMPORAL)
     return sample_shadow_map_jimenez_fourteen_plane(
         light_local, depth, depth_gradient, array_index, frag_coord_xy, texel_size, blur_size, true);

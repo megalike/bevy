@@ -3,7 +3,7 @@ import package::render::{
     mesh_view_bindings as view_bindings,
     shadow_sampling::{
         SPOT_SHADOW_TEXEL_SIZE, sample_shadow_cubemap, sample_shadow_cubemap_pcss,
-        sample_shadow_map, sample_shadow_map_pcss, sample_shadow_map_pcss_plane,
+        sample_shadow_map, sample_shadow_map_pcss, sample_shadow_map_pcss_plane, SPOT_PCSS_MIN_BLUR,
     }
 };
 
@@ -118,7 +118,9 @@ fn fetch_spot_shadow(
         // The deferred lighting pass gets the normal-mapped N as its world normal, not the geometry's plane: no
         // correction there (taps compare with one depth, as before).
         var depth_gradient = vec2(0.0);
+        var min_blur = 0.5;
         @if(!DEFERRED_LIGHTING_PIPELINE) {
+        min_blur = SPOT_PCSS_MIN_BLUR;
         let n = surface_normal.xyz * light_inv_rot;
         let c = dot(n, projected_position);
         let t = (*light).spot_light_tan_angle;
@@ -140,6 +142,7 @@ fn fetch_spot_shadow(
             frag_coord_xy,
             SPOT_SHADOW_TEXEL_SIZE,
             (*light).soft_shadow_size,
+            min_blur,
         );
     }
 
