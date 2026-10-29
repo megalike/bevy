@@ -21,7 +21,7 @@ import package::{
 };
 import package::render::mesh_view_bindings::globals;
 import package::render::view_transformations::{position_world_to_ndc, position_ndc_to_world};
-import bevy_render::maths::{E, powsafe};
+import bevy_render::maths::{E, PI, orthonormalize, powsafe};
 
 @if(STANDARD_MATERIAL_SPECULAR_TRANSMISSION) import package::transmission;
 
@@ -291,6 +291,8 @@ fn calculate_contact_shadow(
     frag_coord: vec2<f32>,
     light_dir: vec3<f32>,
     contact_shadow_steps: u32,
+    light_sin_angular_radius: f32,
+    light_index: u32,
 ) -> f32 {
     @if(BLUE_NOISE_TEXTURE)
     let noise_size = textureDimensions(view_bindings::blue_noise_texture, 0);
@@ -306,10 +308,28 @@ fn calculate_contact_shadow(
     @else
     let noise = utils::interleaved_gradient_noise(frag_coord, view_bindings::globals.frame_count);
 
+    // MPS: a light with a size is not one direction. With soft shadows, each pixel and frame marches towards one
+    // point of the light sphere's apparent disc (`light_sin_angular_radius` = radius / distance), uniform in solid
+    // angle, and TAA averages these into a penumbra as wide as the light makes it. The two random numbers come from a
+    // PCG stream per pixel, frame and light, independent of each other and of the march jitter.
+    var ray_dir = light_dir;
+    if light_sin_angular_radius > 0.0 {
+        var rng = (u32(frag_coord.x) * 1973u + u32(frag_coord.y) * 9277u
+            + view_bindings::globals.frame_count * 26699u + light_index * 104729u) | 1u;
+        let u = utils::rand_vec2f(&rng);
+        // 1 - cos(theta) up to 1 - cos(max) = s^2 / (1 + sqrt(1 - s^2)): stable for small apparent sizes.
+        let s2 = light_sin_angular_radius * light_sin_angular_radius;
+        let one_minus_cos = u.x * s2 / (1.0 + sqrt(1.0 - s2));
+        let cos_theta = 1.0 - one_minus_cos;
+        let sin_theta = sqrt(max(one_minus_cos * (2.0 - one_minus_cos), 0.0));
+        let phi = 2.0 * PI * u.y;
+        ray_dir = orthonormalize(light_dir) * vec3(sin_theta * cos(phi), sin_theta * sin(phi), cos_theta);
+    }
+
     let depth_size = vec2<f32>(textureDimensions(view_bindings::depth_prepass_texture));
     var rm = raymarch::depth_ray_march_new_from_depth(depth_size);
     raymarch::depth_ray_march_from_cs(&rm, position_world_to_ndc(world_position));
-    raymarch::depth_ray_march_to_ws(&rm, world_position + light_dir * view_bindings::contact_shadows_settings.length);
+    raymarch::depth_ray_march_to_ws(&rm, world_position + ray_dir * view_bindings::contact_shadows_settings.length);
     rm.linear_steps = contact_shadow_steps;
     rm.depth_thickness_linear_z = view_bindings::contact_shadows_settings.thickness;
     rm.march_behind_surfaces = true;
@@ -322,7 +342,7 @@ fn calculate_contact_shadow(
         // metres): tight contacts stay dark, blockers further along, the hard lines a soft light would not
         // draw, fade out by the end of the ray.
         let hit = position_ndc_to_world(mix(rm.ray_start_cs, rm.ray_end_cs, rm_result.hit_t));
-        let along = max(dot(hit - world_position, light_dir), 0.0);
+        let along = max(dot(hit - world_position, ray_dir), 0.0);
         let weight = 1.0 - smoothstep(0.0, view_bindings::contact_shadows_settings.length, along);
         return 1.0 - weight * (1.0 - visibility);
     }
@@ -491,8 +511,20 @@ fn apply_pbr_lighting(
         if contact_shadow_enabled && (in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u && shadow > 0.0 &&
                 (view_bindings::clustered_lights.data[light_id].flags &
                     mesh_view_types::POINT_LIGHT_FLAGS_CONTACT_SHADOWS_ENABLED_BIT) != 0u {
-            let L = normalize(view_bindings::clustered_lights.data[light_id].position_radius.xyz - in.world_position.xyz);
-            shadow *= calculate_contact_shadow(in.world_position.xyz, in.frag_coord.xy, L, contact_shadow_steps);
+            let to_light = view_bindings::clustered_lights.data[light_id].position_radius.xyz - in.world_position.xyz;
+            let light_distance = max(length(to_light), 1e-4);
+            let L = to_light / light_distance;
+            // Soft only for a light with soft shadows (its size) and temporal filtering (TAA averages the rays);
+            // inside the light's sphere there is no disc to sample.
+            var sin_angular_radius = 0.0;
+            @if(SHADOW_FILTER_METHOD_TEMPORAL) {
+            let soft_size = view_bindings::clustered_lights.data[light_id].soft_shadow_size;
+            if soft_size > 0.0 && soft_size < light_distance {
+                sin_angular_radius = soft_size / light_distance;
+            }
+            }
+            shadow *= calculate_contact_shadow(in.world_position.xyz, in.frag_coord.xy, L, contact_shadow_steps,
+                sin_angular_radius, light_id);
         }
 
         let light_contrib = lighting::point_light(light_id, &lighting_input, enable_diffuse, true);
@@ -552,8 +584,20 @@ fn apply_pbr_lighting(
         if contact_shadow_enabled && (in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u && shadow > 0.0 &&
                 (view_bindings::clustered_lights.data[light_id].flags &
                     mesh_view_types::POINT_LIGHT_FLAGS_CONTACT_SHADOWS_ENABLED_BIT) != 0u {
-            let L = normalize(view_bindings::clustered_lights.data[light_id].position_radius.xyz - in.world_position.xyz);
-            shadow *= calculate_contact_shadow(in.world_position.xyz, in.frag_coord.xy, L, contact_shadow_steps);
+            let to_light = view_bindings::clustered_lights.data[light_id].position_radius.xyz - in.world_position.xyz;
+            let light_distance = max(length(to_light), 1e-4);
+            let L = to_light / light_distance;
+            // Soft only for a light with soft shadows (its size) and temporal filtering (TAA averages the rays);
+            // inside the light's sphere there is no disc to sample.
+            var sin_angular_radius = 0.0;
+            @if(SHADOW_FILTER_METHOD_TEMPORAL) {
+            let soft_size = view_bindings::clustered_lights.data[light_id].soft_shadow_size;
+            if soft_size > 0.0 && soft_size < light_distance {
+                sin_angular_radius = soft_size / light_distance;
+            }
+            }
+            shadow *= calculate_contact_shadow(in.world_position.xyz, in.frag_coord.xy, L, contact_shadow_steps,
+                sin_angular_radius, light_id);
         }
 
         let light_contrib = lighting::spot_light(light_id, &lighting_input, enable_diffuse);
@@ -616,7 +660,7 @@ fn apply_pbr_lighting(
                 (view_bindings::lights.directional_lights[i].flags &
                     mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_CONTACT_SHADOWS_ENABLED_BIT) != 0u {
             let L = view_bindings::lights.directional_lights[i].direction_to_light;
-            shadow *= calculate_contact_shadow(in.world_position.xyz, in.frag_coord.xy, L, contact_shadow_steps);
+            shadow *= calculate_contact_shadow(in.world_position.xyz, in.frag_coord.xy, L, contact_shadow_steps, 0.0, i);
         }
 
         var light_contrib = lighting::directional_light(i, &lighting_input, enable_diffuse);
