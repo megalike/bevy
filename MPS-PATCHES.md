@@ -5,7 +5,7 @@ of a Bevy release. Everything else is Bevy as released. MPS's rules for this for
 
 ## Conventions
 
-- One branch per Bevy release: `mps/0.20` starts at the tag `v0.20.0`. A Bevy update starts `mps/0.21` at `v0.21.0`
+- One branch per Bevy release: `mps/0.20.1` starts at the tag `v0.20.1`. A Bevy update starts `mps/0.21` at `v0.21.0`
   and carries over every patch below that the new release does not already contain (merged on Bevy's `main` is not
   enough).
 - One change per pull request into `mps/<version>`, from a topic branch (`fix/…`, `feat/…`, `improve/…`, `perf/…`),
@@ -21,7 +21,7 @@ of a Bevy release. Everything else is Bevy as released. MPS's rules for this for
 - Upstream contributions are separate branches from Bevy's current `main` and follow Bevy's contribution guide and AI
   policy; the owner writes and submits them himself.
 
-## Patches on `mps/0.20`
+## Patches on `mps/0.20.1`
 
 | Patch | Kind | Crate | What | Upstream |
 | --- | --- | --- | --- | --- |
