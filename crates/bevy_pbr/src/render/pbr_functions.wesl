@@ -339,7 +339,7 @@ fn calculate_contact_shadow(
     if rm_result.hit {
         let visibility = clamp((rm_result.hit_penetration_frac - 0.5) / (1.0 - 0.5), 0.0, 1.0);
         // MPS: fade by the hit's world distance along the ray (hit_t interpolates the clipped NDC ends, not
-        // metres): tight contacts stay dark, blockers further along, the hard lines a soft light would not
+        // meters): tight contacts stay dark, blockers further along, the hard lines a soft light would not
         // draw, fade out by the end of the ray.
         let hit = position_ndc_to_world(mix(rm.ray_start_cs, rm.ray_end_cs, rm_result.hit_t));
         let along = max(dot(hit - world_position, ray_dir), 0.0);

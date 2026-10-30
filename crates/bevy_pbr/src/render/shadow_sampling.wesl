@@ -273,7 +273,7 @@ fn sample_shadow_map(
 
 // MPS: receiver-plane PCSS. `depth_gradient` is d(depth)/d(shadow uv) of the receiver's plane, so a tap at
 // offset o compares with depth + dot(depth_gradient, o): a tilted receiver no longer finds its own texels as
-// blockers (the self-shadowing combs of grazing light) far from the centre. Each tap's hardware 2x2 PCF still
+// blockers (the self-shadowing combs of grazing light) far from the center. Each tap's hardware 2x2 PCF still
 // compares its four texels with one depth, so a small constant bias stays.
 
 /// The receiver plane's depth at a tap. The offset is measured to the uv the sampler actually reads (it clamps to
