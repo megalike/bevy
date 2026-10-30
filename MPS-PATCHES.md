@@ -1,6 +1,6 @@
 # MPS patches on Bevy
 
-This fork carries the changes Motion Pipes Studio (MPS, https://github.com/megalike/MotionPipesStudio) needs on top
+This fork carries the changes Motion Pipes Studio (MPS, <https://github.com/megalike/MotionPipesStudio>) needs on top
 of a Bevy release. Everything else is Bevy as released. MPS's rules for this fork: `knowledge/BEVY-FORK.md` in MPS.
 
 ## Conventions
@@ -29,3 +29,4 @@ of a Bevy release. Everything else is Bevy as released. MPS's rules for this for
 | Contact shadows fade with hit distance | improve | bevy_pbr | Screen-space contact shadows fade by the blocker's world distance along the ray, so long hard lines that a soft light would not draw fade out while tight contacts stay dark; applies to spot, point and directional lights and also weakens true hard-light contacts half-way along the ray | not filed (to discuss upstream as an option, not a new default) |
 | Soft contact shadows from the light's size | feature | bevy_pbr | For a point or spot light with soft shadows under temporal shadow filtering, each pixel and frame marches the contact-shadow ray towards one point of the light sphere's apparent disc (uniform in solid angle, a PCG stream per pixel, frame and light) and TAA averages the penumbra; lights without a size, the directional light and other filter methods keep one hard ray | not filed (candidate; needs a motion and TAA-history check) |
 | Spot-light PCSS minimum filter | improve | bevy_pbr | The receiver-plane spot PCSS never filters narrower than `SPOT_PCSS_MIN_BLUR` (2.0 `blur_size` units, an outer tap radius of about 3.7 shadow-map texels, against 0.5) like EEVEE's per-light filter radius: casters a texel or two wide are soft bands instead of aliased streaks, real contacts soften by that footprint; Bevy's deferred lighting pass keeps 0.5 | not filed (depends on the receiver-plane patch; an option, not a default) |
+| Lint fixes for the fork's CI | mps-only | bevy_dev_tools, bevy_solari, bevy_pbr | Two dependency lines in the release manifests take the one-line form `taplo` asks for (only formatting, not in `main`, which still has `-dev` versions); American spelling in the patches' comments; no shader or dependency change | not applicable |
