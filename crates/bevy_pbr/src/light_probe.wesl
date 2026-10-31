@@ -5,6 +5,7 @@ import package::render::mesh_view_types::{
     LightProbe, LIGHT_PROBE_FLAG_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE,
     LIGHT_PROBE_FLAG_PARALLAX_CORRECT
 };
+import bevy_render::maths::quat_rotate;
 
 /// The result of searching for a light probe.
 ///
@@ -36,7 +37,35 @@ struct LightProbeQueryResult {
     capture_origin: vec3<f32>,
     /// The priority where light probes overlap (`ReflectionProbePriority`).
     priority: i32,
+    /// The fragment's position in light probe space (the 1×1×1 cube).
+    probe_space_pos: vec3<f32>,
 };
+
+/// Whether a fragment in the light probe's influence box takes a reflection
+/// probe, given its shading normal `N` in world space.
+///
+/// Inside the parallax correction boundaries (the room's walls) it always does.
+/// In the shell between those boundaries and the influence box it does only if
+/// `N` faces into the boundaries along every axis the fragment overshoots: the
+/// floor just outside a doorway (its normal is parallel to the wall) blends as
+/// before, while the outer face of the wall, the underside of the floor and
+/// the roof's top, which can't see the room, are left to the probes around it.
+/// A probe without parallax correction, or whose boundaries coincide with the
+/// influence box, is never in question.
+fn light_probe_faces_fragment(query_result: LightProbeQueryResult, N: vec3<f32>) -> bool {
+    if ((query_result.flags & LIGHT_PROBE_FLAG_PARALLAX_CORRECT) == 0u) {
+        return true;
+    }
+    let overshoot = abs(query_result.probe_space_pos) - query_result.parallax_correction_bounds;
+    if (all(overshoot <= vec3(0.0))) {
+        return true;
+    }
+    // The normal in the light probe's frame (the boundaries are axis-aligned
+    // there); the rotation alone, as the box's scale would skew it.
+    let probe_space_N = quat_rotate(query_result.light_from_world_rotation, N);
+    let outward = sign(query_result.probe_space_pos) * probe_space_N;
+    return !any((overshoot > vec3(0.0)) & (outward > vec3(0.0)));
+}
 
 fn transpose_affine_matrix(matrix: mat3x4<f32>) -> mat4x4<f32> {
     let matrix4x4 = mat4x4<f32>(
@@ -155,6 +184,7 @@ fn light_probe_iterator_next(iterator: ptr<function, LightProbeIterator>) -> Lig
         result.light_from_world_rotation = light_probe.light_from_world_rotation;
         result.capture_origin = light_probe.capture_origin;
         result.priority = light_probe.priority;
+        result.probe_space_pos = probe_space_pos;
         return result;
     }
 
@@ -255,6 +285,7 @@ fn light_probe_iterator_next(iterator: ptr<function, LightProbeIterator>) -> Lig
         result.light_from_world_rotation = light_probe.light_from_world_rotation;
         result.capture_origin = light_probe.capture_origin;
         result.priority = light_probe.priority;
+        result.probe_space_pos = probe_space_pos;
         return result;
     }
 

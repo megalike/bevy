@@ -1001,6 +1001,89 @@ mod tests {
         ));
     }
 
+    /// `light_probe_faces_fragment` of `light_probe.wesl` on the CPU: whether
+    /// a fragment at `fragment_world` with the shading normal `normal_world`
+    /// takes a parallax-corrected reflection probe whose boundaries are
+    /// `bounds` (half extents in light probe space): always inside them, and in
+    /// the shell up to the influence box only if the normal faces into them
+    /// along every overshot axis.
+    fn faces_fragment(
+        world_from_light: &Affine3A,
+        bounds: Vec3,
+        fragment_world: Vec3,
+        normal_world: Vec3,
+    ) -> bool {
+        let light_from_world = world_from_light.inverse();
+        let (light_from_world_rotation, _) = capture_frame(world_from_light, Vec3::ZERO);
+        let probe_space_pos = light_from_world.transform_point3(fragment_world);
+        let overshoot = probe_space_pos.abs() - bounds;
+        if overshoot.cmple(Vec3::ZERO).all() {
+            return true;
+        }
+        let outward = probe_space_pos.signum() * (light_from_world_rotation * normal_world);
+        !(overshoot.cmpgt(Vec3::ZERO) & outward.cmpgt(Vec3::ZERO)).any()
+    }
+
+    /// A 4 x 3 x 15 m container with a 0.25 m margin around its inner walls,
+    /// standing on another container, rotated about the vertical axis: the
+    /// fragments in the margin take its probe only when they face the inside.
+    #[test]
+    fn the_shell_between_the_walls_and_the_influence_box_takes_only_fragments_facing_in() {
+        let inner = Vec3::new(4.0, 3.0, 15.0);
+        let margin = 0.25;
+        let influence = inner + Vec3::splat(2.0 * margin);
+        let rotation = Quat::from_rotation_y(0.4);
+        let center = Vec3::new(-15.0, 4.6, -13.8);
+        let world_from_light =
+            Affine3A::from_scale_rotation_translation(influence, rotation, center);
+        let bounds = 0.5 * inner / influence;
+        // A point and a direction given in the container's own frame (meters).
+        let at = |local: Vec3| center + rotation * local;
+        let along = |local: Vec3| rotation * local;
+        let faces = |local: Vec3, normal: Vec3| {
+            faces_fragment(&world_from_light, bounds, at(local), along(normal))
+        };
+
+        // Inside the walls: any normal.
+        assert!(faces(Vec3::new(1.5, -1.4, 6.0), Vec3::Y));
+        assert!(faces(Vec3::new(1.5, -1.4, 6.0), Vec3::NEG_Y));
+        // The underside of the floor, 0.1 m below it: its normal points down,
+        // out of the box.
+        assert!(!faces(Vec3::new(0.0, -1.6, 0.0), Vec3::NEG_Y));
+        // The roof's top: the same, upward.
+        assert!(!faces(Vec3::new(0.0, 1.6, 0.0), Vec3::Y));
+        // A wall's outer face, 0.1 m outside it.
+        assert!(!faces(Vec3::new(2.1, 0.0, 0.0), Vec3::X));
+        // A neighboring wall facing this container, 0.2 m away: it faces in.
+        assert!(faces(Vec3::new(2.2, 0.0, 0.0), Vec3::NEG_X));
+        // The floor in front of the open end: its normal is parallel to the
+        // end's plane, so it blends as before.
+        assert!(faces(Vec3::new(0.5, -1.4, 7.6), Vec3::Y));
+        // A corner of the shell, below the floor and beyond a wall: out along
+        // either overshot axis is rejected; a normal parallel to one face and
+        // in along the other is not.
+        assert!(!faces(Vec3::new(2.1, -1.6, 0.0), Vec3::NEG_Y));
+        assert!(!faces(Vec3::new(2.1, -1.6, 0.0), Vec3::X));
+        assert!(faces(Vec3::new(2.1, -1.6, 0.0), Vec3::NEG_X));
+        assert!(faces(
+            Vec3::new(2.1, -1.6, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0).normalize()
+        ));
+        // A point beyond the margin is not in the influence box at all; the
+        // weight test of the iterator rejects it before this one.
+        let far = at(Vec3::new(2.4, 0.0, 0.0));
+        let probe_space = world_from_light.inverse().transform_point3(far);
+        assert!(probe_space.abs().max_element() > 0.5);
+        // Boundaries that coincide with the influence box: no shell, so a
+        // fragment inside takes the probe whatever its normal faces.
+        assert!(faces_fragment(
+            &world_from_light,
+            Vec3::splat(0.5),
+            at(Vec3::new(2.1, 0.0, 0.0)),
+            along(Vec3::X)
+        ));
+    }
+
     /// The slab test of `compute_cubemap_sample_dir` in `environment_map.wesl`
     /// on the CPU: the ray parameter at which a ray leaving `world_origin`
     /// along `world_direction` reaches the parallax correction boundaries.
