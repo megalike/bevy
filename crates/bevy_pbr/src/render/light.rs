@@ -95,6 +95,8 @@ pub struct ExtractedPointLight {
     pub soft_shadows_enabled: bool,
     /// whether this point light contributes diffuse light to lightmapped meshes
     pub affects_lightmapped_mesh_diffuse: bool,
+    /// MPS: whether the diffuse term takes the illuminance of the light's sphere
+    pub sphere_diffuse: bool,
 }
 
 #[derive(Component, Debug)]
@@ -142,6 +144,7 @@ bitflags::bitflags! {
         const CONTACT_SHADOWS_ENABLED           = 1 << 4;
         const SPOT_LIGHT                        = 1 << 5;
         const RECT_LIGHT                        = 1 << 6;
+        const SPHERE_DIFFUSE                    = 1 << 7;
         const NONE                              = 0;
         const UNINITIALIZED                     = 0xFFFF;
     }
@@ -586,6 +589,7 @@ pub fn extract_lights(
             spot_light_angles: None,
             volumetric: volumetric_light.is_some(),
             affects_lightmapped_mesh_diffuse: point_light.affects_lightmapped_mesh_diffuse,
+            sphere_diffuse: point_light.sphere_diffuse,
             #[cfg(feature = "experimental_pbr_pcss")]
             soft_shadows_enabled: point_light.soft_shadows_enabled,
             #[cfg(not(feature = "experimental_pbr_pcss"))]
@@ -725,6 +729,7 @@ pub fn extract_lights(
             spot_light_angles: Some((inner_angle, outer_angle)),
             volumetric: volumetric_light.is_some(),
             affects_lightmapped_mesh_diffuse: spot_light.affects_lightmapped_mesh_diffuse,
+            sphere_diffuse: spot_light.sphere_diffuse,
             #[cfg(feature = "experimental_pbr_pcss")]
             soft_shadows_enabled: spot_light.soft_shadows_enabled,
             #[cfg(not(feature = "experimental_pbr_pcss"))]
@@ -1333,6 +1338,10 @@ pub fn prepare_lights(
 
         if light.affects_lightmapped_mesh_diffuse {
             flags |= PointLightFlags::AFFECTS_LIGHTMAPPED_MESH_DIFFUSE;
+        }
+
+        if light.sphere_diffuse {
+            flags |= PointLightFlags::SPHERE_DIFFUSE;
         }
 
         let (light_custom_data, spot_light_tan_angle) = match light.spot_light_angles {
@@ -3160,5 +3169,96 @@ pub fn extract_shadow_lod_origin(
             render_shadow_lod_origin.0 = global_transform.translation();
         }
         None => render_shadow_lod_origin.0 = Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy_math::ops;
+
+    // MPS: the CPU mirror of `sphere_light_diffuse` in `pbr_lighting.wesl`, in f32 like the shader.
+    fn sphere_light_diffuse(c_in: f32, s: f32) -> f32 {
+        let c = c_in.clamp(-1.0, 1.0);
+        let q = (s * s).min(0.999);
+        if c * c >= q {
+            return c.max(0.0);
+        }
+        let t = (1.0 - c * c).sqrt();
+        let x = (1.0 / q - 1.0).sqrt();
+        let y = (-x * c / t).clamp(-1.0, 1.0);
+        let z = t * (1.0 - y * y).max(0.0).sqrt();
+        let h = q * (c * ops::acos(y) - x * z) + ops::atan2(z, x);
+        (h / (core::f32::consts::PI * q)).max(0.0)
+    }
+
+    /// The same factor by numeric integration: the cosine to the normal, where positive, over the directions
+    /// within the sphere's cone (half angle `asin(s)` around the center direction), divided by `pi * s^2`, the
+    /// cosine-weighted solid angle a point light of the same intensity stands for.
+    fn integrated(c: f64, s: f64) -> f64 {
+        let sigma = s.asin();
+        let t = (1.0 - c * c).sqrt();
+        let (steps_alpha, steps_phi) = (1000, 1000);
+        let mut sum = 0.0;
+        for i in 0..steps_alpha {
+            let alpha = sigma * (i as f64 + 0.5) / steps_alpha as f64;
+            let (sin_alpha, cos_alpha) = alpha.sin_cos();
+            for j in 0..steps_phi {
+                let phi = core::f64::consts::TAU * (j as f64 + 0.5) / steps_phi as f64;
+                sum += (cos_alpha * c + sin_alpha * t * phi.cos()).max(0.0) * sin_alpha;
+            }
+        }
+        sum * (sigma / steps_alpha as f64) * (core::f64::consts::TAU / steps_phi as f64)
+            / (core::f64::consts::PI * s * s)
+    }
+
+    #[test]
+    fn sphere_light_diffuse_matches_the_integral() {
+        for &s in &[0.1f32, 0.3, 0.5, 0.9] {
+            for &c in &[
+                -s,
+                -0.75 * s,
+                -0.5 * s,
+                -0.1 * s,
+                0.0,
+                0.1 * s,
+                0.5 * s,
+                0.75 * s,
+                s,
+            ] {
+                let d = sphere_light_diffuse(c, s);
+                let reference = integrated(c as f64, s as f64);
+                assert!(
+                    (d as f64 - reference).abs() < 2e-3,
+                    "D({c}, {s}) = {d}, integral {reference}"
+                );
+            }
+            // Outside the crossing band the factor is the point light's clamped cosine.
+            assert_eq!(sphere_light_diffuse(1.0, s), 1.0);
+            assert_eq!(sphere_light_diffuse(-1.0, s), 0.0);
+            let above = (s + 0.01).min(1.0);
+            assert_eq!(sphere_light_diffuse(above, s), above);
+            assert_eq!(sphere_light_diffuse(-above, s), 0.0);
+            // Continuous at both edges of the band.
+            assert!((sphere_light_diffuse(s - 1e-4, s) - s).abs() < 1e-3);
+            assert!(sphere_light_diffuse(-s + 1e-4, s) < 1e-3);
+            // Half the sphere above the horizon, in closed form: (asin s - s sqrt(1 - s^2)) / (pi s^2).
+            let half = (ops::asin(s) - s * (1.0 - s * s).sqrt()) / (core::f32::consts::PI * s * s);
+            assert!((sphere_light_diffuse(0.0, s) - half).abs() < 1e-4);
+        }
+        // A tiny sphere: the band is a hair wide and f32 cancellation stays small in absolute terms.
+        let s = 1e-3f32;
+        let half = 2.0 * s / (3.0 * core::f32::consts::PI);
+        assert!((sphere_light_diffuse(0.0, s) - half).abs() < 1e-4);
+        // Inside the sphere (`s >= 1`): bounded, monotonic in `c`, never above 1.
+        let mut previous = 0.0f32;
+        for i in 0..=20 {
+            let c = -1.0 + i as f32 / 10.0;
+            let d = sphere_light_diffuse(c, 2.0);
+            assert!(
+                d.is_finite() && (0.0..=1.0).contains(&d) && d >= previous,
+                "D({c}, 2) = {d}"
+            );
+            previous = d;
+        }
     }
 }

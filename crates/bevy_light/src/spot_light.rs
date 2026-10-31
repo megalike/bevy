@@ -99,6 +99,17 @@ pub struct SpotLight {
     /// By default, this is set to true.
     pub affects_lightmapped_mesh_diffuse: bool,
 
+    /// Whether the diffuse term treats this light as a sphere of its `radius`
+    /// (MPS): the cosine-weighted illuminance of the part of the sphere above
+    /// the surface's horizon replaces the center direction's `N·L`, so the
+    /// light wraps past the terminator by the sphere's half angle, while a
+    /// surface that sees the whole sphere is lit as before. Specular light,
+    /// shadows and the spot cone are not affected. Does nothing without a
+    /// radius.
+    ///
+    /// By default, this is set to false.
+    pub sphere_diffuse: bool,
+
     /// A value that adjusts the tradeoff between self-shadowing artifacts and
     /// proximity of shadows to their casters.
     ///
@@ -158,6 +169,7 @@ impl Default for SpotLight {
             shadow_maps_enabled: false,
             contact_shadows_enabled: false,
             affects_lightmapped_mesh_diffuse: true,
+            sphere_diffuse: false,
             shadow_depth_bias: Self::DEFAULT_SHADOW_DEPTH_BIAS,
             shadow_normal_bias: Self::DEFAULT_SHADOW_NORMAL_BIAS,
             shadow_map_near_z: Self::DEFAULT_SHADOW_MAP_NEAR_Z,

@@ -33,7 +33,7 @@
 //! ⟨a⟩    Saturated value (clamped to [0..1])
 
 import package::{
-    render::mesh_view_types::{POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE, RectLight},
+    render::mesh_view_types::{POINT_LIGHT_FLAGS_SPHERE_DIFFUSE_BIT, POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE, RectLight},
     render::mesh_view_bindings as view_bindings,
     atmosphere::functions::{calculate_visible_sun_ratio, clamp_to_surface},
     atmosphere::bruneton_functions::transmittance_lut_r_mu_to_uv,
@@ -630,6 +630,26 @@ fn specular_fix_remap(a: f32) -> f32 {
     return 1.0 - inv_a_sq * inv_a_sq;
 }
 
+/// MPS: the diffuse illuminance factor of a sphere light relative to a point light of the same luminous intensity
+/// at its center: `c` where the surface sees the whole sphere, 0 where the sphere is wholly below the horizon, and
+/// between them the cosine-weighted visible cap (Lagarde and de Rousiers 2014, "Moving Frostbite to Physically
+/// Based Rendering", listing 10, over `pi * q`). `c` is the signed cosine between the normal and the direction to
+/// the center, `s = radius / distance` the sine of the sphere's half angle. A surface inside the sphere (`s >= 1`)
+/// takes a bounded extension, `q` capped below 1. Mirrored by a CPU test in `render/light.rs`.
+fn sphere_light_diffuse(c_in: f32, s: f32) -> f32 {
+    let c = clamp(c_in, -1.0, 1.0);
+    let q = min(s * s, 0.999);
+    if c * c >= q {
+        return max(c, 0.0);
+    }
+    let t = sqrt(1.0 - c * c);
+    let x = sqrt(1.0 / q - 1.0);
+    let y = clamp(-x * c / t, -1.0, 1.0);
+    let z = t * sqrt(max(1.0 - y * y, 0.0));
+    let h = q * (c * acos(y) - x * z) + atan2(z, x);
+    return max(h / (PI * q), 0.0);
+}
+
 fn point_light(
     light_id: u32,
     input: ptr<function, LightingInput>,
@@ -749,6 +769,13 @@ fn point_light(
         diffuse = diffuse_color * Fd_Burley(input, &derived_input);
     }
 
+    // MPS: a light with `sphere_diffuse` lights the diffuse term as a sphere of its radius: the light wraps past
+    // the center direction's horizon by the sphere's half angle; a surface that sees the whole sphere is unchanged.
+    var diffuse_NdotL = derived_input.NdotL;
+    if ((*light).flags & POINT_LIGHT_FLAGS_SPHERE_DIFFUSE_BIT) != 0u && light_radius > 0.0 {
+        diffuse_NdotL = sphere_light_diffuse(dot(N, L), light_radius / distance);
+    }
+
     // See https://google.github.io/filament/Filament.md.html#mjx-eqn-pointLightLuminanceEquation
     // Lout = f(v,l) Φ / { 4 π d^2 }⟨n⋅l⟩
     // where
@@ -767,9 +794,9 @@ fn point_light(
     // Account for the Fresnel term from the clearcoat darkening the main layer.
     //
     // <https://google.github.io/filament/Filament.md.html#materialsystem/clearcoatmodel/integrationinthesurfaceresponse>
-    color_times_NdotL = (diffuse * derived_input.NdotL + specular_light * specular_derived_input.NdotL * inv_Fc) * inv_Fc + Frc * clearcoat_specular_derived_input.NdotL;
+    color_times_NdotL = (diffuse * diffuse_NdotL + specular_light * specular_derived_input.NdotL * inv_Fc) * inv_Fc + Frc * clearcoat_specular_derived_input.NdotL;
 @else   // STANDARD_MATERIAL_CLEARCOAT
-    color_times_NdotL = diffuse * derived_input.NdotL + specular_light * specular_derived_input.NdotL;
+    color_times_NdotL = diffuse * diffuse_NdotL + specular_light * specular_derived_input.NdotL;
 
     var texture_sample = 1f;
 
