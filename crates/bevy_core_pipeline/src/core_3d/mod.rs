@@ -1,5 +1,6 @@
 mod main_opaque_pass_3d_node;
 mod main_transparent_pass_3d_node;
+mod ssr_gbuffer;
 
 // PERF: vulkan docs recommend using 24 bit depth for better performance
 pub const CORE_3D_DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
@@ -46,6 +47,7 @@ use bevy_render::{
 use indexmap::IndexMap;
 pub use main_opaque_pass_3d_node::*;
 pub use main_transparent_pass_3d_node::*;
+pub use ssr_gbuffer::*;
 
 use bevy_app::{App, Plugin, PostUpdate};
 use bevy_asset::UntypedAssetId;
@@ -106,7 +108,11 @@ impl Plugin for Core3dPlugin {
                 CameraRenderGraph::new(Core3d)
             })
             .register_required_components::<Camera3d, Tonemapping>()
-            .add_plugins((SkyboxPlugin, ExtractComponentPlugin::<Camera3d>::default()))
+            .add_plugins((
+                SkyboxPlugin,
+                ExtractComponentPlugin::<Camera3d>::default(),
+                ExtractComponentPlugin::<ForwardSsrGBuffer>::default(),
+            ))
             .add_systems(PostUpdate, check_msaa);
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
@@ -139,6 +145,7 @@ impl Plugin for Core3dPlugin {
                         .ambiguous_with(RenderSystems::PrepareViews),
                     prepare_core_3d_depth_textures.in_set(RenderSystems::PrepareResources),
                     prepare_prepass_textures.in_set(RenderSystems::PrepareResources),
+                    prepare_ssr_gbuffer_textures.in_set(RenderSystems::PrepareResources),
                 ),
             )
             .add_schedule(Core3d::base_schedule())

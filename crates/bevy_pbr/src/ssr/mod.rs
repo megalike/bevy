@@ -2,19 +2,21 @@
 
 use core::ops::Range;
 
-use bevy_app::{App, Plugin};
+use bevy_app::{App, Plugin, PostUpdate};
 use bevy_asset::{AssetServer, Handle};
 use bevy_core_pipeline::{
-    core_3d::{main_opaque_pass_3d, DEPTH_PREPASS_TEXTURE_SUPPORTED},
+    core_3d::{main_opaque_pass_3d, ForwardSsrGBuffer, DEPTH_PREPASS_TEXTURE_SUPPORTED},
     prepass::{DeferredPrepass, DepthPrepass},
     schedule::{Core3d, Core3dSystems},
     FullscreenShader,
 };
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
+    change_detection::DetectChangesMut,
     component::Component,
     entity::Entity,
-    query::{QueryItem, With},
+    lifecycle::RemovedComponents,
+    query::{Has, QueryItem, With, Without},
     reflect::ReflectComponent,
     resource::Resource,
     schedule::IntoScheduleConfigs as _,
@@ -51,15 +53,40 @@ use crate::{
 
 /// Enables screen-space reflections for a camera.
 ///
-/// Screen-space reflections are currently only supported with deferred rendering.
+/// Screen-space reflections read the surface data of the deferred prepass
+/// ([`ScreenSpaceReflectionsMode::Deferred`]) or, for forward-rendered views, a
+/// packed G-buffer the main opaque pass writes ([`ScreenSpaceReflectionsMode::ForwardMrt`]).
 pub struct ScreenSpaceReflectionsPlugin;
+
+/// Where screen-space reflections take the surface data of the receivers.
+///
+/// MPS: the forward mode exists for a forward material that is too expensive to
+/// evaluate a second time in a prepass. The mode is also extracted onto the
+/// render-world view.
+#[derive(Clone, Copy, Component, Debug, Default, PartialEq, Eq, Hash, Reflect)]
+#[reflect(Component, Default, Clone, PartialEq)]
+pub enum ScreenSpaceReflectionsMode {
+    /// Bevy's deferred renderer: the receivers come from the deferred prepass'
+    /// G-buffer, and the reflections are composed before the main opaque pass.
+    /// The [`DeferredPrepass`] component is inserted automatically, but
+    /// deferred rendering itself is not automatically enabled.
+    #[default]
+    Deferred,
+    /// Forward rendering: the main opaque pass writes a packed G-buffer as a
+    /// second color target ([`ForwardSsrGBuffer`], inserted automatically) and
+    /// the reflections are composed after it. Every material drawn in that
+    /// pass writes valid receiver data or zero (see `forward_io.wesl`); forward
+    /// materials keep their environment specular, which a hit replaces.
+    ForwardMrt,
+}
 
 /// Add this component to a camera to enable *screen-space reflections* (SSR).
 ///
-/// Screen-space reflections currently require deferred rendering in order to
-/// appear. Therefore, they also need the [`DepthPrepass`] and [`DeferredPrepass`]
-/// components, which are inserted automatically,
-/// but deferred rendering itself is not automatically enabled.
+/// Screen-space reflections need the [`DepthPrepass`] component (inserted
+/// automatically) and, by [`ScreenSpaceReflectionsMode`], either the
+/// [`DeferredPrepass`] or the [`ForwardSsrGBuffer`] component, which
+/// [`manage_ssr_prerequisites`] inserts and removes with the mode; a
+/// prerequisite the application inserted itself is left alone.
 ///
 /// Enable the `bluenoise_texture` feature to improve the quality of noise on rough reflections.
 ///
@@ -77,9 +104,12 @@ pub struct ScreenSpaceReflectionsPlugin;
 /// which is required for screen-space raymarching.
 #[derive(Clone, Component, Reflect)]
 #[reflect(Component, Default, Clone)]
-#[require(DepthPrepass, DeferredPrepass)]
+#[require(DepthPrepass)]
 #[doc(alias = "Ssr")]
 pub struct ScreenSpaceReflections {
+    /// Where the receivers' surface data comes from; see [`ScreenSpaceReflectionsMode`].
+    pub mode: ScreenSpaceReflectionsMode,
+
     /// The perceptual roughness range over which SSR begins to fade in.
     ///
     /// The first value is the roughness at which SSR begins to appear; the
@@ -134,6 +164,80 @@ pub struct ScreenSpaceReflections {
     /// line-line intersection between the ray approach rate and the surface
     /// gradient.
     pub use_secant: bool,
+}
+
+/// The prerequisite components [`manage_ssr_prerequisites`] inserted on a camera
+/// for its [`ScreenSpaceReflections`] mode, so that a mode change or the removal
+/// of the settings removes only those, never a component the application
+/// supplied itself.
+#[derive(Component, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenSpaceReflectionsPrerequisites {
+    deferred_prepass: bool,
+    forward_ssr_gbuffer: bool,
+}
+
+/// Inserts the prepass or G-buffer component a camera's
+/// [`ScreenSpaceReflectionsMode`] needs and removes the one it inserted for a
+/// previous mode, or for settings that were removed.
+pub fn manage_ssr_prerequisites(
+    mut commands: Commands,
+    mut cameras: Query<(
+        Entity,
+        &ScreenSpaceReflections,
+        Option<&mut ScreenSpaceReflectionsPrerequisites>,
+        Has<DeferredPrepass>,
+        Has<ForwardSsrGBuffer>,
+    )>,
+    mut removed: RemovedComponents<ScreenSpaceReflections>,
+    orphans: Query<&ScreenSpaceReflectionsPrerequisites, Without<ScreenSpaceReflections>>,
+) {
+    for (entity, settings, prerequisites, has_deferred, has_forward) in &mut cameras {
+        let mut wanted = prerequisites.as_deref().copied().unwrap_or_default();
+        let mut entity_commands = commands.entity(entity);
+        match settings.mode {
+            ScreenSpaceReflectionsMode::Deferred => {
+                if wanted.forward_ssr_gbuffer {
+                    entity_commands.remove::<ForwardSsrGBuffer>();
+                    wanted.forward_ssr_gbuffer = false;
+                }
+                if !has_deferred {
+                    entity_commands.insert(DeferredPrepass);
+                    wanted.deferred_prepass = true;
+                }
+            }
+            ScreenSpaceReflectionsMode::ForwardMrt => {
+                if wanted.deferred_prepass {
+                    entity_commands.remove::<DeferredPrepass>();
+                    wanted.deferred_prepass = false;
+                }
+                if !has_forward {
+                    entity_commands.insert(ForwardSsrGBuffer);
+                    wanted.forward_ssr_gbuffer = true;
+                }
+            }
+        }
+        match prerequisites {
+            Some(mut prerequisites) => {
+                prerequisites.set_if_neq(wanted);
+            }
+            None => {
+                entity_commands.insert(wanted);
+            }
+        }
+    }
+    for entity in removed.read() {
+        let Ok(prerequisites) = orphans.get(entity) else {
+            continue;
+        };
+        let mut entity_commands = commands.entity(entity);
+        if prerequisites.deferred_prepass {
+            entity_commands.remove::<DeferredPrepass>();
+        }
+        if prerequisites.forward_ssr_gbuffer {
+            entity_commands.remove::<ForwardSsrGBuffer>();
+        }
+        entity_commands.remove::<ScreenSpaceReflectionsPrerequisites>();
+    }
 }
 
 /// A version of [`ScreenSpaceReflections`] for upload to the GPU.
@@ -194,7 +298,8 @@ impl Plugin for ScreenSpaceReflectionsPlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "raymarch.wesl");
 
-        app.add_plugins(ExtractComponentPlugin::<ScreenSpaceReflections>::default());
+        app.add_plugins(ExtractComponentPlugin::<ScreenSpaceReflections>::default())
+            .add_systems(PostUpdate, manage_ssr_prerequisites);
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -229,6 +334,7 @@ impl Default for ScreenSpaceReflections {
     // <https://gist.github.com/h3r2tic/9c8356bdaefbe80b1a22ae0aaee192db?permalink_comment_id=4552149#gistcomment-4552149>.
     fn default() -> Self {
         Self {
+            mode: ScreenSpaceReflectionsMode::default(),
             min_perceptual_roughness: 0.08..0.12,
             max_perceptual_roughness: 0.55..0.6,
             linear_steps: 10,
@@ -392,7 +498,7 @@ pub fn prepare_ssr_pipelines(
     mut pipelines: ResMut<SpecializedRenderPipelines<ScreenSpaceReflectionsPipeline>>,
     ssr_pipeline: Res<ScreenSpaceReflectionsPipeline>,
     views: Query<
-        (Entity, &ExtractedView),
+        (Entity, &ExtractedView, &ScreenSpaceReflectionsMode),
         (
             With<ScreenSpaceReflectionsUniform>,
             With<DepthPrepass>,
@@ -400,7 +506,11 @@ pub fn prepare_ssr_pipelines(
         ),
     >,
 ) {
-    for (entity, extracted_view) in &views {
+    for (entity, extracted_view, mode) in &views {
+        // MPS: the forward mode has its own pass.
+        if *mode != ScreenSpaceReflectionsMode::Deferred {
+            continue;
+        }
         let Some(view_key) = view_key_cache.get(&extracted_view.retained_view_entity) else {
             continue;
         };
@@ -447,6 +557,7 @@ pub fn prepare_ssr_settings(
 impl SyncComponent<RenderApp> for ScreenSpaceReflections {
     type Target = (
         ScreenSpaceReflectionsUniform,
+        ScreenSpaceReflectionsMode,
         ViewScreenSpaceReflectionsUniformOffset,
         ScreenSpaceReflectionsPipelineId,
     );
@@ -455,7 +566,7 @@ impl SyncComponent<RenderApp> for ScreenSpaceReflections {
 impl ExtractComponent<RenderApp> for ScreenSpaceReflections {
     type QueryData = Read<ScreenSpaceReflections>;
     type QueryFilter = ();
-    type Out = ScreenSpaceReflectionsUniform;
+    type Out = (ScreenSpaceReflectionsUniform, ScreenSpaceReflectionsMode);
 
     fn extract_component(settings: QueryItem<'_, '_, Self::QueryData>) -> Option<Self::Out> {
         if !DEPTH_PREPASS_TEXTURE_SUPPORTED {
@@ -466,7 +577,7 @@ impl ExtractComponent<RenderApp> for ScreenSpaceReflections {
             return None;
         }
 
-        Some(settings.clone().into())
+        Some((settings.clone().into(), settings.mode))
     }
 }
 

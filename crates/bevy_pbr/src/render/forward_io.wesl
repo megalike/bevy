@@ -117,4 +117,8 @@ struct VertexOutput {
 
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
+    // MPS: the forward SSR G-buffer (`deferred_gbuffer_from_pbr_input` with the receiver-valid flag), or zero where
+    // the fragment is no reflection receiver; the main opaque pass attaches it when the view asks for it.
+    @if(FORWARD_SSR_MRT)
+    @location(1) packed: vec4<u32>,
 }

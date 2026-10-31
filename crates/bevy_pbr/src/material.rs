@@ -982,11 +982,40 @@ pub(crate) struct SpecializeMaterialMeshesSystemParam<'w, 's> {
     alpha_mask_render_phases: Res<'w, ViewBinnedRenderPhases<AlphaMask3d>>,
     transmissive_render_phases: Res<'w, ViewSortedRenderPhases<Transmissive3d>>,
     transparent_render_phases: Res<'w, ViewSortedRenderPhases<Transparent3d>>,
-    views: Query<'w, 's, (&'static ExtractedView, &'static RenderVisibleEntities)>,
+    views: Query<
+        'w,
+        's,
+        (
+            &'static ExtractedView,
+            &'static RenderVisibleEntities,
+            Has<ScreenSpaceTransmission>,
+        ),
+    >,
     view_key_cache: Res<'w, ViewKeyCache>,
     specialized_material_pipeline_cache: ResMut<'w, SpecializedMaterialPipelineCache>,
     pending_mesh_material_queues: ResMut<'w, PendingMeshMaterialQueues>,
     dirty_specializations: Res<'w, DirtySpecializations>,
+}
+
+/// Whether a material's meshes are drawn by the main opaque pass of a forward view (the `Opaque3d` or
+/// `AlphaMask3d` phase): the phase classification of `queue_material_meshes`, including the fallback to the alpha
+/// mode while screen-space transmission is off.
+fn forward_main_pass_draw(properties: &MaterialProperties, has_transmission: bool) -> bool {
+    let render_phase_type = if !has_transmission {
+        match properties.alpha_mode {
+            AlphaMode::Blend | AlphaMode::Premultiplied | AlphaMode::Add | AlphaMode::Multiply => {
+                RenderPhaseType::Transparent
+            }
+            AlphaMode::Opaque | AlphaMode::AlphaToCoverage => RenderPhaseType::Opaque,
+            AlphaMode::Mask(_) => RenderPhaseType::AlphaMask,
+        }
+    } else {
+        properties.render_phase_type
+    };
+    matches!(
+        render_phase_type,
+        RenderPhaseType::Opaque | RenderPhaseType::AlphaMask
+    ) && properties.render_method != OpaqueRendererMethod::Deferred
 }
 
 pub(crate) fn specialize_material_meshes(
@@ -1017,7 +1046,7 @@ pub(crate) fn specialize_material_meshes(
             dirty_specializations,
         } = state.get_mut(world).unwrap();
 
-        for (view, visible_entities) in &views {
+        for (view, visible_entities, has_transmission) in &views {
             all_views.insert(view.retained_view_entity);
 
             if !transparent_render_phases.contains_key(&view.retained_view_entity)
@@ -1113,6 +1142,13 @@ pub(crate) fn specialize_material_meshes(
                 let mut mesh_key = *view_key
                     | MeshPipelineKey::from_bits_retain(mesh.key_bits.bits())
                     | mesh_pipeline_key_bits;
+
+                // MPS: only the `Opaque3d` and `AlphaMask3d` draws of the main opaque pass write the forward SSR
+                // G-buffer; transmissive and transparent draws (classified as `queue_material_meshes` does) have
+                // one target, and the deferred draws run in the prepass.
+                if !forward_main_pass_draw(&material.properties, has_transmission) {
+                    mesh_key.remove(MeshPipelineKey::FORWARD_SSR_MRT);
+                }
 
                 if let Some(lightmap) = render_lightmaps.render_lightmaps.get(visible_entity) {
                     mesh_key |= MeshPipelineKey::LIGHTMAPPED;
