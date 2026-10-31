@@ -161,6 +161,15 @@ struct LightProbe {
     cubemap_index: i32,
     /// Various flags that apply to this light probe.
     flags: u32,
+    /// The rotation from world space to light probe space, as a quaternion:
+    /// cubemap sample directions are rotated with it, without the scale of
+    /// `light_from_world_transposed`.
+    light_from_world_rotation: vec4<f32>,
+    /// The world-space point from which the cubemaps were captured.
+    capture_origin: vec3<f32>,
+    /// The priority where light probes overlap: a higher one takes its weight
+    /// first, lower ones share what's left.
+    priority: i32,
 };
 
 struct LightProbes {
@@ -181,6 +190,9 @@ struct LightProbes {
     /// Whether the environment map attached to the view affects the diffuse
     /// lighting for lightmapped meshes.
     view_environment_map_affects_lightmapped_mesh_diffuse: u32,
+    /// Whether the diffuse environment term comes from the view's environment
+    /// map alone, reflection probes supplying only the specular term.
+    diffuse_from_view: u32,
 };
 
 /// Settings for screen space reflections.
