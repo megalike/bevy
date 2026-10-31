@@ -72,11 +72,24 @@ fn skybox_vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return VertexOutput(vec4(clip_position, 0.0, 1.0));
 }
 
+struct FragmentOutput {
+    @location(0) color: vec4<f32>,
+    // MPS: the forward SSR G-buffer the main opaque pass writes as its second target; the sky is no reflection
+    // receiver, and an output left unwritten is not a cleared one (NVIDIA Vulkan wrote garbage through an empty
+    // write mask), so the shader writes the zero itself.
+    @if(FORWARD_SSR_GBUFFER)
+    @location(1) packed: vec4<u32>,
+}
+
 @fragment
-fn skybox_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+fn skybox_fragment(in: VertexOutput) -> FragmentOutput {
     let ray_direction = coords_to_ray_direction(in.position.xy, view.main_pass_viewport);
 
     // Cube maps are left-handed so we negate the z coordinate.
-    let out = textureSample(skybox, skybox_sampler, ray_direction * vec3(1.0, 1.0, -1.0));
-    return vec4(out.rgb * uniforms.brightness, out.a);
+    let sky = textureSample(skybox, skybox_sampler, ray_direction * vec3(1.0, 1.0, -1.0));
+    var out: FragmentOutput;
+    out.color = vec4(sky.rgb * uniforms.brightness, sky.a);
+    @if(FORWARD_SSR_GBUFFER)
+    out.packed = vec4<u32>(0u);
+    return out;
 }

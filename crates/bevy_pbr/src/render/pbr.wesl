@@ -79,6 +79,9 @@ fn fragment(
     // in deferred mode the lit color and these effects will be calculated in the deferred lighting shader
 @if(!PREPASS_PIPELINE)
     var out: FragmentOutput;
+    // MPS: the standard material is no screen-space reflection receiver (zero: see `forward_io.wesl`).
+@if(FORWARD_SSR_MRT)
+    out.packed = vec4<u32>(0u);
 @if(!PREPASS_PIPELINE)
     if (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) == 0u {
         out.color = apply_pbr_lighting(pbr_input);

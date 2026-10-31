@@ -3,7 +3,7 @@ use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
 use bevy_camera::Exposure;
 use bevy_ecs::{
     prelude::{Component, Entity},
-    query::With,
+    query::{Has, With},
     resource::Resource,
     schedule::IntoScheduleConfigs,
     system::{Commands, Local, Query, Res, ResMut},
@@ -29,7 +29,7 @@ use bevy_shader::Shader;
 use bevy_transform::components::Transform;
 use bevy_utils::default;
 
-use crate::core_3d::CORE_3D_DEPTH_FORMAT;
+use crate::core_3d::{ForwardSsrGBuffer, CORE_3D_DEPTH_FORMAT, FORWARD_SSR_GBUFFER_FORMAT};
 
 pub struct SkyboxPlugin;
 
@@ -141,12 +141,31 @@ struct SkyboxPipelineKey {
     target_format: TextureFormat,
     samples: u32,
     depth_format: TextureFormat,
+    /// MPS: the view's main opaque pass also writes a forward SSR G-buffer, which the skybox leaves untouched.
+    forward_ssr_gbuffer: bool,
 }
 
 impl SpecializedRenderPipeline for SkyboxPipeline {
     type Key = SkyboxPipelineKey;
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+        let mut targets = vec![Some(ColorTargetState {
+            format: key.target_format,
+            // BlendState::REPLACE is not needed here, and None will be potentially much faster in some cases.
+            blend: None,
+            write_mask: ColorWrites::ALL,
+        })];
+        let mut shader_defs = Vec::new();
+        if key.forward_ssr_gbuffer {
+            // MPS: the sky is no reflection receiver: the shader writes zero to the second attachment (an
+            // unwritten output behind an empty write mask was not left alone on NVIDIA Vulkan).
+            shader_defs.push("FORWARD_SSR_GBUFFER".into());
+            targets.push(Some(ColorTargetState {
+                format: FORWARD_SSR_GBUFFER_FORMAT,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            }));
+        }
         RenderPipelineDescriptor {
             label: Some("skybox_pipeline".into()),
             layout: vec![self.bind_group_layout.clone()],
@@ -177,12 +196,8 @@ impl SpecializedRenderPipeline for SkyboxPipeline {
             },
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
-                targets: vec![Some(ColorTargetState {
-                    format: key.target_format,
-                    // BlendState::REPLACE is not needed here, and None will be potentially much faster in some cases.
-                    blend: None,
-                    write_mask: ColorWrites::ALL,
-                })],
+                shader_defs,
+                targets,
                 ..default()
             }),
             ..default()
@@ -198,9 +213,9 @@ fn prepare_skybox_pipelines(
     pipeline_cache: Res<PipelineCache>,
     mut pipelines: ResMut<SpecializedRenderPipelines<SkyboxPipeline>>,
     pipeline: Res<SkyboxPipeline>,
-    cameras: Query<(Entity, &ExtractedView, &Msaa), With<Skybox>>,
+    cameras: Query<(Entity, &ExtractedView, &Msaa, Has<ForwardSsrGBuffer>), With<Skybox>>,
 ) {
-    for (entity, view, msaa) in &cameras {
+    for (entity, view, msaa, forward_ssr_gbuffer) in &cameras {
         let pipeline_id = pipelines.specialize(
             &pipeline_cache,
             &pipeline,
@@ -208,6 +223,7 @@ fn prepare_skybox_pipelines(
                 target_format: view.target_format,
                 samples: msaa.samples(),
                 depth_format: CORE_3D_DEPTH_FORMAT,
+                forward_ssr_gbuffer: forward_ssr_gbuffer && ForwardSsrGBuffer::is_supported(*msaa),
             },
         );
 

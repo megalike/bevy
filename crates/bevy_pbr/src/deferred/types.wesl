@@ -7,6 +7,9 @@ import package::render::{
 const DEFERRED_FLAGS_UNLIT_BIT: u32                 = 1u << 0u;
 const DEFERRED_FLAGS_FOG_ENABLED_BIT: u32           = 1u << 1u;
 const DEFERRED_MESH_FLAGS_SHADOW_RECEIVER_BIT: u32  = 1u << 2u;
+// MPS: set in a forward SSR G-buffer (`FORWARD_SSR_MRT`) by a fragment whose packed data is a valid reflection
+// receiver; a cleared or zero-written texel has no flags, so the SSR pass skips it.
+const DEFERRED_FLAGS_FORWARD_SSR_RECEIVER_BIT: u32  = 1u << 3u;
 
 fn deferred_flags_from_mesh_material_flags(mesh_flags: u32, mat_flags: u32) -> u32 {
     var flags = 0u;

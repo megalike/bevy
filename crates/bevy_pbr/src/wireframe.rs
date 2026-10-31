@@ -1528,6 +1528,8 @@ pub fn specialize_wireframes(
             };
 
             let mut mesh_key = *view_key;
+            // MPS: the wireframe pass has one color attachment.
+            mesh_key.remove(MeshPipelineKey::FORWARD_SSR_MRT);
             mesh_key |= MeshPipelineKey::from_primitive_topology_and_strip_index(
                 mesh.primitive_topology(),
                 mesh.index_format(),
