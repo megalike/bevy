@@ -30,6 +30,12 @@ struct LightProbeQueryResult {
     /// The flags that the light probe has: a combination of
     /// `LIGHT_PROBE_FLAG_*`.
     flags: u32,
+    /// The rotation from world space to light probe space, as a quaternion.
+    light_from_world_rotation: vec4<f32>,
+    /// The world-space point from which the cubemaps were captured.
+    capture_origin: vec3<f32>,
+    /// The priority where light probes overlap (`ReflectionProbePriority`).
+    priority: i32,
 };
 
 fn transpose_affine_matrix(matrix: mat3x4<f32>) -> mat4x4<f32> {
@@ -146,6 +152,9 @@ fn light_probe_iterator_next(iterator: ptr<function, LightProbeIterator>) -> Lig
         result.parallax_correction_bounds = light_probe.parallax_correction_bounds;
         result.flags = light_probe.flags;
         result.weight = weight;
+        result.light_from_world_rotation = light_probe.light_from_world_rotation;
+        result.capture_origin = light_probe.capture_origin;
+        result.priority = light_probe.priority;
         return result;
     }
 
@@ -243,6 +252,9 @@ fn light_probe_iterator_next(iterator: ptr<function, LightProbeIterator>) -> Lig
         result.parallax_correction_bounds = light_probe.parallax_correction_bounds;
         result.flags = light_probe.flags;
         result.weight = weight;
+        result.light_from_world_rotation = light_probe.light_from_world_rotation;
+        result.capture_origin = light_probe.capture_origin;
+        result.priority = light_probe.priority;
         return result;
     }
 

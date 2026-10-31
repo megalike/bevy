@@ -293,6 +293,17 @@ impl Default for GeneratedEnvironmentMapLight {
     }
 }
 
+/// Generates only the specular cubemap of a [`GeneratedEnvironmentMapLight`].
+///
+/// Add this marker next to a [`GeneratedEnvironmentMapLight`] whose diffuse
+/// map isn't needed, for example a reflection probe captured at runtime whose
+/// diffuse term comes from elsewhere. The irradiance convolution (a fixed cost
+/// comparable to the whole specular chain at small sizes) is skipped, and the
+/// generated [`EnvironmentMapLight::diffuse_map`] stays black.
+#[derive(Clone, Copy, Default, Component, Reflect, Debug)]
+#[reflect(Clone, Default, Component, Debug)]
+pub struct GeneratedEnvironmentMapSpecularOnly;
+
 /// Lets the atmosphere contribute environment lighting (reflections and ambient diffuse) to your scene.
 ///
 /// Attach this to a [`Camera3d`](bevy_camera::Camera3d) to light the entire view, or to a
@@ -441,6 +452,76 @@ pub enum ParallaxCorrection {
     /// correction will be centered on the reflection probe with a width of 3.0
     /// m, a height of 6.0 m, and a depth of 12.0 m.
     Custom(Vec3),
+}
+
+/// The point from which a reflection probe's cubemaps were captured, as an
+/// offset from the light probe's origin in light probe space (the 1×1×1 cube).
+///
+/// By default, Bevy treats the cubemaps as captured at the light probe's
+/// origin, the center of the parallax correction boundaries. A room often has
+/// something at its center (a crane, a lamp), or the capture belongs at eye
+/// height; this component lets the capture point and the boundaries differ.
+/// Parallax correction traces the reflected ray to the boundaries and samples
+/// the cubemap in the direction from this point to the hit. Without parallax
+/// correction ([`ParallaxCorrection::None`]) this component has no effect.
+///
+/// Place this component on an entity that has a [`LightProbe`] and
+/// [`EnvironmentMapLight`] component.
+#[derive(Clone, Copy, Default, Component, Reflect, Debug, PartialEq)]
+#[reflect(Clone, Default, Component, Debug, PartialEq)]
+pub struct ReflectionCaptureOrigin(pub Vec3);
+
+/// The priority of a reflection probe where reflection probes overlap.
+///
+/// Without this component (or with equal priorities) overlapping reflection
+/// probes blend by their falloff weights. With it, where a reflection probe of
+/// a higher priority has weight `w`, the reflection probes of lower priorities
+/// supply only the residual share `1 - w`, and the view's own
+/// [`EnvironmentMapLight`] what remains after all of them. A room inside a
+/// hall gets a higher priority than the hall's probe: deep inside the room
+/// the hall's reflections don't show, and they return over the room probe's
+/// falloff at its doorway.
+///
+/// Place this component on an entity that has a [`LightProbe`] and
+/// [`EnvironmentMapLight`] component. Irradiance volumes don't use it.
+#[derive(Clone, Copy, Default, Component, Reflect, Debug, PartialEq, Eq)]
+#[reflect(Clone, Default, Component, Debug, PartialEq)]
+pub struct ReflectionProbePriority(pub i32);
+
+/// Per-view settings for environment map lighting: whether a view's fragments
+/// take light from the reflection probes and irradiance volumes they lie in,
+/// and where their diffuse environment light comes from.
+///
+/// Add this component to a camera. Without it, a view uses every light probe
+/// in range and takes both the diffuse and the specular environment terms from
+/// the probes, falling back to the view's own [`EnvironmentMapLight`].
+#[derive(Clone, Copy, Component, Reflect, Debug, PartialEq)]
+#[reflect(Clone, Default, Component, Debug, PartialEq)]
+pub struct EnvironmentMapSettings {
+    /// Whether the view takes reflection probes and irradiance volumes into
+    /// account.
+    ///
+    /// Set this to false on a camera that captures a reflection probe, so that
+    /// the capture doesn't contain the probes' own reflections.
+    pub use_local_probes: bool,
+
+    /// Whether the diffuse environment term comes from the view's
+    /// [`EnvironmentMapLight`] alone, with reflection probes supplying only the
+    /// specular term.
+    ///
+    /// Set this to true when the probes' diffuse cubemaps don't represent the
+    /// light the scene should receive, for example when they hold captured
+    /// room radiance under a rendering model without indirect light.
+    pub diffuse_from_view: bool,
+}
+
+impl Default for EnvironmentMapSettings {
+    fn default() -> Self {
+        EnvironmentMapSettings {
+            use_local_probes: true,
+            diffuse_from_view: false,
+        }
+    }
 }
 
 /// A system that automatically adds a [`ParallaxCorrection::Auto`] component to
