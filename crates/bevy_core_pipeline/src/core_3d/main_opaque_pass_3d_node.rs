@@ -1,5 +1,5 @@
 use crate::{
-    core_3d::Opaque3d,
+    core_3d::{Opaque3d, ViewSsrGBuffer},
     skybox::{SkyboxBindGroup, SkyboxPipelineId},
 };
 use bevy_camera::{MainPassResolutionOverride, Viewport};
@@ -29,6 +29,7 @@ pub fn main_opaque_pass_3d(
         Option<&SkyboxBindGroup>,
         &ViewUniformOffset,
         Option<&MainPassResolutionOverride>,
+        Option<&ViewSsrGBuffer>,
     )>,
     opaque_phases: Res<ViewBinnedRenderPhases<Opaque3d>>,
     alpha_mask_phases: Res<ViewBinnedRenderPhases<AlphaMask3d>>,
@@ -46,6 +47,7 @@ pub fn main_opaque_pass_3d(
         skybox_bind_group,
         view_uniform_offset,
         resolution_override,
+        ssr_gbuffer,
     ) = view.into_inner();
 
     let (Some(opaque_phase), Some(alpha_mask_phase)) = (
@@ -61,12 +63,22 @@ pub fn main_opaque_pass_3d(
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
-    let color_attachments = [Some(target.get_color_attachment())];
+    // MPS: with a forward SSR G-buffer the pass writes it as slot 1 (cleared to zero on its first use each
+    // frame); the mesh pipelines of this pass carry the matching second target.
+    let color_attachments = [
+        Some(target.get_color_attachment()),
+        ssr_gbuffer.map(|gbuffer| gbuffer.texture.get_attachment()),
+    ];
+    let color_attachments = if ssr_gbuffer.is_some() {
+        &color_attachments[..]
+    } else {
+        &color_attachments[..1]
+    };
     let depth_stencil_attachment = Some(depth.get_attachment(StoreOp::Store));
 
     let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("main_opaque_pass_3d"),
-        color_attachments: &color_attachments,
+        color_attachments,
         depth_stencil_attachment,
         timestamp_writes: None,
         occlusion_query_set: None,

@@ -96,6 +96,7 @@ use crate::{
     },
     *,
 };
+use bevy_core_pipeline::core_3d::{ForwardSsrGBuffer, FORWARD_SSR_GBUFFER_FORMAT};
 use bevy_core_pipeline::oit::OrderIndependentTransparencySettings;
 use bevy_core_pipeline::prepass::{DeferredPrepass, DepthPrepass, NormalPrepass};
 use bevy_core_pipeline::tonemapping::{DebandDither, Tonemapping};
@@ -387,6 +388,7 @@ pub fn check_views_need_specialization(
             Has<ExtractedAtmosphere>,
             Has<ScreenSpaceReflectionsUniform>,
             Has<ContactShadows>,
+            Has<ForwardSsrGBuffer>,
         ),
     )>,
     mut seen_views: Local<HashSet<RetainedViewEntity>>,
@@ -406,7 +408,7 @@ pub fn check_views_need_specialization(
         projection,
         distance_fog,
         (has_environment_maps, has_irradiance_volumes),
-        (has_oit, has_atmosphere, has_ssr, has_contact_shadows),
+        (has_oit, has_atmosphere, has_ssr, has_contact_shadows, has_forward_ssr_gbuffer),
     ) in views.iter_mut()
     {
         seen_views.insert(view.retained_view_entity);
@@ -456,6 +458,13 @@ pub fn check_views_need_specialization(
 
         if has_contact_shadows {
             view_key |= MeshPipelineKey::CONTACT_SHADOWS;
+        }
+
+        // MPS: the main opaque pass of this view writes the forward SSR G-buffer as a second target (the same
+        // condition as `prepare_ssr_gbuffer_textures`). `specialize_material_meshes` keeps the bit only for the
+        // draws of that pass.
+        if has_forward_ssr_gbuffer && ForwardSsrGBuffer::is_supported(*msaa) {
+            view_key |= MeshPipelineKey::FORWARD_SSR_MRT;
         }
 
         if view.invert_culling {
@@ -3128,7 +3137,8 @@ bitflags::bitflags! {
         const INVERT_CULLING                    = 1 << 22;
         const PREPASS_READS_MATERIAL            = 1 << 23;
         const CONTACT_SHADOWS                   = 1 << 24;
-        const LAST_FLAG                         = Self::CONTACT_SHADOWS.bits();
+        const FORWARD_SSR_MRT                   = 1 << 25; // MPS: the draw writes the forward SSR G-buffer as target 1
+        const LAST_FLAG                         = Self::FORWARD_SSR_MRT.bits();
 
         const ALL_PREPASS_BITS                  = Self::DEPTH_PREPASS.bits()
                                                 | Self::NORMAL_PREPASS.bits()
@@ -3743,6 +3753,22 @@ impl SpecializedMeshPipeline for MeshPipeline {
 
         let format = key.target_format();
 
+        let mut targets = vec![Some(ColorTargetState {
+            format,
+            blend,
+            write_mask: ColorWrites::ALL,
+        })];
+        if key.contains(MeshPipelineKey::FORWARD_SSR_MRT) {
+            // MPS: the forward SSR G-buffer (`bevy_core_pipeline::core_3d::ViewSsrGBuffer`); the shader writes
+            // `FragmentOutput::packed`, valid receiver data or zero.
+            shader_defs.push("FORWARD_SSR_MRT".into());
+            targets.push(Some(ColorTargetState {
+                format: FORWARD_SSR_GBUFFER_FORMAT,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            }));
+        }
+
         // This is defined here so that custom shaders that use something other than
         // the mesh binding from bevy_pbr::render::mesh_bindings can easily make use of this
         // in their own shaders.
@@ -3763,11 +3789,7 @@ impl SpecializedMeshPipeline for MeshPipeline {
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
                 shader_defs,
-                targets: vec![Some(ColorTargetState {
-                    format,
-                    blend,
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets,
                 ..default()
             }),
             layout: bind_group_layout,
