@@ -10,7 +10,6 @@ import package::{
             view,
             globals,
             depth_prepass_texture,
-            deferred_prepass_texture,
             ssr_settings
         },
         pbr_functions,
@@ -44,6 +43,12 @@ import bevy_render::{
 
 @if(ENVIRONMENT_MAP) import package::light_probe::environment_map;
 
+// MPS: the forward mode reads the G-buffer the main opaque pass wrote (`FORWARD_SSR_MRT`), the deferred mode the
+// deferred prepass; the forward occlusion takes this frame's GTAO where the view has it.
+@if(!FORWARD_SSR_MRT) import package::render::mesh_view_bindings::deferred_prepass_texture;
+@if(FORWARD_SSR_MRT && SCREEN_SPACE_AMBIENT_OCCLUSION)
+import package::render::mesh_view_bindings::screen_space_ambient_occlusion_texture;
+
 /// The texture representing the color framebuffer.
 @group(2) @binding(0) var color_texture: texture_2d<f32>;
 
@@ -53,6 +58,19 @@ import bevy_render::{
 // Group 1, bindings 2 and 3 are in `raymarch.wesl`.
 
 @group(2) @binding(4) var stbn_texture: texture_2d_array<f32>;
+
+/// MPS: the forward SSR G-buffer (`bevy_core_pipeline::core_3d::ViewSsrGBuffer`).
+@if(FORWARD_SSR_MRT)
+@group(2) @binding(5) var forward_ssr_gbuffer_texture: texture_2d<u32>;
+
+/// MPS: a hit this close to the screen border (a share of the screen) is trusted less, since the reflected object
+/// is leaving the frame; the receiver keeps that share of its environment specular instead.
+const FORWARD_SSR_BORDER_FADE: f32 = 0.05;
+
+fn forward_ssr_border_confidence(hit_uv: vec2<f32>) -> f32 {
+    let distance = min(hit_uv, vec2(1.0) - hit_uv);
+    return smoothstep(0.0, FORWARD_SSR_BORDER_FADE, min(distance.x, distance.y));
+}
 
 struct BrdfSample {
     wi: vec3<f32>,
@@ -83,7 +101,8 @@ fn sample_specular_brdf(wo: vec3<f32>, roughness: f32, F0: vec3<f32>, urand: vec
 }
 
 /// Returns the reflected color in the RGB channel and the specular occlusion in
-/// the alpha channel.
+/// the alpha channel (MPS, the forward mode: the share of the environment specular
+/// the receiver keeps, 1 on a miss and the border fade's remainder on a hit).
 ///
 /// The general approach here is similar to [1]. We first project the reflection
 /// ray into screen space. Then we perform uniform steps along that screen-space
@@ -114,9 +133,12 @@ fn evaluate_ssr(R_world: vec3<f32>, P_world: vec3<f32>, jitter: f32) -> vec4<f32
 
     let raymarch_result = depth_ray_march_march(&raymarch);
     if (raymarch_result.hit) {
+        var environment_share = 0.0;
+        @if(FORWARD_SSR_MRT)
+        environment_share = 1.0 - forward_ssr_border_confidence(raymarch_result.hit_uv);
         return vec4(
             textureSampleLevel(color_texture, color_sampler, raymarch_result.hit_uv, 0.0).rgb,
-            0.0
+            environment_share
         );
     }
 
@@ -131,7 +153,18 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 
     // Load the G-buffer data.
     let fragment = textureLoad(color_texture, vec2<i32>(frag_coord.xy), 0);
-    let gbuffer = textureLoad(deferred_prepass_texture, vec2<i32>(frag_coord.xy), 0);
+    var gbuffer: vec4<u32>;
+@if(FORWARD_SSR_MRT) {
+    gbuffer = textureLoad(forward_ssr_gbuffer_texture, vec2<i32>(frag_coord.xy), 0);
+    // Not a receiver (the sky, a debug view, a material that wrote zero): the frame passes through.
+    let flags = pbr_deferred_types::unpack_flags(gbuffer.a);
+    if ((flags & pbr_deferred_types::DEFERRED_FLAGS_FORWARD_SSR_RECEIVER_BIT) == 0u) {
+        return fragment;
+    }
+}
+@if(!FORWARD_SSR_MRT) {
+    gbuffer = textureLoad(deferred_prepass_texture, vec2<i32>(frag_coord.xy), 0);
+}
     let pbr_input = pbr_input_from_deferred_gbuffer(frag_coord, gbuffer);
 
     // Don't do anything if the surface is too rough or too smooth
@@ -176,6 +209,13 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     }
     fade *= fade_xy.x * fade_xy.y;
 
+    // MPS: a receiver outside the roughness window keeps the frame as shaded; no ray is cast.
+@if(FORWARD_SSR_MRT) {
+    if (fade <= 0.0) {
+        return fragment;
+    }
+}
+
     // Unpack the PBR input.
     var specular_occlusion = pbr_input.specular_occlusion;
     let world_position = pbr_input.world_position.xyz;
@@ -187,6 +227,20 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 
     let roughness = lighting::perceptualRoughnessToRoughness(perceptual_roughness);
     let F0 = pbr_functions::calculate_F0(pbr_input.material.base_color.rgb, pbr_input.material.metallic, pbr_input.material.reflectance);
+
+    // MPS: the forward material's specular occlusion (Lagarde's formula on GTAO times the authored ambient shade,
+    // which the packed occlusion carries alone), recomputed here with this frame's GTAO so that the hit and the
+    // environment share it replaces are occluded alike.
+@if(FORWARD_SSR_MRT) {
+    var ao = pbr_input.diffuse_occlusion.x;
+    @if(SCREEN_SPACE_AMBIENT_OCCLUSION) {
+        let ssao_coord = vec2<i32>(in.position.xy - view.viewport.xy);
+        ao *= textureLoad(screen_space_ambient_occlusion_texture, ssao_coord, 0).r;
+    }
+    ao = saturate(ao);
+    let NdotV_occlusion = clamp(dot(N, V), 0.0001, 1.0);
+    specular_occlusion = saturate(pow(NdotV_occlusion + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
+}
 
     // Get some random numbers. If the spatio-temporal blue noise (STBN) texture
     // is available (i.e. not the 1x1 placeholder), we use it. Otherwise, we
@@ -228,6 +282,7 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // Do the raymarching.
     let ssr_specular = evaluate_ssr(R_stochastic, world_position, raymarch_jitter);
     var indirect_light = (ssr_specular.rgb * brdf_sample_value_over_pdf) * fade;
+    var environment_specular = vec3(0.0);
 
     // Sample the environment map if necessary.
     //
@@ -310,11 +365,24 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // main PBR pass.
     let environment_light = environment_map::environment_map_light(
         &lighting_input, &clusterable_object_index_ranges, true);
+    environment_specular = environment_light.specular;
 
     // Accumulate the environment map light.
     // Note that we multiply by (1.0 - ssr_specular.a * fade) to occlude the
     // environment map if SSR hits.
+    @if(!FORWARD_SSR_MRT)
     indirect_light += (view.exposure * environment_light.specular * specular_occlusion) * (1.0 - (1.0 - ssr_specular.a) * fade);
+}
+
+@if(FORWARD_SSR_MRT) {
+    // MPS: the opaque pass shaded the frame with the receiver's environment specular (exposed, occluded); a hit
+    // replaces that term's share q = hit confidence x roughness fade, a miss leaves the frame:
+    // Cout = C + q O (W H - exposure E), with H the hit's color (already exposed) and W the BRDF value over
+    // the sample's pdf (reviews/2026-10-31-hangar-ssr.md). The packed roughness and color leave a small residual
+    // in the subtracted E, which is measured, not clamped away.
+    let q = (1.0 - ssr_specular.a) * fade;
+    let replacement = ssr_specular.rgb * brdf_sample_value_over_pdf - view.exposure * environment_specular;
+    return vec4(fragment.rgb + q * specular_occlusion * replacement, fragment.a);
 }
 
     // Write the results.
