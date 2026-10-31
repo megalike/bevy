@@ -50,7 +50,9 @@ use bevy_ecs::{
 };
 use bevy_extract::extract_instances::ExtractInstance;
 use bevy_image::Image;
-use bevy_light::{EnvironmentMapLight, ParallaxCorrection};
+use bevy_light::{
+    EnvironmentMapLight, ParallaxCorrection, ReflectionCaptureOrigin, ReflectionProbePriority,
+};
 use bevy_math::{Affine3A, Quat, Vec3};
 use bevy_render::{
     render_asset::RenderAssets,
@@ -247,7 +249,11 @@ impl LightProbeComponent for EnvironmentMapLight {
     // view.
     type ViewLightProbeInfo = EnvironmentMapViewLightProbeInfo;
 
-    type QueryData = Option<Read<ParallaxCorrection>>;
+    type QueryData = (
+        Option<Read<ParallaxCorrection>>,
+        Option<Read<ReflectionCaptureOrigin>>,
+        Option<Read<ReflectionProbePriority>>,
+    );
 
     fn id(&self, image_assets: &RenderAssets<GpuImage>) -> Option<Self::AssetId> {
         if image_assets.get(&self.diffuse_map).is_none()
@@ -268,7 +274,7 @@ impl LightProbeComponent for EnvironmentMapLight {
 
     fn flags(
         &self,
-        maybe_parallax_correction: &<Self::QueryData as QueryData>::Item<'_, '_>,
+        (maybe_parallax_correction, _, _): &<Self::QueryData as QueryData>::Item<'_, '_>,
     ) -> RenderLightProbeFlags {
         let mut flags = RenderLightProbeFlags::empty();
         if self.affects_lightmapped_mesh_diffuse {
@@ -329,13 +335,27 @@ impl LightProbeComponent for EnvironmentMapLight {
 
     fn parallax_correction_bounds(
         &self,
-        maybe_parallax_correction: &<Self::QueryData as QueryData>::Item<'_, '_>,
+        (maybe_parallax_correction, _, _): &<Self::QueryData as QueryData>::Item<'_, '_>,
     ) -> Vec3 {
         match *maybe_parallax_correction {
             Some(&ParallaxCorrection::Custom(bounds)) => bounds,
             Some(&ParallaxCorrection::Auto) => Vec3::splat(0.5),
             Some(&ParallaxCorrection::None) | None => Vec3::ZERO,
         }
+    }
+
+    fn capture_origin(
+        &self,
+        (_, maybe_capture_origin, _): &<Self::QueryData as QueryData>::Item<'_, '_>,
+    ) -> Vec3 {
+        maybe_capture_origin.map_or(Vec3::ZERO, |origin| origin.0)
+    }
+
+    fn priority(
+        &self,
+        (_, _, maybe_priority): &<Self::QueryData as QueryData>::Item<'_, '_>,
+    ) -> i32 {
+        maybe_priority.map_or(0, |priority| priority.0)
     }
 }
 

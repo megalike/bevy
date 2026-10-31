@@ -19,7 +19,7 @@ use bevy_core_pipeline::mip_generation::{
 use bevy_ecs::{
     component::Component,
     entity::Entity,
-    query::Without,
+    query::{Has, Without},
     resource::Resource,
     schedule::IntoScheduleConfigs,
     system::{Commands, Query, Res, ResMut},
@@ -60,7 +60,9 @@ use bevy_render::{
 // [Lambertian convolution]: https://bruop.github.io/ibl/#:~:text=Lambertian%20Diffuse%20Component
 // [GGX convolution]: https://gpuopen.com/download/Bounded_VNDF_Sampling_for_Smith-GGX_Reflections.pdf
 
-use bevy_light::{EnvironmentMapLight, GeneratedEnvironmentMapLight};
+use bevy_light::{
+    EnvironmentMapLight, GeneratedEnvironmentMapLight, GeneratedEnvironmentMapSpecularOnly,
+};
 use bevy_shader::ShaderDefVal;
 use core::cmp::min;
 use tracing::info;
@@ -342,12 +344,13 @@ pub fn extract_generated_environment_map_entities(
             RenderEntity,
             &GeneratedEnvironmentMapLight,
             &EnvironmentMapLight,
+            Has<GeneratedEnvironmentMapSpecularOnly>,
         )>,
     >,
     mut commands: Commands,
     render_images: Res<RenderAssets<GpuImage>>,
 ) {
-    for (entity, filtered_env_map, env_map_light) in query.iter() {
+    for (entity, filtered_env_map, env_map_light, specular_only) in query.iter() {
         let Some(env_map) = render_images.get(&filtered_env_map.environment_map) else {
             continue;
         };
@@ -370,6 +373,7 @@ pub fn extract_generated_environment_map_entities(
             intensity: filtered_env_map.intensity,
             rotation: filtered_env_map.rotation,
             affects_lightmapped_mesh_diffuse: filtered_env_map.affects_lightmapped_mesh_diffuse,
+            generate_diffuse: !specular_only,
         };
         commands
             .get_entity(entity)
@@ -387,6 +391,9 @@ pub struct RenderEnvironmentMap {
     pub intensity: f32,
     pub rotation: Quat,
     pub affects_lightmapped_mesh_diffuse: bool,
+    /// Whether the diffuse map is generated too (false with
+    /// [`GeneratedEnvironmentMapSpecularOnly`]: only the specular map is).
+    pub generate_diffuse: bool,
 }
 
 #[derive(Component)]
@@ -455,7 +462,8 @@ pub struct GeneratorBindGroups {
     pub downsampling_first: BindGroup,
     pub downsampling_second: BindGroup,
     pub radiance: Vec<BindGroup>, // One per mip level
-    pub irradiance: BindGroup,
+    /// None when only the specular map is generated.
+    pub irradiance: Option<BindGroup>,
     pub copy: BindGroup,
 }
 
@@ -646,39 +654,41 @@ pub fn prepare_generated_environment_map_bind_groups(
             radiance_bind_groups.push(bind_group);
         }
 
-        // Create irradiance bind group
-        let irradiance_constants = FilteringConstants {
-            mip_level: 0.0,
-            // 32 phi, 32 theta = 1024 samples total
-            sample_count: 1024,
-            roughness: 1.0,
-            noise_size_bits,
-        };
+        // Create irradiance bind group, unless only the specular map is wanted
+        let irradiance_bind_group = env_map_light.generate_diffuse.then(|| {
+            let irradiance_constants = FilteringConstants {
+                mip_level: 0.0,
+                // 32 phi, 32 theta = 1024 samples total
+                sample_count: 1024,
+                roughness: 1.0,
+                noise_size_bits,
+            };
 
-        let mut irradiance_constants_buffer = UniformBuffer::from(irradiance_constants);
-        irradiance_constants_buffer.write_buffer(&render_device, &queue);
+            let mut irradiance_constants_buffer = UniformBuffer::from(irradiance_constants);
+            irradiance_constants_buffer.write_buffer(&render_device, &queue);
 
-        // create a 2d array view
-        let irradiance_map =
-            env_map_light
-                .diffuse_map
-                .texture
-                .create_view(&TextureViewDescriptor {
-                    dimension: Some(TextureViewDimension::D2Array),
-                    ..Default::default()
-                });
+            // create a 2d array view
+            let irradiance_map =
+                env_map_light
+                    .diffuse_map
+                    .texture
+                    .create_view(&TextureViewDescriptor {
+                        dimension: Some(TextureViewDimension::D2Array),
+                        ..Default::default()
+                    });
 
-        let irradiance_bind_group = render_device.create_bind_group(
-            "irradiance_bind_group",
-            &pipeline_cache.get_bind_group_layout(&layouts.irradiance),
-            &BindGroupEntries::sequential((
-                &textures.environment_map.default_view,
-                &samplers.linear,
-                &irradiance_map,
-                &irradiance_constants_buffer,
-                &stbn_texture_view,
-            )),
-        );
+            render_device.create_bind_group(
+                "irradiance_bind_group",
+                &pipeline_cache.get_bind_group_layout(&layouts.irradiance),
+                &BindGroupEntries::sequential((
+                    &textures.environment_map.default_view,
+                    &samplers.linear,
+                    &irradiance_map,
+                    &irradiance_constants_buffer,
+                    &stbn_texture_view,
+                )),
+            )
+        });
 
         // Create copy bind group (source env map → destination mip0)
         let src_view = env_map_light
@@ -896,8 +906,8 @@ pub fn filtering_system(
         }
 
         // Irradiance convolution pass
-        // Generate the diffuse environment map
-        {
+        // Generate the diffuse environment map (not for a specular-only light)
+        if let Some(irradiance_bind_group) = &bind_groups.irradiance {
             let mut compute_pass =
                 ctx.command_encoder()
                     .begin_compute_pass(&ComputePassDescriptor {
@@ -908,7 +918,7 @@ pub fn filtering_system(
             let irr_span = diagnostics.pass_span(&mut compute_pass, "lightprobe_irradiance_map");
 
             compute_pass.set_pipeline(irradiance_pipeline);
-            compute_pass.set_bind_group(0, &bind_groups.irradiance, &[]);
+            compute_pass.set_bind_group(0, irradiance_bind_group, &[]);
 
             // 32×32 texture processed with 8×8 workgroups for all 6 faces
             compute_pass.dispatch_workgroups(4, 4, 6);

@@ -15,7 +15,8 @@ use bevy_ecs::{
 use bevy_extract::extract_instances::ExtractInstancesPlugin;
 use bevy_image::Image;
 use bevy_light::{
-    cluster::ClusterVisibilityClass, EnvironmentMapLight, IrradianceVolume, LightProbe,
+    cluster::ClusterVisibilityClass, EnvironmentMapLight, EnvironmentMapSettings, IrradianceVolume,
+    LightProbe,
 };
 use bevy_math::{Affine3A, FloatOrd, Mat4, Quat, Vec3, Vec4};
 use bevy_platform::collections::HashMap;
@@ -114,6 +115,25 @@ struct RenderLightProbe {
     /// Various flags associated with the light probe: the bit value of
     /// [`RenderLightProbeFlags`].
     flags: u32,
+
+    /// The rotation from world space to light probe space, as a quaternion.
+    ///
+    /// Cubemap sample directions are formed in world space and rotated with
+    /// this, without the scale of [`Self::light_from_world_transposed`], which
+    /// would distort them in a light probe that isn't a cube.
+    light_from_world_rotation: Vec4,
+
+    /// The world-space point from which the cubemaps were captured.
+    ///
+    /// See [`bevy_light::ReflectionCaptureOrigin`]. This is the light probe's
+    /// origin unless that component says otherwise.
+    capture_origin: Vec3,
+
+    /// The priority of this light probe where light probes overlap: a higher
+    /// one takes its weight first, lower ones share what's left.
+    ///
+    /// See [`bevy_light::ReflectionProbePriority`].
+    priority: i32,
 }
 
 /// A per-view shader uniform that specifies all the light probes that the view
@@ -156,6 +176,13 @@ pub struct LightProbesUniform {
     ///
     /// This will be 1 if the map does affect lightmapped meshes or 0 otherwise.
     view_environment_map_affects_lightmapped_mesh_diffuse: u32,
+
+    /// Whether the diffuse environment term comes from the view's environment
+    /// map alone, reflection probes supplying only the specular term.
+    ///
+    /// This will be 1 if so or 0 otherwise. See
+    /// [`EnvironmentMapSettings::diffuse_from_view`].
+    diffuse_from_view: u32,
 }
 
 /// A GPU buffer that stores information about all light probes.
@@ -219,6 +246,15 @@ where
 
     // Various flags associated with the light probe.
     flags: RenderLightProbeFlags,
+
+    // The rotation from world space to light probe space.
+    light_from_world_rotation: Quat,
+
+    // The world-space point from which the cubemaps were captured.
+    capture_origin: Vec3,
+
+    // The priority where light probes overlap.
+    priority: i32,
 
     // The IDs of all assets associated with this light probe.
     //
@@ -288,6 +324,10 @@ where
     /// probe. Currently, the only light probe type that supports this is the
     /// [`EnvironmentMapLight`].
     view_light_probe_info: Option<C::ViewLightProbeInfo>,
+
+    /// Whether the view takes its diffuse environment term from its own
+    /// environment map alone ([`EnvironmentMapSettings::diffuse_from_view`]).
+    diffuse_from_view: bool,
 }
 
 /// A trait implemented by all components that represent light probes.
@@ -368,6 +408,26 @@ pub trait LightProbeComponent: Send + Sync + Component + Sized {
     ) -> Vec3 {
         Vec3::ZERO
     }
+
+    /// Returns the point from which this light probe's textures were captured,
+    /// in light probe space.
+    ///
+    /// See the comments in [`bevy_light::ReflectionCaptureOrigin`] for more
+    /// details.
+    fn capture_origin(
+        &self,
+        _query_components: &<Self::QueryData as QueryData>::Item<'_, '_>,
+    ) -> Vec3 {
+        Vec3::ZERO
+    }
+
+    /// Returns the priority of this light probe where light probes overlap.
+    ///
+    /// See the comments in [`bevy_light::ReflectionProbePriority`] for more
+    /// details.
+    fn priority(&self, _query_components: &<Self::QueryData as QueryData>::Item<'_, '_>) -> i32 {
+        0
+    }
 }
 
 impl Plugin for LightProbePlugin {
@@ -411,7 +471,16 @@ fn gather_light_probes<C>(
     image_assets: Res<RenderAssets<GpuImage>>,
     light_probe_query: Extract<Query<(Entity, &GlobalTransform, &LightProbe, &C, C::QueryData)>>,
     view_query: Extract<
-        Query<(RenderEntity, &GlobalTransform, &VisibleEntities, Option<&C>), With<Camera3d>>,
+        Query<
+            (
+                RenderEntity,
+                &GlobalTransform,
+                &VisibleEntities,
+                Option<&C>,
+                Option<&EnvironmentMapSettings>,
+            ),
+            With<Camera3d>,
+        >,
     >,
     mut view_light_probe_info: Local<Vec<LightProbeInfo<C>>>,
     mut commands: Commands,
@@ -419,9 +488,18 @@ fn gather_light_probes<C>(
     C: LightProbeComponent,
 {
     // Build up the light probes uniform and the key table.
-    for (view_entity, view_transform, visible_entities, view_component) in view_query.iter() {
+    for (view_entity, view_transform, visible_entities, view_component, settings) in
+        view_query.iter()
+    {
+        let settings = settings.copied().unwrap_or_default();
         view_light_probe_info.clear();
-        let visible_light_probes = visible_entities.get(TypeId::of::<ClusterVisibilityClass>());
+        // A view that excludes local light probes (a reflection probe capture)
+        // keeps only the environment map attached to the view itself.
+        let visible_light_probes = if settings.use_local_probes {
+            visible_entities.get(TypeId::of::<ClusterVisibilityClass>())
+        } else {
+            &[]
+        };
         for &main_entity in visible_light_probes {
             let Ok(query_row) = light_probe_query.get(main_entity) else {
                 // This might not be a light probe. If so, ignore it.
@@ -445,6 +523,7 @@ fn gather_light_probes<C>(
         // Create the light probes list.
         let mut render_view_light_probes =
             C::create_render_view_light_probes(view_component, &image_assets);
+        render_view_light_probes.diffuse_from_view = settings.diffuse_from_view;
 
         // Gather up the light probes in the list.
         render_view_light_probes.maybe_gather_light_probes(&view_light_probe_info);
@@ -540,6 +619,8 @@ fn upload_light_probes(
                 Some(view_light_probe_info) => view_light_probe_info.rotation.inverse().into(),
                 None => Quat::IDENTITY.into(),
             },
+            diffuse_from_view: render_view_environment_maps
+                .is_some_and(|maps| maps.diffuse_from_view) as u32,
         };
 
         // Add any environment maps that [`gather_light_probes`] found to the
@@ -581,6 +662,7 @@ impl Default for LightProbesUniform {
             intensity_for_view: 1.0,
             view_environment_map_affects_lightmapped_mesh_diffuse: 1,
             view_rotation: Quat::IDENTITY.into(),
+            diffuse_from_view: 0,
         }
     }
 }
@@ -606,6 +688,10 @@ where
             environment_map.get_world_from_light_matrix(&light_probe_transform.affine());
         let light_from_world_transposed = Mat4::from(world_from_light.inverse()).transpose();
         let bounding_sphere_radius = (world_from_light.matrix3 * Vec3::ONE).length();
+        let (light_from_world_rotation, capture_origin) = capture_frame(
+            &world_from_light,
+            environment_map.capture_origin(&query_components),
+        );
         environment_map.id(image_assets).map(|id| LightProbeInfo {
             main_entity: main_entity.into(),
             world_from_light,
@@ -621,6 +707,9 @@ where
             asset_id: id,
             intensity: environment_map.intensity(),
             flags: environment_map.flags(&query_components),
+            light_from_world_rotation,
+            capture_origin,
+            priority: environment_map.priority(&query_components),
         })
     }
 
@@ -646,6 +735,7 @@ where
             main_entity_to_render_light_probe_index: MainEntityHashMap::default(),
             render_light_probes: vec![],
             view_light_probe_info: None,
+            diffuse_from_view: false,
         }
     }
 
@@ -707,9 +797,28 @@ where
                 texture_index: cubemap_index as i32,
                 intensity: light_probe.intensity,
                 flags: light_probe.flags.bits() as u32,
+                light_from_world_rotation: light_probe.light_from_world_rotation.into(),
+                capture_origin: light_probe.capture_origin,
+                priority: light_probe.priority,
             });
         }
     }
+}
+
+/// Returns the rotation from world space to light probe space and the
+/// world-space capture point of a light probe, given its light-to-world
+/// transform and its capture origin in light probe space.
+///
+/// Cubemap sample directions are formed in world space and rotated into the
+/// light probe's frame with the rotation alone: the full inverse transform
+/// would scale them by the light probe's extents, which distorts directions in
+/// a light probe that isn't a cube.
+fn capture_frame(world_from_light: &Affine3A, capture_origin: Vec3) -> (Quat, Vec3) {
+    let (_, rotation, _) = world_from_light.to_scale_rotation_translation();
+    (
+        rotation.inverse(),
+        world_from_light.transform_point3(capture_origin),
+    )
 }
 
 impl<C> Clone for LightProbeInfo<C>
@@ -726,6 +835,9 @@ where
             bounding_sphere_radius: self.bounding_sphere_radius,
             intensity: self.intensity,
             flags: self.flags,
+            light_from_world_rotation: self.light_from_world_rotation,
+            capture_origin: self.capture_origin,
+            priority: self.priority,
             asset_id: self.asset_id.clone(),
         }
     }
@@ -793,4 +905,178 @@ pub(crate) fn binding_arrays_are_usable(
             WgpuFeatures::TEXTURE_BINDING_ARRAY
                 | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy_math::{Affine3A, Quat, Vec3};
+
+    use super::capture_frame;
+
+    /// The reflection probe blend of `compute_radiances` in
+    /// `environment_map.wesl` on the CPU: probes as (priority, weight,
+    /// radiance), the view environment map's radiance, the blended radiance.
+    /// Each pass takes one priority level, highest first; a level's probes
+    /// blend by weight (normalized when their weights exceed 1) and take
+    /// `min(1, Σw)` of what the higher levels left; the view map fills the
+    /// rest.
+    fn blend_by_priority(probes: &[(i32, f32, f32)], view: Option<f32>) -> f32 {
+        let mut radiance = 0.0;
+        let mut remaining = 1.0f32;
+        let mut level = probes.iter().map(|p| p.0).max();
+        while let Some(priority) = level
+            && remaining > 0.0001
+        {
+            let (level_radiance, level_weight) = probes
+                .iter()
+                .filter(|p| p.0 == priority)
+                .fold((0.0, 0.0), |(r, w), p| (r + p.2 * p.1, w + p.1));
+            radiance += level_radiance * remaining / level_weight.max(1.0);
+            remaining *= 1.0 - level_weight.min(1.0);
+            level = probes.iter().map(|p| p.0).filter(|p| *p < priority).max();
+        }
+        if remaining > 0.0001 {
+            match view {
+                Some(view) => radiance += view * remaining,
+                None if remaining < 1.0 => radiance /= 1.0 - remaining,
+                None => {}
+            }
+        }
+        radiance
+    }
+
+    #[test]
+    fn equal_priorities_blend_as_before_and_a_higher_one_takes_its_weight_first() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        // Equal priorities: the stock weighted sum, the view map filling the deficit.
+        assert!(close(blend_by_priority(&[(0, 1.0, 10.0)], Some(1.0)), 10.0));
+        assert!(close(blend_by_priority(&[(0, 0.25, 10.0)], Some(2.0)), 4.0));
+        assert!(close(
+            blend_by_priority(&[(0, 1.0, 10.0), (0, 1.0, 20.0)], Some(1.0)),
+            15.0
+        ));
+        assert!(close(
+            blend_by_priority(&[(0, 0.5, 10.0), (0, 0.25, 20.0)], Some(4.0)),
+            11.0
+        ));
+        // Without a view map the probes are renormalized, as before.
+        assert!(close(blend_by_priority(&[(0, 0.25, 10.0)], None), 10.0));
+        assert!(close(
+            blend_by_priority(&[(0, 0.5, 10.0), (0, 0.25, 20.0)], None),
+            40.0 / 3.0
+        ));
+        assert!(close(blend_by_priority(&[], Some(3.0)), 3.0));
+        // A container inside the hall: deep inside, the container alone.
+        assert!(close(
+            blend_by_priority(&[(0, 1.0, 10.0), (1, 1.0, 20.0)], Some(1.0)),
+            20.0
+        ));
+        // At its doorway, weight 0.3: the hall supplies the residual 0.7.
+        assert!(close(
+            blend_by_priority(&[(0, 1.0, 10.0), (1, 0.3, 20.0)], Some(1.0)),
+            13.0
+        ));
+        // Both fading at the hall's own doorway: the rest comes from the view map.
+        assert!(close(
+            blend_by_priority(&[(0, 0.5, 10.0), (1, 0.3, 20.0)], Some(1.0)),
+            6.0 + 3.5 + 0.35
+        ));
+        // Three levels, and two probes sharing the top one.
+        assert!(close(
+            blend_by_priority(
+                &[
+                    (0, 1.0, 10.0),
+                    (5, 0.5, 20.0),
+                    (9, 0.25, 40.0),
+                    (9, 0.25, 80.0)
+                ],
+                Some(1.0)
+            ),
+            30.0 + 5.0 + 2.5
+        ));
+        // The order of the list doesn't matter.
+        assert!(close(
+            blend_by_priority(&[(1, 0.3, 20.0), (0, 1.0, 10.0)], Some(1.0)),
+            13.0
+        ));
+    }
+
+    /// The slab test of `compute_cubemap_sample_dir` in `environment_map.wesl`
+    /// on the CPU: the ray parameter at which a ray leaving `world_origin`
+    /// along `world_direction` reaches the parallax correction boundaries.
+    fn parallax_hit_t(
+        light_from_world: &Affine3A,
+        bounds: Vec3,
+        world_origin: Vec3,
+        world_direction: Vec3,
+    ) -> f32 {
+        let ray_origin = light_from_world.transform_point3(world_origin);
+        let ray_direction = light_from_world.transform_vector3(world_direction);
+        let t0 = (-bounds - ray_origin) / ray_direction;
+        let t1 = (bounds - ray_origin) / ray_direction;
+        let valid = |t: f32| if t >= 0.0 { t } else { f32::MAX };
+        let t_min = Vec3::new(
+            valid(t0.x).min(valid(t1.x)),
+            valid(t0.y).min(valid(t1.y)),
+            valid(t0.z).min(valid(t1.z)),
+        );
+        t_min.x.min(t_min.y).min(t_min.z)
+    }
+
+    /// A labeled 60 × 12 × 30 m room, rotated and offset, captured away from
+    /// its center: the corrected sample direction points from the capture
+    /// point to the wall the reflected ray reaches, with the room's real
+    /// proportions, where the direction in normalized light probe coordinates
+    /// would be squeezed by the box's scale.
+    #[test]
+    fn box_projection_samples_from_the_capture_origin_in_world_proportions() {
+        let scale = Vec3::new(60.0, 12.0, 30.0);
+        let rotation = Quat::from_rotation_y(0.7);
+        let world_from_light =
+            Affine3A::from_scale_rotation_translation(scale, rotation, Vec3::new(2.0, 6.0, -3.0));
+        let light_from_world = world_from_light.inverse();
+        // Eye height, a quarter of the room towards -X, in light probe space.
+        let capture_light = Vec3::new(-0.25, -0.35, 0.0);
+        let (light_from_world_rotation, capture_world) =
+            capture_frame(&world_from_light, capture_light);
+        assert!((light_from_world_rotation * rotation).abs_diff_eq(Quat::IDENTITY, 1e-6));
+        assert!(capture_world.abs_diff_eq(world_from_light.transform_point3(capture_light), 1e-5));
+
+        // A fragment just above the floor near the center, reflecting towards
+        // the +X wall, slightly up.
+        let fragment_light = Vec3::new(0.1, -0.45, 0.2);
+        let fragment_world = world_from_light.transform_point3(fragment_light);
+        let direction_light = Vec3::new(1.0, 0.2, -0.3) / scale; // one meter per unit in world
+        let direction_world = world_from_light
+            .transform_vector3(direction_light)
+            .normalize();
+        let direction_light = light_from_world.transform_vector3(direction_world);
+
+        let bounds = Vec3::splat(0.5);
+        let t = parallax_hit_t(&light_from_world, bounds, fragment_world, direction_world);
+        let hit_light = fragment_light + direction_light * t;
+        assert!(
+            (hit_light.x - 0.5).abs() < 1e-5,
+            "the ray reaches the +X wall: {hit_light}"
+        );
+
+        // The shader: the hit in world space, seen from the capture point,
+        // rotated into the light probe's frame.
+        let hit_world = fragment_world + direction_world * t;
+        let shader_dir = (light_from_world_rotation * (hit_world - capture_world)).normalize();
+        // The expected direction, measured in meters inside the room.
+        let expected = ((hit_light - capture_light) * scale).normalize();
+        assert!(
+            shader_dir.abs_diff_eq(expected, 1e-4),
+            "{shader_dir} vs {expected}"
+        );
+        // What the uncorrected shader sampled: the hit in normalized
+        // coordinates, which squeezes the room's long axes.
+        let normalized = (hit_light - capture_light).normalize();
+        assert!(shader_dir.angle_between(normalized) > 0.3);
+        // Direction-only sampling rotates without the scale.
+        let direction_only = light_from_world_rotation * direction_world;
+        assert!(direction_only.abs_diff_eq(rotation.inverse() * direction_world, 1e-6));
+        assert!(direction_only.angle_between(direction_light.normalize()) > 0.3);
+    }
 }
