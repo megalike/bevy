@@ -1,4 +1,6 @@
-import package::light_probe::{light_probe_iterator_new, light_probe_iterator_next, LightProbeQueryResult};
+import package::light_probe::{
+    light_probe_faces_fragment, light_probe_iterator_new, light_probe_iterator_next, LightProbeQueryResult
+};
 import package::render::mesh_view_bindings as bindings;
 import package::render::mesh_view_bindings::light_probes;
 import package::render::mesh_view_types::{
@@ -222,7 +224,9 @@ fn compute_radiances(
     let radiance_direction = radiance_sample_direction(N, R, roughness);
     let identity_rotation = vec4<f32>(0.0, 0.0, 0.0, 1.0);
 
-    // Find all reflection probes that contain the fragment. Reflection probes
+    // Find all reflection probes that contain the fragment (in the shell
+    // between a probe's parallax correction boundaries and its influence box,
+    // only if the fragment faces the boundaries). Reflection probes
     // of one priority blend in a weighted sum; where reflection probes of a
     // higher priority have weight `w` (at most 1), those of lower priorities
     // supply only the residual share `1 - w` (see `ReflectionProbePriority`).
@@ -249,6 +253,9 @@ fn compute_radiances(
         let query_result = light_probe_iterator_next(&iterator);
         if (query_result.texture_index < 0) {
             break;
+        }
+        if (!light_probe_faces_fragment(query_result, N)) {
+            continue;
         }
         if (have_level && query_result.priority < level_priority) {
             if (!have_next || query_result.priority > next_priority) {
@@ -302,6 +309,9 @@ fn compute_radiances(
                 let query_result = light_probe_iterator_next(&iterator);
                 if (query_result.texture_index < 0) {
                     break;
+                }
+                if (!light_probe_faces_fragment(query_result, N)) {
+                    continue;
                 }
                 if (query_result.priority == level_priority) {
                     let probe = sample_reflection_probe(
