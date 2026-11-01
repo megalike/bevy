@@ -309,6 +309,15 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 
     // Do the raymarching.
     let ssr_specular = evaluate_ssr(R_stochastic, world_position, raymarch_jitter, perceptual_roughness);
+    @if(FORWARD_SSR_MRT)
+    let q = (1.0 - ssr_specular.a) * fade;
+@if(FORWARD_SSR_MRT) {
+    // MPS: only zero replacement leaves the frame unchanged; crossed-ray misses can still darken probes.
+    if (q == 0.0) {
+        return fragment;
+    }
+}
+
     var indirect_light = (ssr_specular.rgb * brdf_sample_value_over_pdf) * fade;
     var environment_specular = vec3(0.0);
 
@@ -408,7 +417,6 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // Cout = C + q O (W H - exposure E), with H the hit's color (already exposed) and W the BRDF value over
     // the sample's pdf (reviews/2026-10-31-hangar-ssr.md). The packed roughness and color leave a small residual
     // in the subtracted E, which is measured, not clamped away.
-    let q = (1.0 - ssr_specular.a) * fade;
     let replacement = ssr_specular.rgb * brdf_sample_value_over_pdf - view.exposure * environment_specular;
     return vec4(fragment.rgb + q * specular_occlusion * replacement, fragment.a);
 }
