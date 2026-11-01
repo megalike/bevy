@@ -45,14 +45,6 @@ fn weighted_average(depth0: f32, depth1: f32, depth2: f32, depth3: f32) -> f32 {
     return ((weight0 * depth0) + (weight1 * depth1) + (weight2 * depth2) + (weight3 * depth3)) / weight_total;
 }
 
-@if(HALF_RESOLUTION)
-fn load_half_depth(pixel_coordinates: vec2<i32>) -> f32 {
-    // MPS: Keep the representative texel identical in tracing and upsampling, including odd edges.
-    let last_pixel = (vec2<i32>(view.main_pass_viewport.zw) - 1i) / 2i;
-    let coordinates = min(pixel_coordinates, last_pixel) * 2i + vec2<i32>(view.main_pass_viewport.xy);
-    return textureLoad(input_depth, coordinates, 0);
-}
-
 /// Used to share the depths from the previous MIP level between all invocations in a workgroup
 var<workgroup> previous_mip_depth: array<array<f32, 8>, 8>;
 
@@ -66,16 +58,9 @@ fn preprocess_depth(@builtin(global_invocation_id) global_id: vec3<u32>, @builti
     let pixel_coordinates1 = pixel_coordinates0 + vec2<i32>(1i, 0i);
     let pixel_coordinates2 = pixel_coordinates0 + vec2<i32>(0i, 1i);
     let pixel_coordinates3 = pixel_coordinates0 + vec2<i32>(1i, 1i);
-@if(HALF_RESOLUTION)
-    let depths = vec4<f32>(
-        load_half_depth(pixel_coordinates2), load_half_depth(pixel_coordinates3),
-        load_half_depth(pixel_coordinates1), load_half_depth(pixel_coordinates0),
-    );
-@else {
     let input_depth_size = vec2<f32>(textureDimensions(input_depth));
     let depths_uv = (vec2<f32>(pixel_coordinates0) + view.viewport.xy) / input_depth_size;
     let depths = textureGather(input_depth, point_clamp_sampler, depths_uv, vec2<i32>(1i, 1i));
-}
     textureStore(preprocessed_depth_mip0, pixel_coordinates0, vec4<f32>(depths.w, 0.0, 0.0, 0.0));
     textureStore(preprocessed_depth_mip0, pixel_coordinates1, vec4<f32>(depths.z, 0.0, 0.0, 0.0));
     textureStore(preprocessed_depth_mip0, pixel_coordinates2, vec4<f32>(depths.x, 0.0, 0.0, 0.0));
