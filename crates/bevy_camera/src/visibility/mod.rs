@@ -937,7 +937,12 @@ pub fn add_visibility_class<C>(
     C: 'static,
 {
     if let Some(mut visibility_class) = world.get_mut::<VisibilityClass>(entity) {
-        visibility_class.push(TypeId::of::<C>());
+        // MPS: the hook runs again when the component is removed and reinserted, and a repeated
+        // class would list the entity twice in `VisibleEntities`.
+        let class = TypeId::of::<C>();
+        if !visibility_class.contains(&class) {
+            visibility_class.push(class);
+        }
     }
 }
 
@@ -945,6 +950,21 @@ pub fn add_visibility_class<C>(
 mod test {
     use super::*;
     use bevy_app::prelude::*;
+
+    #[derive(Component)]
+    #[component(on_add = add_visibility_class::<ClassMarker>)]
+    #[require(VisibilityClass)]
+    struct ClassMarker;
+
+    #[test]
+    fn reinserting_a_component_keeps_one_visibility_class() {
+        let mut world = World::new();
+        let entity = world.spawn(ClassMarker).id();
+        world.entity_mut(entity).remove::<ClassMarker>();
+        world.entity_mut(entity).insert(ClassMarker);
+        let class = world.get::<VisibilityClass>(entity).unwrap();
+        assert_eq!(class.as_slice(), &[TypeId::of::<ClassMarker>()]);
+    }
 
     #[test]
     fn visibility_propagation() {
