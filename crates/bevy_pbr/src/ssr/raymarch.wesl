@@ -255,6 +255,10 @@ struct DepthRaymarchDistanceFn {
     depth_thickness: f32,
 
     use_sloppy_march: bool,
+
+    /// MPS: skip the bilinear taps of a step that can't be a hit. Needs `march_behind_surfaces` (the thickness test
+    /// decides a step) and no secant (the only reader of a non-hit's distance).
+    reject_on_nearest: bool,
 }
 
 fn depth_raymarch_distance_fn_evaluate(
@@ -287,8 +291,23 @@ fn depth_raymarch_distance_fn_evaluate(
     // * The false occlusions due to duplo land are rejected because the ray stays above the smooth surface.
     // * The shrink-wrap surface is no longer continuous, so it's possible for rays to miss it.
 
-    let linear_depth = 1.0 / depth_sample_linear(interp_uv, (*distance_fn).depth_tex_size);
     let unfiltered_depth = 1.0 / depth_sample_nearest(interp_uv, (*distance_fn).depth_tex_size);
+
+    let bias = 0.000002;
+
+    // MPS: a hit needs the ray below both surfaces and less than the thickness behind both, so where the nearest
+    // surface alone rules it out the bilinear taps can't change the outcome, and the marcher never reads this step's
+    // distance (see `reject_on_nearest`). The margin of a few ulps keeps a step the tests below might take, however a
+    // driver rounds or fuses them.
+    let margin = 0.000001;
+    if (*distance_fn).reject_on_nearest && (
+        unfiltered_depth * (1.0 + bias) >= ray_depth * (1.0 + margin) ||
+        ray_depth * (1.0 - margin) - unfiltered_depth >= (*distance_fn).depth_thickness
+    ) {
+        return DistanceWithPenetration(0.0, false, 0.0);
+    }
+
+    let linear_depth = 1.0 / depth_sample_linear(interp_uv, (*distance_fn).depth_tex_size);
 
     var max_depth: f32;
     var min_depth: f32;
@@ -300,8 +319,6 @@ fn depth_raymarch_distance_fn_evaluate(
         max_depth = max(linear_depth, unfiltered_depth);
         min_depth = min(linear_depth, unfiltered_depth);
     }
-
-    let bias = 0.000002;
 
     var res: DistanceWithPenetration;
     res.distance = max_depth * (1.0 + bias) - ray_depth;
@@ -523,6 +540,7 @@ fn depth_ray_march_march(raymarch: ptr<function, DepthRayMarch>) -> DepthRayMarc
     distance_fn.march_behind_surfaces = (*raymarch).march_behind_surfaces;
     distance_fn.depth_thickness = depth_thickness;
     distance_fn.use_sloppy_march = (*raymarch).use_sloppy_march;
+    distance_fn.reject_on_nearest = (*raymarch).march_behind_surfaces && !(*raymarch).use_secant;
 
     var hit: DistanceWithPenetration;
 
