@@ -68,25 +68,25 @@ fn compute_cubemap_sample_dir(
         let ray_origin = (light_from_world * vec4(world_ray_origin, 1.0)).xyz;
         let ray_direction = (light_from_world * vec4(world_ray_direction, 0.0)).xyz;
 
-        // Solve for the intersection of that ray with each side of the cube.
+        // MPS: the ray leaves the box where it leaves the first of the three
+        // slabs: per axis the plane it travels towards, then the minimum. The
+        // nearest positive plane jumped between a face and the far wall for a
+        // fragment on a face, with the sign of the position's rounding.
         // Since our light probe is a 1×1×1 cube centered at the origin in light
         // probe space, the faces of the cube are at X = ±0.5, Y = ±0.5, and Z =
         // ±0.5.
-        var t0 = (-parallax_correction_bounds - ray_origin) / ray_direction;
-        var t1 = (parallax_correction_bounds - ray_origin) / ray_direction;
-
-        // We're shooting the rays forward, so we need to rule out negative time
-        // values. So, if t is negative, make it a large value so that we won't
-        // choose it below.
-        // We would use infinity here but WGSL forbids it:
+        // A ray parallel to an axis never leaves that slab. We would use
+        // infinity here but WGSL forbids it:
         // https://github.com/gfx-rs/wgpu/issues/5515
-        t0 = select(vec3(FLOAT_MAX), t0, t0 >= vec3(0.0));
-        t1 = select(vec3(FLOAT_MAX), t1, t1 >= vec3(0.0));
+        let t_far = select(
+            vec3(FLOAT_MAX),
+            (sign(ray_direction) * parallax_correction_bounds - ray_origin) / ray_direction,
+            abs(ray_direction) > vec3(1e-6),
+        );
 
-        // Choose the minimum valid time value to find the intersection of the
-        // first cube face.
-        let t_min = min(t0, t1);
-        let t = min(min(t_min.x, t_min.y), t_min.z);
+        // A ray that leaves behind its origin, from outside the box, stays at
+        // the fragment; the result is continuous with a ray that just misses.
+        let t = max(min(min(t_far.x, t_far.y), t_far.z), 0.0);
 
         // The transform is affine, so the ray reaches the face at the same `t`
         // in world space. Sample the cubemap in the direction from the capture
