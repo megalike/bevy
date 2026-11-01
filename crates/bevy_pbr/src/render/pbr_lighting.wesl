@@ -666,6 +666,15 @@ fn point_light(
     );
     let L_spec = specular_L_a_prime.xyz;
     let a_prime = specular_L_a_prime.w;
+
+@if(!STANDARD_MATERIAL_CLEARCOAT && !STANDARD_MATERIAL_DIFFUSE_TRANSMISSION) {
+    // MPS: a sphere's specular direction can face the surface even when its center does not.
+    // Leave variants with additional lobes on the full evaluation path.
+    if ((!enable_diffuse || dot(N, L) <= 0.0) && dot(N, L_spec) <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+}
+
     var specular_derived_input = derive_lighting_input(N, V, L_spec);
 
     let normalizationFactor = a / a_prime;
