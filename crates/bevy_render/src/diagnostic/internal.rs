@@ -212,6 +212,7 @@ struct SpanRecord {
     begin_instant: Option<Instant>,
     end_instant: Option<Instant>,
     pipeline_statistics_index: Option<u32>,
+    draw_commands: Option<u32>,
 }
 
 struct FrameData {
@@ -393,6 +394,7 @@ impl FrameData {
             begin_instant: None,
             end_instant: None,
             pipeline_statistics_index: None,
+            draw_commands: None,
         });
 
         self.open_spans.last_mut().unwrap()
@@ -463,11 +465,13 @@ impl FrameData {
 
         let begin_timestamp_index = self.write_timestamp(pass, true);
         let pipeline_statistics_index = self.write_pipeline_statistics(pass);
+        let draw_commands = pass.draw_commands();
 
         let span = self.open_span(Some(P::KIND), name);
         span.begin_instant = Some(begin_instant);
         span.begin_timestamp_index = begin_timestamp_index;
         span.pipeline_statistics_index = pipeline_statistics_index;
+        span.draw_commands = draw_commands;
     }
 
     fn end_pass(&mut self, pass: &mut impl Pass) {
@@ -475,6 +479,10 @@ impl FrameData {
 
         let span = self.close_span();
         span.end_timestamp_index = end_timestamp_index;
+        span.draw_commands = pass
+            .draw_commands()
+            .zip(span.draw_commands)
+            .map(|(end, begin)| end - begin);
 
         if span.pipeline_statistics_index.is_some() {
             pass.end_pipeline_statistics_query();
@@ -534,6 +542,14 @@ impl FrameData {
                         path: self.diagnostic_path(&span.path_range, "elapsed_cpu"),
                         suffix: "ms",
                         value: (end - begin).as_secs_f64() * 1000.0,
+                    });
+                }
+
+                if let Some(draw_commands) = span.draw_commands {
+                    diagnostics.push(RenderDiagnostic {
+                        path: self.diagnostic_path(&span.path_range, "draw_commands"),
+                        suffix: "",
+                        value: draw_commands as f64,
                     });
                 }
             }
@@ -610,6 +626,14 @@ impl FrameData {
                     path: self.diagnostic_path(&span.path_range, "elapsed_cpu"),
                     suffix: "ms",
                     value: (end - begin).as_secs_f64() * 1000.0,
+                });
+            }
+
+            if let Some(draw_commands) = span.draw_commands {
+                diagnostics.push(RenderDiagnostic {
+                    path: self.diagnostic_path(&span.path_range, "draw_commands"),
+                    suffix: "",
+                    value: draw_commands as f64,
                 });
             }
 
@@ -805,6 +829,11 @@ impl WritePipelineStatistics for ComputePass<'_> {
 
 pub trait Pass: WritePipelineStatistics + WriteTimestamp {
     const KIND: PassKind;
+
+    /// The draw commands recorded in this pass so far, for a pass that counts them.
+    fn draw_commands(&self) -> Option<u32> {
+        None
+    }
 }
 
 impl Pass for RenderPass<'_> {

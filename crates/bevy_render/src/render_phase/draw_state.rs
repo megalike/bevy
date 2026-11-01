@@ -132,6 +132,7 @@ impl DrawState {
 pub struct TrackedRenderPass<'a> {
     pass: RenderPass<'a>,
     state: DrawState,
+    draw_commands: u32,
 }
 
 impl<'a> TrackedRenderPass<'a> {
@@ -147,6 +148,7 @@ impl<'a> TrackedRenderPass<'a> {
                 ..default()
             },
             pass,
+            draw_commands: 0,
         }
     }
 
@@ -275,6 +277,7 @@ impl<'a> TrackedRenderPass<'a> {
     pub fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
         #[cfg(feature = "detailed_trace")]
         trace!("draw: {:?} {:?}", vertices, instances);
+        self.draw_commands += 1;
         self.pass.draw(vertices, instances);
     }
 
@@ -293,6 +296,7 @@ impl<'a> TrackedRenderPass<'a> {
             group_count_y,
             group_count_z
         );
+        self.draw_commands += 1;
         self.pass
             .draw_mesh_tasks(group_count_x, group_count_y, group_count_z);
     }
@@ -318,6 +322,7 @@ impl<'a> TrackedRenderPass<'a> {
             indirect_buffer,
             indirect_offset
         );
+        self.draw_commands += 1;
         self.pass
             .draw_mesh_tasks_indirect(indirect_buffer, indirect_offset);
     }
@@ -347,6 +352,7 @@ impl<'a> TrackedRenderPass<'a> {
             indirect_offset,
             count
         );
+        self.draw_commands += 1;
         self.pass
             .multi_draw_mesh_tasks_indirect(indirect_buffer, indirect_offset, count);
     }
@@ -382,6 +388,7 @@ impl<'a> TrackedRenderPass<'a> {
             count_offset,
             max_count
         );
+        self.draw_commands += 1;
         self.pass.multi_draw_mesh_tasks_indirect_count(
             indirect_buffer,
             indirect_offset,
@@ -403,6 +410,7 @@ impl<'a> TrackedRenderPass<'a> {
             base_vertex,
             instances
         );
+        self.draw_commands += 1;
         self.pass.draw_indexed(indices, base_vertex, instances);
     }
 
@@ -426,6 +434,7 @@ impl<'a> TrackedRenderPass<'a> {
     pub fn draw_indirect(&mut self, indirect_buffer: &'a Buffer, indirect_offset: u64) {
         #[cfg(feature = "detailed_trace")]
         trace!("draw indirect: {:?} {}", indirect_buffer, indirect_offset);
+        self.draw_commands += 1;
         self.pass.draw_indirect(indirect_buffer, indirect_offset);
     }
 
@@ -455,6 +464,7 @@ impl<'a> TrackedRenderPass<'a> {
             indirect_buffer,
             indirect_offset
         );
+        self.draw_commands += 1;
         self.pass
             .draw_indexed_indirect(indirect_buffer, indirect_offset);
     }
@@ -489,6 +499,7 @@ impl<'a> TrackedRenderPass<'a> {
             indirect_offset,
             count
         );
+        self.draw_commands += 1;
         self.pass
             .multi_draw_indirect(indirect_buffer, indirect_offset, count);
     }
@@ -532,6 +543,7 @@ impl<'a> TrackedRenderPass<'a> {
             count_offset,
             max_count
         );
+        self.draw_commands += 1;
         self.pass.multi_draw_indirect_count(
             indirect_buffer,
             indirect_offset,
@@ -573,6 +585,7 @@ impl<'a> TrackedRenderPass<'a> {
             indirect_offset,
             count
         );
+        self.draw_commands += 1;
         self.pass
             .multi_draw_indexed_indirect(indirect_buffer, indirect_offset, count);
     }
@@ -618,6 +631,7 @@ impl<'a> TrackedRenderPass<'a> {
             count_offset,
             max_count
         );
+        self.draw_commands += 1;
         self.pass.multi_draw_indexed_indirect_count(
             indirect_buffer,
             indirect_offset,
@@ -775,4 +789,8 @@ impl WritePipelineStatistics for TrackedRenderPass<'_> {
 
 impl Pass for TrackedRenderPass<'_> {
     const KIND: PassKind = PassKind::Render;
+
+    fn draw_commands(&self) -> Option<u32> {
+        Some(self.draw_commands)
+    }
 }
