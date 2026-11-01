@@ -35,7 +35,8 @@ pub use self::{
 use crate::renderer::RenderDevice;
 
 /// Enables collecting render diagnostics, such as CPU/GPU elapsed time per render pass,
-/// as well as pipeline statistics (number of primitives, number of shader invocations, etc).
+/// as well as pipeline statistics (number of primitives, number of shader invocations, etc)
+/// and the draw commands of a tracked render pass, where a multi-draw is one command.
 ///
 /// To access the diagnostics, you can use the [`DiagnosticsStore`](bevy_diagnostic::DiagnosticsStore) resource,
 /// add [`LogDiagnosticsPlugin`](bevy_diagnostic::LogDiagnosticsPlugin), or use [Tracy](https://github.com/bevyengine/bevy/blob/main/docs/profiling.md#tracy-renderqueue).
