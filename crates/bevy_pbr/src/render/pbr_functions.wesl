@@ -503,14 +503,23 @@ fn apply_pbr_lighting(
         @else   // LIGHTMAP
         let enable_diffuse = true;
 
+        // MPS: the reflected light first. Where it is exactly zero (out of range, or every active lobe turned away; the
+        // BRDF's own N dot L terms decide, because the specular lobe of a sphere light has its own L) no shadow map or
+        // contact march can change the result. Diffuse transmission below has its own lobe and its own shadow.
+        var light_contrib = vec3<f32>(0.0);
+        if lighting::point_light_in_range(light_id, lighting_input.P) {
+            light_contrib = lighting::point_light(light_id, &lighting_input, enable_diffuse, true);
+        }
+        let light_matters = any(light_contrib != vec3<f32>(0.0));
+
         var shadow: f32 = 1.0;
-        if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
+        if (light_matters && (in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
                 && (view_bindings::clustered_lights.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
             shadow = shadows::fetch_point_shadow(light_id, in.world_position, in.world_normal, in.frag_coord.xy);
         }
 
         @if(CONTACT_SHADOWS && DEPTH_PREPASS)
-        if contact_shadow_enabled && (in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u && shadow > 0.0 &&
+        if contact_shadow_enabled && light_matters && (in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u && shadow > 0.0 &&
                 (view_bindings::clustered_lights.data[light_id].flags &
                     mesh_view_types::POINT_LIGHT_FLAGS_CONTACT_SHADOWS_ENABLED_BIT) != 0u {
             let to_light = view_bindings::clustered_lights.data[light_id].position_radius.xyz - in.world_position.xyz;
@@ -529,7 +538,6 @@ fn apply_pbr_lighting(
                 sin_angular_radius, light_id);
         }
 
-        let light_contrib = lighting::point_light(light_id, &lighting_input, enable_diffuse, true);
         direct_light += light_contrib * shadow;
 
 @if(STANDARD_MATERIAL_DIFFUSE_TRANSMISSION) {
@@ -569,8 +577,15 @@ fn apply_pbr_lighting(
         @else   // LIGHTMAP
         let enable_diffuse = true;
 
+        // MPS: the reflected light first, as for a point light; also exactly zero outside the cone.
+        var light_contrib = vec3<f32>(0.0);
+        if lighting::spot_light_in_cone(light_id, lighting_input.P) {
+            light_contrib = lighting::spot_light(light_id, &lighting_input, enable_diffuse);
+        }
+        let light_matters = any(light_contrib != vec3<f32>(0.0));
+
         var shadow: f32 = 1.0;
-        if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
+        if (light_matters && (in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
                 && (view_bindings::clustered_lights.data[light_id].flags &
                     mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
             shadow = shadows::fetch_spot_shadow(
@@ -583,7 +598,7 @@ fn apply_pbr_lighting(
         }
 
         @if(CONTACT_SHADOWS && DEPTH_PREPASS)
-        if contact_shadow_enabled && (in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u && shadow > 0.0 &&
+        if contact_shadow_enabled && light_matters && (in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u && shadow > 0.0 &&
                 (view_bindings::clustered_lights.data[light_id].flags &
                     mesh_view_types::POINT_LIGHT_FLAGS_CONTACT_SHADOWS_ENABLED_BIT) != 0u {
             let to_light = view_bindings::clustered_lights.data[light_id].position_radius.xyz - in.world_position.xyz;
@@ -602,7 +617,6 @@ fn apply_pbr_lighting(
                 sin_angular_radius, light_id);
         }
 
-        let light_contrib = lighting::spot_light(light_id, &lighting_input, enable_diffuse);
         direct_light += light_contrib * shadow;
 
 @if(STANDARD_MATERIAL_DIFFUSE_TRANSMISSION) {
