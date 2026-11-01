@@ -407,7 +407,9 @@ impl FrameData {
             .rfind(|(_, v)| v.thread_id == thread_id)
             .unwrap();
 
-        let span = self.open_spans.swap_remove(index);
+        // MPS: not `swap_remove`: when another thread closes a span, that would move this thread's innermost span
+        // ahead of its outer one, the outer one would close first, and a pass's statistics query would stay open.
+        let span = self.open_spans.remove(index);
         self.closed_spans.push(span);
         self.closed_spans.last_mut().unwrap()
     }
