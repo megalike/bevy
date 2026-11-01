@@ -121,6 +121,11 @@ struct PbrInput {
     /// Multiplier applied to all directional lights before cascade and contact shadows,
     /// use this for custom shadow maps. Defaults to 1.0.
     directional_shadow_factor: f32,
+    /// MPS: multiplier of the direct specular of point and spot lights, for a
+    /// surface whose reflections already show their sources. Does not affect
+    /// diffuse light, shadows, the environment or SSR, nor directional and rect
+    /// lights. Defaults to 1.0; forward only.
+    direct_specular_scale: f32,
 };
 
 /// Creates a PbrInput with default values
@@ -149,6 +154,7 @@ fn pbr_input_new() -> PbrInput {
 
     pbr_input.flags = 0u;
     pbr_input.directional_shadow_factor = 1.0;
+    pbr_input.direct_specular_scale = 1.0;
 
     return pbr_input;
 }

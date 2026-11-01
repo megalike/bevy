@@ -89,6 +89,10 @@ struct LightingInput {
     /// What we call `F_ab` they call `AB`.
     F_ab: vec2<f32>,
 
+    /// MPS: scales the base and clearcoat direct specular of point and spot
+    /// lights, sphere sources included (`PbrInput::direct_specular_scale`).
+    direct_specular_scale: f32,
+
     /// The strength of the clearcoat layer.
     @if(STANDARD_MATERIAL_CLEARCOAT)
     clearcoat_strength: f32,
@@ -740,6 +744,12 @@ fn point_light(
         let solid_angle = light_radius * light_radius / (distance * distance);
         Frc *= saturate(clearcoat_specular_derived_input.NdotL / max(clearcoat_specular_derived_input.NdotL + solid_angle, 1e-4));
     }
+
+    // MPS: the material's own scale of this highlight, 1 by default. The clearcoat's Fresnel loss of the base layer
+    // stays, so the scale never changes the diffuse term.
+    specular_light *= (*input).direct_specular_scale;
+    @if(STANDARD_MATERIAL_CLEARCOAT)
+    Frc *= (*input).direct_specular_scale;
 
     // Diffuse.
     // Comes after specular since its N⋅L is used in the lighting equation.
