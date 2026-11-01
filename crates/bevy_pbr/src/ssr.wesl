@@ -67,6 +67,20 @@ import package::render::mesh_view_bindings::screen_space_ambient_occlusion_textu
 /// is leaving the frame; the receiver keeps that share of its environment specular instead.
 const FORWARD_SSR_BORDER_FADE: f32 = 0.05;
 
+/// MPS: a hit fades out from this share of the depth thickness, so the hit-or-miss edge of an object in the reflection
+/// is soft and does not speckle with the ray's jitter.
+const FORWARD_SSR_PENETRATION_FADE: f32 = 0.5;
+
+/// MPS: on a near-mirror receiver, a ray that crossed behind a surface by less than these meters (full, none) is taken
+/// as blocked by that object: the frame does not show the side it met, its underside for a reflection in a floor, and
+/// the probe would put the bright room there. No color is invented for it: the probe's share falls to
+/// FORWARD_SSR_BLOCKED_ENVIRONMENT, from none at the depth thickness (a hit fades out there) over the margin, so no
+/// step follows the ray's jitter. Metal and other rougher receivers (the roughness fade, full, none) are left alone.
+const FORWARD_SSR_BLOCKED_M: vec2<f32> = vec2(1.0, 2.5);
+const FORWARD_SSR_BLOCKED_MARGIN_M: f32 = 0.10;
+const FORWARD_SSR_BLOCKED_ROUGHNESS: vec2<f32> = vec2(0.12, 0.16);
+const FORWARD_SSR_BLOCKED_ENVIRONMENT: f32 = 0.5;
+
 fn forward_ssr_border_confidence(hit_uv: vec2<f32>) -> f32 {
     let distance = min(hit_uv, vec2(1.0) - hit_uv);
     return smoothstep(0.0, FORWARD_SSR_BORDER_FADE, min(distance.x, distance.y));
@@ -117,8 +131,10 @@ fn sample_specular_brdf(wo: vec3<f32>, roughness: f32, F0: vec3<f32>, urand: vec
 /// * `jitter`: Jitter to apply to the first step of the linear search; 0..=1
 ///   range.
 ///
+/// * `perceptual_roughness`: The receiver's roughness (MPS, the forward mode).
+///
 /// [1]: https://lettier.github.io/3d-game-shaders-for-beginners/screen-space-reflection.html
-fn evaluate_ssr(R_world: vec3<f32>, P_world: vec3<f32>, jitter: f32) -> vec4<f32> {
+fn evaluate_ssr(R_world: vec3<f32>, P_world: vec3<f32>, jitter: f32, perceptual_roughness: f32) -> vec4<f32> {
     let depth_size = vec2<f32>(textureDimensions(depth_prepass_texture));
 
     var raymarch = depth_ray_march_new_from_depth(depth_size);
@@ -135,12 +151,24 @@ fn evaluate_ssr(R_world: vec3<f32>, P_world: vec3<f32>, jitter: f32) -> vec4<f32
     if (raymarch_result.hit) {
         var environment_share = 0.0;
         @if(FORWARD_SSR_MRT)
-        environment_share = 1.0 - forward_ssr_border_confidence(raymarch_result.hit_uv);
+        environment_share = 1.0 - forward_ssr_border_confidence(raymarch_result.hit_uv)
+            * (1.0 - smoothstep(FORWARD_SSR_PENETRATION_FADE, 1.0, raymarch_result.hit_penetration_frac));
         return vec4(
             textureSampleLevel(color_texture, color_sampler, raymarch_result.hit_uv, 0.0).rgb,
             environment_share
         );
     }
+
+@if(FORWARD_SSR_MRT) {
+    if (raymarch_result.crossed) {
+        let penetration = raymarch_result.hit_penetration;
+        let blocked = forward_ssr_border_confidence(raymarch_result.crossed_uv)
+            * smoothstep(ssr_settings.thickness, ssr_settings.thickness + FORWARD_SSR_BLOCKED_MARGIN_M, penetration)
+            * (1.0 - smoothstep(FORWARD_SSR_BLOCKED_M.x, FORWARD_SSR_BLOCKED_M.y, penetration))
+            * (1.0 - smoothstep(FORWARD_SSR_BLOCKED_ROUGHNESS.x, FORWARD_SSR_BLOCKED_ROUGHNESS.y, perceptual_roughness));
+        return vec4(0.0, 0.0, 0.0, 1.0 - (1.0 - FORWARD_SSR_BLOCKED_ENVIRONMENT) * blocked);
+    }
+}
 
     return vec4(0.0, 0.0, 0.0, 1.0);
 }
@@ -280,7 +308,7 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let brdf_sample_value_over_pdf = brdf_sample.value_over_pdf;
 
     // Do the raymarching.
-    let ssr_specular = evaluate_ssr(R_stochastic, world_position, raymarch_jitter);
+    let ssr_specular = evaluate_ssr(R_stochastic, world_position, raymarch_jitter, perceptual_roughness);
     var indirect_light = (ssr_specular.rgb * brdf_sample_value_over_pdf) * fade;
     var environment_specular = vec3(0.0);
 
@@ -354,7 +382,7 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // Determine which cluster we're in. We'll need this to find the right
     // reflection probe.
     let cluster_index = clustered_forward::view_fragment_cluster_index(
-        frag_coord.xy, frag_coord.z, false);
+        frag_coord.xy, depth_ndc_to_view_z(frag_coord.z), view.clip_from_view[3].w == 1.0);
     var clusterable_object_index_ranges =
         clustered_forward::unpack_clusterable_object_index_ranges(cluster_index);
 

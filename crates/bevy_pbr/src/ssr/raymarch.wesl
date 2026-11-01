@@ -333,6 +333,11 @@ struct DepthRayMarchResult {
     /// UV corresponding to `hit_t`.
     hit_uv: vec2<f32>,
 
+    /// MPS: on a miss, whether the ray ended by crossing behind a surface deeper than the depth thickness.
+    /// `crossed_uv` and `hit_penetration` then describe that crossing.
+    crossed: bool,
+    crossed_uv: vec2<f32>,
+
     /// The distance that the hit point penetrates into the hit surface.
     /// Will normally be non-zero due to limited precision of the ray march.
     ///
@@ -496,7 +501,7 @@ fn depth_ray_march_to_ws_dir(raymarch: ptr<function, DepthRayMarch>, dir: vec3<f
 
 /// Perform the ray march.
 fn depth_ray_march_march(raymarch: ptr<function, DepthRayMarch>) -> DepthRayMarchResult {
-    var res = DepthRayMarchResult(false, 0.0, vec2(0.0), 0.0, 0.0);
+    var res = DepthRayMarchResult(false, 0.0, vec2(0.0), false, vec2(0.0), 0.0, 0.0);
 
     let ray_start_uv = ndc_to_uv((*raymarch).ray_start_cs.xy);
     let ray_end_uv = ndc_to_uv((*raymarch).ray_end_cs.xy);
@@ -546,6 +551,12 @@ fn depth_ray_march_march(raymarch: ptr<function, DepthRayMarch>) -> DepthRayMarc
         res.hit_penetration = hit.penetration / linear_z_to_scaled_linear_z;
         res.hit_penetration_frac = hit.penetration / depth_thickness;
         return res;
+    }
+
+    if (intersected) {
+        res.crossed = true;
+        res.crossed_uv = mix(ray_start_uv, ray_end_uv, hit_t);
+        res.hit_penetration = hit.penetration / linear_z_to_scaled_linear_z;
     }
 
     res.hit_t = miss_t;
