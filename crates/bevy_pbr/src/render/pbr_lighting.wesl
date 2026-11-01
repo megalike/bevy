@@ -802,6 +802,37 @@ fn point_light(
         rangeAttenuation * texture_sample;
 }
 
+// MPS: whether `point_light()` can return anything at `P`: outside the light's range its result is exactly zero.
+fn point_light_in_range(light_id: u32, P: vec3<f32>) -> bool {
+    let light = &view_bindings::clustered_lights.data[light_id];
+    let light_to_frag = (*light).position_radius.xyz - P;
+    return getRangeFalloff(dot(light_to_frag, light_to_frag), (*light).color_inverse_square_range.w) > 0.0;
+}
+
+// MPS: the same for `spot_light()`, which is also exactly zero outside the cone.
+fn spot_light_in_cone(light_id: u32, P: vec3<f32>) -> bool {
+    let light = &view_bindings::clustered_lights.data[light_id];
+    return point_light_in_range(light_id, P) &&
+        spot_cone_attenuation(light_id, (*light).position_radius.xyz - P) > 0.0;
+}
+
+fn spot_cone_attenuation(light_id: u32, light_to_frag: vec3<f32>) -> f32 {
+    let light = &view_bindings::clustered_lights.data[light_id];
+
+    // reconstruct spot dir from x/z and y-direction flag
+    var spot_dir = vec3<f32>((*light).light_custom_data.x, 0.0, (*light).light_custom_data.y);
+    spot_dir.y = sqrt(max(0.0, 1.0 - spot_dir.x * spot_dir.x - spot_dir.z * spot_dir.z));
+    if ((*light).flags & POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE) != 0u {
+        spot_dir.y = -spot_dir.y;
+    }
+
+    // calculate attenuation based on filament formula https://google.github.io/filament/Filament.md.html#listing_glslpunctuallight
+    // spot_scale and spot_offset have been precomputed
+    // note we normalize here to get "l" from the filament listing. spot_dir is already normalized
+    let cd = dot(-spot_dir, normalize(light_to_frag));
+    return saturate(cd * (*light).light_custom_data.z + (*light).light_custom_data.w);
+}
+
 fn spot_light(
     light_id: u32,
     input: ptr<function, LightingInput>,
@@ -812,19 +843,8 @@ fn spot_light(
 
     let light = &view_bindings::clustered_lights.data[light_id];
 
-    // reconstruct spot dir from x/z and y-direction flag
-    var spot_dir = vec3<f32>((*light).light_custom_data.x, 0.0, (*light).light_custom_data.y);
-    spot_dir.y = sqrt(max(0.0, 1.0 - spot_dir.x * spot_dir.x - spot_dir.z * spot_dir.z));
-    if ((*light).flags & POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE) != 0u {
-        spot_dir.y = -spot_dir.y;
-    }
     let light_to_frag = (*light).position_radius.xyz - (*input).P.xyz;
-
-    // calculate attenuation based on filament formula https://google.github.io/filament/Filament.md.html#listing_glslpunctuallight
-    // spot_scale and spot_offset have been precomputed
-    // note we normalize here to get "l" from the filament listing. spot_dir is already normalized
-    let cd = dot(-spot_dir, normalize(light_to_frag));
-    let attenuation = saturate(cd * (*light).light_custom_data.z + (*light).light_custom_data.w);
+    let attenuation = spot_cone_attenuation(light_id, light_to_frag);
     let spot_attenuation = attenuation * attenuation;
 
     var texture_sample = 1f;
