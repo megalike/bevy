@@ -82,7 +82,13 @@ const FORWARD_SSR_BLOCKED_ROUGHNESS: vec2<f32> = vec2(0.12, 0.16);
 const FORWARD_SSR_BLOCKED_ENVIRONMENT: f32 = 0.5;
 
 fn forward_ssr_border_confidence(hit_uv: vec2<f32>) -> f32 {
-    let distance = min(hit_uv, vec2(1.0) - hit_uv);
+    // MPS: `hit_uv` addresses the depth texture, which can be larger than the main pass viewport; the
+    // border is the viewport's.
+    let viewport_uv = utils::coords_to_viewport_uv(
+        hit_uv * vec2<f32>(textureDimensions(depth_prepass_texture)),
+        view.main_pass_viewport
+    );
+    let distance = min(viewport_uv, vec2(1.0) - viewport_uv);
     return smoothstep(0.0, FORWARD_SSR_BORDER_FADE, min(distance.x, distance.y));
 }
 
@@ -175,12 +181,18 @@ fn evaluate_ssr(R_world: vec3<f32>, P_world: vec3<f32>, jitter: f32, perceptual_
 
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
+    // Copy pixels outside this viewport because the texture swap replaces the full target.
+    let fragment = textureLoad(color_texture, vec2<i32>(in.position.xy), 0);
+    if any(in.position.xy < view.main_pass_viewport.xy) ||
+        any(in.position.xy >= view.main_pass_viewport.xy + view.main_pass_viewport.zw) {
+        return fragment;
+    }
+
     // Sample the depth.
     var frag_coord = in.position;
     frag_coord.z = prepass_utils::prepass_depth(in.position, 0u);
 
     // Load the G-buffer data.
-    let fragment = textureLoad(color_texture, vec2<i32>(frag_coord.xy), 0);
     var gbuffer: vec4<u32>;
 @if(FORWARD_SSR_MRT) {
     gbuffer = textureLoad(forward_ssr_gbuffer_texture, vec2<i32>(frag_coord.xy), 0);
