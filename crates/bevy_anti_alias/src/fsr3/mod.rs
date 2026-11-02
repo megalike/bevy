@@ -41,7 +41,10 @@ impl Plugin for Fsr3Plugin {
         };
 
         render_app
-            .add_systems(ExtractSchedule, extract::extract_fsr3)
+            .add_systems(
+                ExtractSchedule,
+                (extract::extract_fsr3, extract::extract_real_time),
+            )
             .add_systems(
                 Render,
                 prepare::prepare_fsr3
@@ -54,9 +57,24 @@ impl Plugin for Fsr3Plugin {
 
 /// Camera component to enable FSR 3.
 ///
-/// The camera must have a perspective projection and [`Msaa::Off`](bevy_render::view::Msaa::Off).
+/// FSR 3 runs while the camera is active and has [`Hdr`], a perspective projection,
+/// [`Msaa::Off`](bevy_render::view::Msaa::Off), the depth and motion vector prepasses, and a viewport large
+/// enough for the quality mode. On other frames, such as while its window is minimized, the camera renders at
+/// its native resolution without jitter, and FSR 3 starts again with a fresh history.
+///
+/// FSR 3 is skipped, with a warning, on a camera that also has
+/// [`TemporalAntiAliasing`](crate::taa::TemporalAntiAliasing) or `Dlss`: a camera uses one temporal upscaler or
+/// anti-aliasing technique at a time.
+///
 /// FSR 3 needs correct motion vectors for everything on screen, like
 /// [`TemporalAntiAliasing`](crate::taa::TemporalAntiAliasing).
+///
+/// # Limitations
+/// - The viewport must start at the render target's origin: a viewport with a nonzero position, as in split
+///   screen, is not supported.
+/// - Motion blur samples the prepass textures at the output resolution, so it does not match the reduced render
+///   resolution.
+/// - `wgpu_ffx` creates its bind groups and staging buffers anew for every dispatch.
 #[derive(Component, Reflect, Clone)]
 #[reflect(Component, Default, Clone)]
 #[require(TemporalJitter, MipBias, DepthPrepass, MotionVectorPrepass, Hdr)]
@@ -71,7 +89,8 @@ pub struct Fsr3 {
     /// After setting this to true, it will automatically be toggled
     /// back to false at the end of the frame.
     pub reset: bool,
-    /// Run FSR 3's robust contrast adaptive sharpening (RCAS) pass on the upscaled image.
+    /// Run FSR 3's robust contrast adaptive sharpening (RCAS) pass on the upscaled image. Set to false to turn
+    /// sharpening off.
     pub enable_sharpening: bool,
     /// Sharpening strength, from 0.0 (none) to 1.0 (most). Used only with `enable_sharpening`.
     pub sharpness: f32,

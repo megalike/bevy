@@ -4,13 +4,12 @@ use bevy_core_pipeline::prepass::ViewPrepassTextures;
 use bevy_ecs::system::Res;
 use bevy_math::{ops, Vec4Swizzles};
 use bevy_render::{
-    camera::TemporalJitter,
+    camera::{ExtractedCamera, TemporalJitter},
     diagnostic::RecordDiagnostics,
     renderer::{RenderContext, ViewQuery},
-    view::{ExtractedView, Msaa, ViewTarget},
+    view::{ExtractedView, ViewTarget},
 };
-use bevy_time::Time;
-use tracing::warn;
+use bevy_time::{Real, Time};
 use wgpu_ffx::{FsrDispatchFlags, FsrDispatchInfo};
 
 pub fn fsr3(
@@ -20,11 +19,11 @@ pub fn fsr3(
         &MainPassResolutionOverride,
         &TemporalJitter,
         &ExtractedView,
+        &ExtractedCamera,
         &ViewTarget,
         &ViewPrepassTextures,
-        &Msaa,
     )>,
-    time: Res<Time>,
+    time: Res<Time<Real>>,
     mut ctx: RenderContext,
 ) {
     let (
@@ -33,29 +32,25 @@ pub fn fsr3(
         resolution_override,
         temporal_jitter,
         extracted_view,
+        extracted_camera,
         view_target,
         prepass_textures,
-        msaa,
     ) = view.into_inner();
-
-    if *msaa != Msaa::Off {
-        warn!("FSR 3 requires MSAA to be disabled");
-        return;
-    }
-
-    let (Some(prepass_depth_texture), Some(prepass_motion_vectors_texture)) =
-        (&prepass_textures.depth, &prepass_textures.motion_vectors)
-    else {
-        return;
-    };
 
     let mut resources = fsr3_context.view.lock().unwrap();
     let render_resolution = resolution_override.0;
     let upscaled_resolution = extracted_view.viewport.zw();
+    let (Some(prepass_depth_texture), Some(prepass_motion_vectors_texture)) =
+        (&prepass_textures.depth, &prepass_textures.motion_vectors)
+    else {
+        resources.reset_history = true;
+        return;
+    };
     if resources.render_resolution != render_resolution
         || resources.upscaled_resolution != upscaled_resolution
     {
         // `prepare_fsr3` sets both together; a mismatch would make FSR read outside its resources.
+        resources.reset_history = true;
         return;
     }
 
@@ -89,11 +84,13 @@ pub fn fsr3(
         upscale_size: upscaled_resolution.to_array(),
         enable_sharpening: fsr3.enable_sharpening,
         sharpness: fsr3.sharpness.clamp(0.0, 1.0),
-        // FSR refuses a frame time below 1 ms (a paused clock reports 0).
+        // FSR refuses a frame time below 1 ms (the first frame reports 0).
         frame_time_delta: (time.delta_secs() * 1000.0).max(1.0),
-        // Bevy's main pass already multiplies by the camera's exposure.
-        pre_exposure: 1.0,
-        reset_history: fsr3.reset,
+        // The main pass multiplies the color by the camera's exposure: that is FSR's pre-exposure, which scales the
+        // history when it changes. Its `exposure` input stays the default 1.0, since the color FSR sees is already
+        // the exposed signal that tonemapping receives.
+        pre_exposure: extracted_camera.exposure,
+        reset_history: resources.reset_history,
         // With reversed depth FSR expects its "near" value to be the larger distance.
         camera_near: far,
         camera_far: near,
@@ -110,6 +107,7 @@ pub fn fsr3(
         .context
         .dispatch(&mut resources.view, ctx.command_encoder(), &dispatch_info)
         .expect("Failed to dispatch FSR 3");
+    resources.reset_history = false;
 
     time_span.end(ctx.command_encoder());
 }

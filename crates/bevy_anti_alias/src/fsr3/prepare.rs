@@ -39,6 +39,8 @@ pub struct Fsr3ViewResources {
     pub dilated_depth: Texture,
     pub dilated_motion_vectors: Texture,
     pub reconstructed_previous_depth: Buffer,
+    /// Discard the history at the next dispatch: set by a reset request or a frame FSR 3 did not run on.
+    pub reset_history: bool,
 }
 
 impl Fsr3ViewResources {
@@ -85,6 +87,7 @@ impl Fsr3ViewResources {
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
+            reset_history: true,
         }
     }
 }
@@ -100,6 +103,7 @@ pub fn prepare_fsr3(
             &mut TemporalJitter,
             &mut MipBias,
             Option<&mut Fsr3RenderContext>,
+            Option<&MainPassResolutionOverride>,
         ),
         (
             With<Camera3d>,
@@ -122,6 +126,7 @@ pub fn prepare_fsr3(
         mut temporal_jitter,
         mut mip_bias,
         fsr3_context,
+        resolution_override,
     ) in &mut query
     {
         camera_main_texture_usages.0 |= TextureUsages::STORAGE_BINDING;
@@ -131,10 +136,8 @@ pub fn prepare_fsr3(
         camera_3d.depth_texture_usages = depth_texture_usages.into();
 
         let upscaled_resolution = view.viewport.zw();
+        // `extract_fsr3` passes only views whose render resolution FSR 3 accepts.
         let render_resolution = fsr3.quality_mode.render_resolution(upscaled_resolution);
-        if render_resolution.cmplt(UVec2::splat(2)).any() {
-            continue;
-        }
 
         // Bevy's color is HDR and its depth reversed (1.0 at the near plane). Bevy's perspective projection has an
         // infinite far plane; a custom one may not.
@@ -168,6 +171,9 @@ pub fn prepare_fsr3(
                         render_resolution,
                         upscaled_resolution,
                     );
+                }
+                // `extract_fsr3` removes the override on frames FSR 3 does not run.
+                if resolution_override.map(|o| o.0) != Some(render_resolution) {
                     commands
                         .entity(entity)
                         .insert(MainPassResolutionOverride(render_resolution));
