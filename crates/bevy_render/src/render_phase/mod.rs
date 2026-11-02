@@ -243,6 +243,13 @@ pub struct RenderMultidrawableBatchSetGpuBuffers {
     /// A temporary buffer used to store intermediate sums during the uniform
     /// allocation phase.
     pub fan_buffer: UninitBufferVec<u32>,
+
+    /// True if the buffers above have changed since they were last written to
+    /// the GPU.
+    ///
+    /// Bins only change when mesh instances are added or removed, so most
+    /// frames have nothing to upload.
+    pub dirty: bool,
 }
 
 impl RenderMultidrawableBatchSetGpuBuffers {
@@ -263,6 +270,7 @@ impl RenderMultidrawableBatchSetGpuBuffers {
             bin_metadata_buffer,
             bin_index_to_bin_metadata_index_buffer,
             fan_buffer,
+            dirty: true,
         }
     }
 
@@ -591,6 +599,7 @@ where
                 .insert(bin, main_entity, input_uniform_index, bin_index);
 
         self.instance_count += 1;
+        self.gpu_buffers.dirty = true;
         debug_assert_eq!(
             binned_mesh_instance_index.0 as usize,
             self.binned_mesh_instance_index_to_entity.len()
@@ -653,6 +662,7 @@ where
         }
 
         self.instance_count -= 1;
+        self.gpu_buffers.dirty = true;
 
         self.remove_bin_if_empty(bin_key, bin_index);
     }
@@ -2536,6 +2546,7 @@ mod tests {
 
                     // Process each operation, skipping invalid ones.
                     for op in ops.iter() {
+                        batch_set.gpu_buffers.dirty = false;
                         match *op {
                             RenderMultidrawableBatchSetOperation::Add {
                                 entity_id,
@@ -2572,6 +2583,7 @@ mod tests {
                                     entity,
                                     input_uniform_index,
                                 );
+                                assert!(batch_set.gpu_buffers.dirty);
                             }
 
                             RenderMultidrawableBatchSetOperation::Remove { entity_id } => {
@@ -2597,6 +2609,7 @@ mod tests {
                                         render_binned_mesh_instance.bin_index,
                                     ),
                                 );
+                                assert!(batch_set.gpu_buffers.dirty);
                             }
                         }
                     }
