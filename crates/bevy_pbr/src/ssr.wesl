@@ -274,7 +274,7 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 @if(FORWARD_SSR_MRT) {
     var ao = pbr_input.diffuse_occlusion.x;
     @if(SCREEN_SPACE_AMBIENT_OCCLUSION) {
-        let ssao_coord = vec2<i32>(in.position.xy - view.viewport.xy);
+        let ssao_coord = vec2<i32>(in.position.xy - view.main_pass_viewport.xy);
         ao *= textureLoad(screen_space_ambient_occlusion_texture, ssao_coord, 0).r;
     }
     ao = saturate(ao);
