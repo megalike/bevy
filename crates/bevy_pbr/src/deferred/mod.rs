@@ -5,6 +5,7 @@ use crate::{
 };
 use bevy_app::prelude::*;
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
+use bevy_camera::{MainPassResolutionOverride, Viewport};
 use bevy_core_pipeline::{
     core_3d::main_opaque_pass_3d,
     deferred::{
@@ -122,6 +123,8 @@ impl Plugin for DeferredPbrLightingPlugin {
 
 pub fn deferred_lighting(
     view: ViewQuery<(
+        &ExtractedCamera,
+        Option<&MainPassResolutionOverride>,
         &MeshViewBindGroup,
         &ViewTarget,
         &DeferredLightingIdDepthTexture,
@@ -133,6 +136,8 @@ pub fn deferred_lighting(
     mut ctx: RenderContext,
 ) {
     let (
+        camera,
+        resolution_override,
         mesh_view_bind_group,
         target,
         deferred_lighting_id_depth_texture,
@@ -174,6 +179,12 @@ pub fn deferred_lighting(
         multiview_mask: None,
     });
     let pass_span = diagnostics.pass_span(&mut render_pass, "deferred_lighting");
+
+    if let Some(viewport) =
+        Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override)
+    {
+        render_pass.set_camera_viewport(&viewport);
+    }
 
     render_pass.set_render_pipeline(pipeline);
 
