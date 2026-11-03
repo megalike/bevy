@@ -74,7 +74,7 @@ impl Plugin for Fsr3Plugin {
 ///   screen, is not supported.
 /// - Motion blur samples the prepass textures at the output resolution, so it does not match the reduced render
 ///   resolution.
-/// - `wgpu_ffx` creates its bind groups and staging buffers anew for every dispatch.
+/// - `wgpu_ffx` creates its staging buffers anew for every frame (its bind groups are kept per set of resources).
 #[derive(Component, Reflect, Clone)]
 #[reflect(Component, Default, Clone)]
 #[require(TemporalJitter, MipBias, DepthPrepass, MotionVectorPrepass, Hdr)]
