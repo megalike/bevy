@@ -14,11 +14,13 @@ use taa::TemporalAntiAliasPlugin;
 pub mod contrast_adaptive_sharpening;
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 pub mod dlss;
+#[cfg(feature = "fsr3")]
+pub mod fsr3;
 pub mod fxaa;
 pub mod smaa;
 pub mod taa;
 
-/// Adds fxaa, smaa, taa, contrast aware sharpening, and optional dlss support.
+/// Adds fxaa, smaa, taa, contrast aware sharpening, and optional dlss and fsr3 support.
 #[derive(Default)]
 pub struct AntiAliasPlugin;
 
@@ -31,6 +33,8 @@ impl Plugin for AntiAliasPlugin {
             CasPlugin,
             #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
             dlss::DlssPlugin,
+            #[cfg(feature = "fsr3")]
+            fsr3::Fsr3Plugin,
         ));
     }
 }

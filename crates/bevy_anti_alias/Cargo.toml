@@ -15,6 +15,7 @@ webgpu = []
 smaa_luts = ["bevy_image/ktx2", "bevy_image/zstd"]
 dlss = ["dep:dlss_wgpu", "dep:uuid", "bevy_render/raw_vulkan_init"]
 force_disable_dlss = ["dlss_wgpu?/mock"]
+fsr3 = ["dep:wgpu-ffx", "dep:bevy_time"]
 
 [dependencies]
 # bevy
@@ -32,11 +33,15 @@ bevy_ecs = { path = "../bevy_ecs", version = "0.20.1" }
 bevy_extract = { path = "../bevy_extract", version = "0.20.1" }
 bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.20.1" }
 bevy_diagnostic = { path = "../bevy_diagnostic", version = "0.20.1" }
+bevy_time = { path = "../bevy_time", version = "0.20.1", optional = true }
 
 # other
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 dlss_wgpu = { version = "6.0.0", optional = true }
 uuid = { version = "1.21.0", optional = true }
+# MPS: wgpu-ffx's wgpu 30 branch with MPS's fixes (fork megalike/wgpu-ffx, branch `mps`), until a published
+# release supports wgpu 30.
+wgpu-ffx = { git = "https://github.com/megalike/wgpu-ffx", rev = "674c8217588fd52a1ef671547cefca312ef19b83", optional = true }
 
 [lints]
 workspace = true

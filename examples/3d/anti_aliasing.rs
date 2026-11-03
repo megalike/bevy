@@ -25,6 +25,8 @@ use bevy::{
 use bevy::anti_alias::dlss::{
     Dlss, DlssPerfQualityMode, DlssProjectId, DlssSuperResolutionSupported,
 };
+#[cfg(feature = "fsr3")]
+use bevy::anti_alias::fsr3::{Fsr3, Fsr3QualityMode};
 
 fn main() {
     let mut app = App::new();
@@ -63,6 +65,17 @@ type DlssComponents = (
 #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
 type DlssComponents = ();
 
+#[cfg(feature = "fsr3")]
+type Fsr3Components = (
+    Fsr3,
+    TemporalJitter,
+    MipBias,
+    DepthPrepass,
+    MotionVectorPrepass,
+);
+#[cfg(not(feature = "fsr3"))]
+type Fsr3Components = ();
+
 fn modify_aa(
     keys: Res<ButtonInput<KeyCode>>,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] camera: Single<
@@ -89,6 +102,7 @@ fn modify_aa(
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_supported: Option<
         Res<DlssSuperResolutionSupported>,
     >,
+    #[cfg(feature = "fsr3")] fsr3: Single<Option<&mut Fsr3>, With<Camera>>,
     mut commands: Commands,
 ) {
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -104,7 +118,8 @@ fn modify_aa(
             .remove::<Fxaa>()
             .remove::<Smaa>()
             .remove::<TaaComponents>()
-            .remove::<DlssComponents>();
+            .remove::<DlssComponents>()
+            .remove::<Fsr3Components>();
     }
 
     // MSAA
@@ -113,7 +128,8 @@ fn modify_aa(
             .remove::<Fxaa>()
             .remove::<Smaa>()
             .remove::<TaaComponents>()
-            .remove::<DlssComponents>();
+            .remove::<DlssComponents>()
+            .remove::<Fsr3Components>();
 
         *msaa = Msaa::Sample4;
     }
@@ -138,6 +154,7 @@ fn modify_aa(
             .remove::<Smaa>()
             .remove::<TaaComponents>()
             .remove::<DlssComponents>()
+            .remove::<Fsr3Components>()
             .insert(Fxaa::default());
     }
 
@@ -172,6 +189,7 @@ fn modify_aa(
             .remove::<Fxaa>()
             .remove::<TaaComponents>()
             .remove::<DlssComponents>()
+            .remove::<Fsr3Components>()
             .insert(Smaa::default());
     }
 
@@ -198,6 +216,7 @@ fn modify_aa(
             .remove::<Fxaa>()
             .remove::<Smaa>()
             .remove::<DlssComponents>()
+            .remove::<Fsr3Components>()
             .insert(TemporalAntiAliasing::default());
     }
 
@@ -209,6 +228,7 @@ fn modify_aa(
             .remove::<Fxaa>()
             .remove::<Smaa>()
             .remove::<TaaComponents>()
+            .remove::<Fsr3Components>()
             .insert(Dlss::default());
     }
 
@@ -232,6 +252,40 @@ fn modify_aa(
         }
         if keys.just_pressed(KeyCode::KeyN) {
             dlss.perf_quality_mode = DlssPerfQualityMode::Dlaa;
+        }
+    }
+
+    // FSR 3
+    #[cfg(feature = "fsr3")]
+    let fsr3 = fsr3.into_inner();
+    #[cfg(feature = "fsr3")]
+    if keys.just_pressed(KeyCode::Digit7) && fsr3.is_none() {
+        *msaa = Msaa::Off;
+        camera
+            .remove::<Fxaa>()
+            .remove::<Smaa>()
+            .remove::<TemporalAntiAliasing>()
+            .remove::<DlssComponents>()
+            .insert(Fsr3::default());
+    }
+
+    // FSR 3 Settings
+    #[cfg(feature = "fsr3")]
+    if let Some(mut fsr3) = fsr3 {
+        if keys.just_pressed(KeyCode::KeyX) {
+            fsr3.quality_mode = Fsr3QualityMode::UltraPerformance;
+        }
+        if keys.just_pressed(KeyCode::KeyC) {
+            fsr3.quality_mode = Fsr3QualityMode::Performance;
+        }
+        if keys.just_pressed(KeyCode::KeyV) {
+            fsr3.quality_mode = Fsr3QualityMode::Balanced;
+        }
+        if keys.just_pressed(KeyCode::KeyB) {
+            fsr3.quality_mode = Fsr3QualityMode::Quality;
+        }
+        if keys.just_pressed(KeyCode::KeyN) {
+            fsr3.quality_mode = Fsr3QualityMode::NativeAa;
         }
     }
 }
@@ -306,6 +360,7 @@ fn update_ui(
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_supported: Option<
         Res<DlssSuperResolutionSupported>,
     >,
+    #[cfg(feature = "fsr3")] fsr3: Single<Option<&Fsr3>, With<Camera>>,
 ) {
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     let (projection, fxaa, smaa, taa, cas, msaa, dlss) = *camera;
@@ -320,11 +375,23 @@ fn update_ui(
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
     let dlss_none = true;
 
+    #[cfg(feature = "fsr3")]
+    let fsr3 = *fsr3;
+    #[cfg(feature = "fsr3")]
+    let fsr3_none = fsr3.is_none();
+    #[cfg(not(feature = "fsr3"))]
+    let fsr3_none = true;
+
     draw_selectable_menu_item(
         ui,
         "No AA",
         '1',
-        *msaa == Msaa::Off && fxaa.is_none() && taa.is_none() && smaa.is_none() && dlss_none,
+        *msaa == Msaa::Off
+            && fxaa.is_none()
+            && taa.is_none()
+            && smaa.is_none()
+            && dlss_none
+            && fsr3_none,
     );
     draw_selectable_menu_item(ui, "MSAA", '2', *msaa != Msaa::Off);
     draw_selectable_menu_item(ui, "FXAA", '3', fxaa.is_some());
@@ -334,6 +401,8 @@ fn update_ui(
     if dlss_supported.is_some() {
         draw_selectable_menu_item(ui, "DLSS", '6', dlss.is_some());
     }
+    #[cfg(feature = "fsr3")]
+    draw_selectable_menu_item(ui, "FSR 3", '7', fsr3.is_some());
 
     if *msaa != Msaa::Off {
         ui.push_str("\n----------\n\nSample Count\n");
@@ -389,6 +458,22 @@ fn update_ui(
         draw_selectable_menu_item(ui, "Balanced", 'V', pqm == DlssPerfQualityMode::Balanced);
         draw_selectable_menu_item(ui, "Quality", 'B', pqm == DlssPerfQualityMode::Quality);
         draw_selectable_menu_item(ui, "DLAA", 'N', pqm == DlssPerfQualityMode::Dlaa);
+    }
+
+    #[cfg(feature = "fsr3")]
+    if let Some(fsr3) = fsr3 {
+        let mode = fsr3.quality_mode;
+        ui.push_str("\n----------\n\nQuality\n");
+        draw_selectable_menu_item(
+            ui,
+            "UltraPerformance",
+            'X',
+            mode == Fsr3QualityMode::UltraPerformance,
+        );
+        draw_selectable_menu_item(ui, "Performance", 'C', mode == Fsr3QualityMode::Performance);
+        draw_selectable_menu_item(ui, "Balanced", 'V', mode == Fsr3QualityMode::Balanced);
+        draw_selectable_menu_item(ui, "Quality", 'B', mode == Fsr3QualityMode::Quality);
+        draw_selectable_menu_item(ui, "Native AA", 'N', mode == Fsr3QualityMode::NativeAa);
     }
 
     ui.push_str("\n----------\n\n");

@@ -610,6 +610,9 @@ dlss = ["bevy_internal/dlss"]
 # Forcibly disable DLSS so that `cargo build --all-features` works without the DLSS SDK being installed. Not meant for users.
 force_disable_dlss = ["bevy_internal/force_disable_dlss"]
 
+# AMD FidelityFX Super Resolution 3 upscaler
+fsr3 = ["bevy_internal/fsr3"]
+
 # Enable AccessKit on Unix backends (currently only works with experimental screen readers and forks.)
 accesskit_unix = ["bevy_internal/accesskit_unix"]
 
