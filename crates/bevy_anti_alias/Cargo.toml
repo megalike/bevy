@@ -39,9 +39,9 @@ bevy_time = { path = "../bevy_time", version = "0.20.1", optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 dlss_wgpu = { version = "6.0.0", optional = true }
 uuid = { version = "1.21.0", optional = true }
-# MPS: temporary local path to the wgpu 30 branch of wgpu-ffx (E:/wgpu-ffx, branch `mps`), until a published
+# MPS: wgpu-ffx's wgpu 30 branch with MPS's fixes (fork megalike/wgpu-ffx, branch `mps`), until a published
 # release supports wgpu 30.
-wgpu-ffx = { path = "E:/wgpu-ffx/wgpu-ffx", optional = true }
+wgpu-ffx = { git = "https://github.com/megalike/wgpu-ffx", rev = "674c8217588fd52a1ef671547cefca312ef19b83", optional = true }
 
 [lints]
 workspace = true
