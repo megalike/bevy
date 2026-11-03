@@ -58,7 +58,8 @@ use bevy_color::{Color, LinearRgba};
 
 pub use atmosphere::*;
 use bevy_light::{
-    AmbientLight, DirectionalLight, PointLight, RectLight, ShadowFilteringMethod, SpotLight,
+    AmbientLight, DirectionalLight, KeepShadowMaps, PointLight, RectLight, ShadowFilteringMethod,
+    SpotLight,
 };
 use bevy_shader::{load_shader_library, ShaderRef};
 pub use cluster::*;
@@ -238,6 +239,7 @@ impl Plugin for PbrPlugin {
                 SyncComponentPlugin::<DirectionalLight, Self>::default(),
                 SyncComponentPlugin::<PointLight, Self>::default(),
                 SyncComponentPlugin::<SpotLight, Self>::default(),
+                SyncComponentPlugin::<KeepShadowMaps, Self>::default(),
                 SyncComponentPlugin::<RectLight, Self>::default(),
                 SyncComponentPlugin::<AmbientLight, Self>::default(),
             ))
@@ -506,6 +508,9 @@ impl SyncComponent<RenderApp, PbrPlugin> for PointLight {
 }
 impl SyncComponent<RenderApp, PbrPlugin> for SpotLight {
     type Target = (Self, ExtractedPointLight, PointAndSpotLightViewEntities);
+}
+impl SyncComponent<RenderApp, PbrPlugin> for KeepShadowMaps {
+    type Target = Self;
 }
 impl SyncComponent<RenderApp, PbrPlugin> for RectLight {
     type Target = (Self, ExtractedRectLight);

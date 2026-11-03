@@ -24,8 +24,8 @@ use bevy_light::cluster::assign::{calculate_cluster_factors, ClusterableObjectTy
 use bevy_light::SunDisk;
 use bevy_light::{
     spot_light_clip_from_view, spot_light_world_from_view, AmbientLight, CascadeShadowConfig,
-    Cascades, DirectionalLight, DirectionalLightShadowMap, GlobalAmbientLight, PointLight,
-    PointLightShadowMap, RectLight, ShadowFilteringMethod, SpotLight, VolumetricLight,
+    Cascades, DirectionalLight, DirectionalLightShadowMap, GlobalAmbientLight, KeepShadowMaps,
+    PointLight, PointLightShadowMap, RectLight, ShadowFilteringMethod, SpotLight, VolumetricLight,
 };
 use bevy_log::warn_once;
 use bevy_material::{
@@ -433,6 +433,15 @@ pub fn extract_lights(
                 Changed<ViewVisibility>,
                 Changed<RenderLayers>,
             )>,
+        >,
+    >,
+    kept_shadow_map_lights: Extract<
+        Query<
+            RenderEntity,
+            (
+                With<KeepShadowMaps>,
+                Or<(With<PointLight>, With<SpotLight>)>,
+            ),
         >,
     >,
     visibility_extraction_system_param: VisibilityExtractionSystemParam,
@@ -935,6 +944,20 @@ pub fn extract_lights(
         ));
     }
 
+    // MPS: a light whose shadow maps are kept isn't extracted again, but its
+    // visible entities must stay: `prepare_lights` redraws its maps if their
+    // layer moves. The `SyncComponent` impl removes the marker from the render
+    // world.
+    if !kept_shadow_map_lights.is_empty() {
+        all_lights_found.extend(&kept_shadow_map_lights);
+        commands.try_insert_batch(
+            kept_shadow_map_lights
+                .iter()
+                .map(|render_entity| (render_entity, KeepShadowMaps))
+                .collect::<Vec<_>>(),
+        );
+    }
+
     // Clear out any shadow maps that correspond to lights that have become
     // invisible or have their shadow mapping turned off.
     for (render_entity, _, _) in existing_render_shadow_map_visible_entities
@@ -1119,10 +1142,18 @@ pub fn prepare_lights(
         Res<GpuPreprocessingSupport>,
         Option<Res<RenderClusteredDecals>>,
     ),
-    (existing_shadow_views, mut light_key_cache, mut specialized_shadow_material_pipeline_cache): (
+    (
+        existing_shadow_views,
+        mut light_key_cache,
+        mut specialized_shadow_material_pipeline_cache,
+        kept_shadow_map_lights,
+        mut shadow_map_layers,
+    ): (
         Query<&ShadowView>,
         ResMut<LightKeyCache>,
         ResMut<SpecializedShadowMaterialPipelineCache>,
+        Query<(), With<KeepShadowMaps>>,
+        Local<ShadowMapLayers>,
     ),
 ) {
     let views_iter = views.iter();
@@ -1573,6 +1604,12 @@ pub fn prepare_lights(
                 array_layer_count: None,
             });
 
+    let (point_light_texture_kept, directional_light_texture_kept) = shadow_map_layers
+        .prepare_for_new_frame(
+            point_light_depth_texture.texture.id(),
+            directional_light_depth_texture.texture.id(),
+        );
+
     let mut live_views = EntityHashSet::with_capacity(views_count);
 
     // TODO: this should select lights based on relevance to the view instead of the first ones that show up in a query
@@ -1591,6 +1628,24 @@ pub fn prepare_lights(
         ) = point_lights.get_mut(*light_entity).unwrap();
 
         if !light.shadow_maps_enabled {
+            despawn_entities(
+                &mut commands,
+                mem::take(&mut point_and_spot_light_view_entities.0),
+            );
+            continue;
+        }
+
+        // MPS: a light whose maps are kept has no shadow views, so nothing is
+        // specialized, queued, batched, preprocessed or drawn for it; its
+        // phases and caches are dropped below. Its maps are drawn again from
+        // new views, as for a new light, once they aren't kept.
+        let cube_index = global_clusterable_object_meta.entity_to_index[light_entity];
+        if shadow_map_layers.keep(
+            *light_entity,
+            cube_index as u32,
+            point_light_texture_kept,
+            kept_shadow_map_lights.contains(*light_entity),
+        ) {
             despawn_entities(
                 &mut commands,
                 mem::take(&mut point_and_spot_light_view_entities.0),
@@ -1618,8 +1673,12 @@ pub fn prepare_lights(
             );
 
             point_and_spot_light_view_entities.0 = light_view_entities;
-        } else if changed_point_lights.get(*light_entity).is_ok() {
-            // Update the point shadow maps with the changes.
+        } else if changed_point_lights.get(*light_entity).is_ok()
+            || shadow_map_layers.moved(*light_entity)
+        {
+            // Update the point shadow maps with the changes. MPS: also when
+            // their layer or texture moved: a light with `KeepShadowMaps` isn't
+            // extracted again, so it doesn't count as changed.
             create_point_shadow_maps(
                 &mut commands,
                 &mut point_light_depth_attachments,
@@ -1673,6 +1732,21 @@ pub fn prepare_lights(
             continue;
         }
 
+        // See the point lights above.
+        let layer = num_directional_cascades_enabled + light_index;
+        if shadow_map_layers.keep(
+            *light_entity,
+            layer as u32,
+            directional_light_texture_kept,
+            kept_shadow_map_lights.contains(*light_entity),
+        ) {
+            despawn_entities(
+                &mut commands,
+                mem::take(&mut point_and_spot_light_view_entities.0),
+            );
+            continue;
+        }
+
         // Spot light shadow maps are shared across all cameras,
         // so the retained view entity must not include the camera.
         let retained_view_entity = RetainedViewEntity::new(*light_main_entity, None, 0);
@@ -1693,7 +1767,10 @@ pub fn prepare_lights(
             );
 
             point_and_spot_light_view_entities.0 = vec![view_light_entity];
-        } else if changed_point_lights.get(*light_entity).is_ok() {
+        } else if changed_point_lights.get(*light_entity).is_ok()
+            || shadow_map_layers.moved(*light_entity)
+        {
+            // MPS: see the point lights above.
             create_spot_shadow_map(
                 &mut commands,
                 &mut directional_light_depth_attachments,
@@ -2337,6 +2414,66 @@ fn create_spot_shadow_map(
         GpuPreprocessingMode::Culling
     ) {
         commands.entity(view_light_entity).insert(NoIndirectDrawing);
+    }
+}
+
+/// Where the shadow maps of each point and spot light were in the last frames,
+/// so that the maps of a light with [`KeepShadowMaps`] are kept only while
+/// they stay in the same texture and layer.
+#[derive(Default)]
+pub struct ShadowMapLayers {
+    /// The point light and the directional light depth textures.
+    textures: Option<(TextureId, TextureId)>,
+    /// The first layer of each light's maps in its texture, and in how many
+    /// frames in a row they were there, as of the last frame.
+    last_frame: EntityHashMap<(u32, u32)>,
+    /// The same for this frame.
+    this_frame: EntityHashMap<(u32, u32)>,
+}
+
+impl ShadowMapLayers {
+    /// Frames a light's maps are drawn in a new place before they can be kept
+    /// again: as when an application keeps maps, the first frame's queues can
+    /// be incomplete.
+    const SETTLE_FRAMES: u32 = 3;
+
+    /// Starts a new frame and returns whether the point light and the
+    /// directional light depth textures are those of the last frame.
+    fn prepare_for_new_frame(
+        &mut self,
+        point_light_texture: TextureId,
+        directional_light_texture: TextureId,
+    ) -> (bool, bool) {
+        mem::swap(&mut self.last_frame, &mut self.this_frame);
+        self.this_frame.clear();
+        let last = self
+            .textures
+            .replace((point_light_texture, directional_light_texture));
+        (
+            last.is_some_and(|(point, _)| point == point_light_texture),
+            last.is_some_and(|(_, directional)| directional == directional_light_texture),
+        )
+    }
+
+    /// Records the first layer of a light's maps in this frame and returns
+    /// whether its maps are kept: it has [`KeepShadowMaps`] (`marked`) and its
+    /// maps have been in this texture and layer for more than
+    /// [`Self::SETTLE_FRAMES`] frames, so that a move draws them in new views
+    /// for that many frames before they are kept again.
+    fn keep(&mut self, light: Entity, layer: u32, texture_kept: bool, marked: bool) -> bool {
+        let frames = match self.last_frame.get(&light) {
+            Some(&(last_layer, frames)) if texture_kept && last_layer == layer => frames.saturating_add(1),
+            _ => 1,
+        };
+        self.this_frame.insert(light, (layer, frames));
+        marked && frames > Self::SETTLE_FRAMES
+    }
+
+    /// Whether a light's maps are in a new layer or texture this frame (call
+    /// after [`Self::keep`]), so that its existing shadow views must render to
+    /// the new place.
+    fn moved(&self, light: Entity) -> bool {
+        self.this_frame.get(&light).is_none_or(|&(_, frames)| frames == 1)
     }
 }
 

@@ -263,6 +263,39 @@ pub type WithLight = Or<(
 #[derive(Debug, Component, Reflect, Default, Clone, PartialEq)]
 #[reflect(Component, Default, Debug, Clone, PartialEq)]
 pub struct NotShadowCaster;
+
+/// Add this component to a [`PointLight`] or [`SpotLight`] to keep its shadow
+/// maps as they are instead of redrawing them every frame.
+///
+/// While a light has this component, Bevy spends almost no per-frame work on
+/// its shadow maps: it doesn't check which meshes its shadow views see (it only
+/// keeps the meshes it saw visible), doesn't keep shadow views for it, doesn't
+/// queue, batch or GPU-preprocess meshes for them and doesn't run their shadow
+/// passes. Lighting keeps sampling the maps
+/// drawn last, and the light keeps its shadow map layer. The meshes that the
+/// light saw when its maps were last drawn stay visible.
+///
+/// Add it only when the light's shadow maps are drawn and still valid: neither
+/// the light nor any shadow caster it sees moved, appeared, disappeared or
+/// changed its mesh or material since they were drawn, and every caster was
+/// ready (its mesh, material and pipeline) when they were drawn. Remove it to
+/// redraw the maps; they are queued and drawn again from scratch in the same
+/// frame.
+///
+/// Bevy redraws a light's maps anyway, from the meshes the light saw when its
+/// maps were last drawn, when their layer or the shadow map texture changes:
+/// for example when a shadowed light is added, removed or leaves the view, or
+/// when the shadow map size changes. It draws them for three frames in the new
+/// place before it keeps them again, without knowing whether every caster's
+/// pipeline was ready: an application that can tell should remove the marker
+/// on such changes too.
+///
+/// This component has no effect on a [`DirectionalLight`], whose cascades
+/// follow the camera.
+#[derive(Debug, Component, Reflect, Default, Clone, PartialEq)]
+#[reflect(Component, Default, Debug, Clone, PartialEq)]
+pub struct KeepShadowMaps;
+
 /// Add this component to make a [`Mesh3d`] not receive shadows.
 ///
 /// **Note:** If you're using diffuse transmission, setting [`NotShadowReceiver`] will
@@ -523,6 +556,7 @@ pub fn check_point_light_mesh_visibility(
         &CubemapFrusta,
         &mut CubemapVisibleEntities,
         Option<&RenderLayers>,
+        Has<KeepShadowMaps>,
     )>,
     mut spot_lights: Query<(
         &SpotLight,
@@ -530,25 +564,9 @@ pub fn check_point_light_mesh_visibility(
         &Frustum,
         &mut VisibleMeshEntities,
         Option<&RenderLayers>,
+        Has<KeepShadowMaps>,
     )>,
-    mut visible_entity_query: Query<
-        (
-            Entity,
-            &InheritedVisibility,
-            &mut ViewVisibility,
-            Option<&RenderLayers>,
-            Option<&Aabb>,
-            Option<&GlobalTransform>,
-            Has<VisibilityRange>,
-            Has<NoFrustumCulling>,
-        ),
-        (
-            Without<NotShadowCaster>,
-            Without<DirectionalLight>,
-            Without<NoCpuCulling>,
-            With<Mesh3d>,
-        ),
-    >,
+    mut visible_entity_query: PointLightShadowCasterQuery,
     mut camera_query: Query<(Entity, &RenderTarget), With<Camera>>,
     mut shadow_lod_origin_query: Query<Entity, With<ShadowLodOrigin>>,
     mut point_and_spot_light_query: Query<Entity, Or<(With<PointLight>, With<SpotLight>)>>,
@@ -579,10 +597,18 @@ pub fn check_point_light_mesh_visibility(
                 cubemap_frusta,
                 mut cubemap_visible_entities,
                 maybe_view_mask,
+                keep_shadow_maps,
             )) = point_lights.get_mut(light_entity)
             {
                 // NOTE: If shadow mapping is disabled for the light then it must have no visible entities
                 if !point_light.shadow_maps_enabled {
+                    continue;
+                }
+
+                if keep_shadow_maps {
+                    for visible_entities in cubemap_visible_entities.iter() {
+                        keep_shadow_casters_visible(visible_entities, &mut visible_entity_query);
+                    }
                     continue;
                 }
 
@@ -669,11 +695,22 @@ pub fn check_point_light_mesh_visibility(
             }
 
             // Spot lights
-            if let Ok((point_light, transform, frustum, mut visible_entities, maybe_view_mask)) =
-                spot_lights.get_mut(light_entity)
+            if let Ok((
+                point_light,
+                transform,
+                frustum,
+                mut visible_entities,
+                maybe_view_mask,
+                keep_shadow_maps,
+            )) = spot_lights.get_mut(light_entity)
             {
                 // NOTE: If shadow mapping is disabled for the light then it must have no visible entities
                 if !point_light.shadow_maps_enabled {
+                    continue;
+                }
+
+                if keep_shadow_maps {
+                    keep_shadow_casters_visible(&visible_entities, &mut visible_entity_query);
                     continue;
                 }
 
@@ -745,6 +782,47 @@ pub fn check_point_light_mesh_visibility(
                 visible_entities.shrink();
                 visible_entities.entities.sort_unstable();
             }
+        }
+    }
+}
+
+/// The meshes that [`check_point_light_mesh_visibility`] tests against the
+/// frusta of point and spot lights.
+type PointLightShadowCasterQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static InheritedVisibility,
+        &'static mut ViewVisibility,
+        Option<&'static RenderLayers>,
+        Option<&'static Aabb>,
+        Option<&'static GlobalTransform>,
+        Has<VisibilityRange>,
+        Has<NoFrustumCulling>,
+    ),
+    (
+        Without<NotShadowCaster>,
+        Without<DirectionalLight>,
+        Without<NoCpuCulling>,
+        With<Mesh3d>,
+    ),
+>;
+
+/// Marks the meshes that a light with [`KeepShadowMaps`] saw when its shadow
+/// maps were last drawn as visible, without testing them against its frusta
+/// again. Its list of visible meshes stays as it is (and unchanged, so that it
+/// isn't extracted again).
+fn keep_shadow_casters_visible(
+    visible_entities: &VisibleMeshEntities,
+    visible_entity_query: &mut PointLightShadowCasterQuery,
+) {
+    for &entity in &visible_entities.entities {
+        if let Ok((_, inherited_visibility, mut view_visibility, ..)) =
+            visible_entity_query.get_mut(entity)
+            && inherited_visibility.get()
+        {
+            view_visibility.set_visible();
         }
     }
 }

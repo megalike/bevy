@@ -1,11 +1,11 @@
-//! Illustrates spot lights.
+//! Illustrates spot lights, and keeping their shadow maps while nothing moves.
 
 use std::f32::consts::*;
 
 use bevy::{
     camera::Hdr,
     color::palettes::basic::{MAROON, RED},
-    light::NotShadowCaster,
+    light::{KeepShadowMaps, NotShadowCaster},
     math::ops,
     prelude::*,
 };
@@ -17,7 +17,8 @@ Controls
 --------
 Horizontal Movement: WASD
 Vertical Movement: Space and Shift
-Rotate Camera: Left and Right Arrows";
+Rotate Camera: Left and Right Arrows
+Stop Lights and Keep Their Shadow Maps: K";
 
 fn main() {
     App::new()
@@ -27,8 +28,28 @@ fn main() {
         })
         .add_plugins(DefaultPlugins)
         .add_systems(Startup, setup)
-        .add_systems(Update, (light_sway, movement, rotation))
+        .init_resource::<KeepShadows>()
+        .add_systems(
+            Update,
+            (
+                toggle_keep_shadows,
+                light_sway.run_if(|keep: Res<KeepShadows>| !keep.enabled),
+                movement,
+                rotation,
+                keep_shadow_maps,
+            )
+                .chain(),
+        )
         .run();
+}
+
+/// Whether the spot lights stand still and keep their shadow maps while
+/// nothing moves.
+#[derive(Resource, Default)]
+struct KeepShadows {
+    enabled: bool,
+    /// Frames in a row in which neither a light nor a shadow caster moved.
+    still_frames: u32,
 }
 
 #[derive(Component)]
@@ -134,7 +155,41 @@ fn setup(
     ));
 }
 
-fn light_sway(time: Res<Time>, mut query: Query<(&mut Transform, &mut SpotLight)>) {
+fn toggle_keep_shadows(input: Res<ButtonInput<KeyCode>>, mut keep: ResMut<KeepShadows>) {
+    if input.just_pressed(KeyCode::KeyK) {
+        keep.enabled = !keep.enabled;
+    }
+}
+
+/// Keeps the spot lights' shadow maps once a frame in which nothing moved has
+/// drawn them, and redraws them as soon as something moves.
+///
+/// This is enough here because K is pressed after the scene has loaded. An
+/// application that keeps maps on its own must also wait until every caster
+/// and its pipeline were ready when the maps were drawn: a map drawn while a
+/// pipeline compiled is kept incomplete.
+fn keep_shadow_maps(
+    mut commands: Commands,
+    mut keep: ResMut<KeepShadows>,
+    lights: Query<(Entity, Has<KeepShadowMaps>), With<SpotLight>>,
+) {
+    let kept = keep.enabled && keep.still_frames >= 2;
+    for (entity, has_keep_shadow_maps) in &lights {
+        if kept && !has_keep_shadow_maps {
+            commands.entity(entity).insert(KeepShadowMaps);
+        } else if !kept && has_keep_shadow_maps {
+            commands.entity(entity).remove::<KeepShadowMaps>();
+        }
+    }
+    keep.still_frames = keep.still_frames.saturating_add(1);
+}
+
+fn light_sway(
+    time: Res<Time>,
+    mut query: Query<(&mut Transform, &mut SpotLight)>,
+    mut keep: ResMut<KeepShadows>,
+) {
+    keep.still_frames = 0;
     for (mut transform, mut angles) in query.iter_mut() {
         transform.rotation = Quat::from_euler(
             EulerRot::XYZ,
@@ -152,6 +207,7 @@ fn movement(
     input: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     mut query: Query<&mut Transform, With<Movable>>,
+    mut keep: ResMut<KeepShadows>,
 ) {
     // Calculate translation to move the cubes and ground plane
     let mut translation = Vec3::ZERO;
@@ -178,6 +234,11 @@ fn movement(
     }
 
     translation *= 2.0 * time.delta_secs();
+    if translation == Vec3::ZERO {
+        return;
+    }
+    // The shadow casters move: the shadow maps must be drawn again.
+    keep.still_frames = 0;
 
     // Apply translation
     for mut transform in &mut query {
