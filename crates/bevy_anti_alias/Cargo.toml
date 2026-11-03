@@ -41,7 +41,7 @@ dlss_wgpu = { version = "6.0.0", optional = true }
 uuid = { version = "1.21.0", optional = true }
 # MPS: wgpu-ffx's wgpu 30 branch with MPS's fixes (fork megalike/wgpu-ffx, branch `mps`), until a published
 # release supports wgpu 30.
-wgpu-ffx = { git = "https://github.com/megalike/wgpu-ffx", rev = "674c8217588fd52a1ef671547cefca312ef19b83", optional = true }
+wgpu-ffx = { git = "https://github.com/megalike/wgpu-ffx", rev = "d7c3a2235a3a0d6bb927bce2c3ca4d1bff964c43", optional = true }
 
 [lints]
 workspace = true
