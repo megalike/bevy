@@ -310,10 +310,12 @@ fn report_shadow_cache(time: Res<Time>, feedback: Res<ShadowCacheFeedback>, mut 
 /// start-up); `SHADOW_CACHE_FAULT` injects a fault that the oracle must catch
 /// (`skip_restore`, `drop_written`, `drop_one_tile`,
 /// `miss_static_invalidation`, `miss_settle_invalidation`, `late_marker`,
-/// `stale_ack`, `wrong_layer`, `acknowledge_early`, `skip_reentry_restore`).
+/// `stale_ack`, `wrong_layer`, `acknowledge_early`, `skip_reentry_restore`,
+/// `miss_tag_change`).
 mod oracle {
     use super::*;
     use bevy::{
+        asset::uuid_handle,
         camera::visibility::{NoCpuCulling, NoFrustumCulling, RenderLayers, VisibilityRange},
         diagnostic::FrameCount,
         light::{
@@ -321,12 +323,15 @@ mod oracle {
             ShadowCacheFaults, ShadowCacheLoading, ShadowCacheState, ShadowCasterLive,
             ShadowViewId, StaticShadowCaster,
         },
-        mesh::Indices,
+        mesh::{Indices, MeshTag},
         pbr::{
             ShadowCacheAuditPlugin, ShadowCacheAuditResults, ShadowCacheAuditSettings,
             ShadowCacheAuditStatus,
         },
         platform::collections::HashMap,
+        reflect::TypePath,
+        render::render_resource::AsBindGroup,
+        shader::ShaderRef,
         time::TimeUpdateStrategy,
         world_serialization::{WorldAsset, WorldInstanceReady},
     };
@@ -373,6 +378,59 @@ mod oracle {
         std::env::var("SPOTLIGHT_ORACLE_CACHE").as_deref() != Ok("0")
     }
 
+    /// A material whose shadow depends on the mesh's [`MeshTag`], as a
+    /// terrain's patches that read their heights by it: a tag other than 0
+    /// draws the mesh at half its size (inside its bounds).
+    #[derive(Asset, TypePath, AsBindGroup, Debug, Clone, Default)]
+    struct TagShadowMaterial {}
+
+    const TAG_SHADOW_SHADER: Handle<Shader> = uuid_handle!("6f1c7a52-3b9e-4d0a-9a4e-2f8d1c5b7e31");
+
+    const TAG_SHADOW_SHADER_SOURCE: &str = r"
+import bevy_pbr::render::{mesh_functions, view_transformations::position_world_to_clip};
+
+struct Vertex {
+    @builtin(instance_index) instance_index: u32,
+    @location(0) position: vec3<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex
+fn vertex(vertex: Vertex) -> VertexOutput {
+    let scale = select(1.0, 0.5, mesh_functions::get_tag(vertex.instance_index) != 0u);
+    let world_from_local = mesh_functions::get_world_from_local(vertex.instance_index);
+    let world_position = mesh_functions::mesh_position_local_to_world(
+        world_from_local,
+        vec4<f32>(vertex.position * scale, 1.0),
+    );
+    var out: VertexOutput;
+    out.position = position_world_to_clip(world_position.xyz);
+    return out;
+}
+
+@fragment
+fn fragment() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.8, 0.7, 0.3, 1.0);
+}
+";
+
+    impl Material for TagShadowMaterial {
+        fn vertex_shader() -> ShaderRef {
+            TAG_SHADOW_SHADER.into()
+        }
+
+        fn fragment_shader() -> ShaderRef {
+            TAG_SHADOW_SHADER.into()
+        }
+
+        fn prepass_vertex_shader() -> ShaderRef {
+            TAG_SHADOW_SHADER.into()
+        }
+    }
+
     /// The oracle, on the scripted scene or on `--stress`'s.
     pub struct OraclePlugin {
         /// Runs the script (see [`scenario`]); without it the scene's own
@@ -410,16 +468,24 @@ mod oracle {
                 });
             }
             if self.scripted {
-                app.add_systems(
-                    Startup,
-                    (
-                        list_lights.after(setup),
-                        spawn_script_casters.after(list_lights),
-                        warm_up_gltf.after(spawn_script_casters),
-                    ),
-                )
-                .add_systems(Update, (run_script, move_movers, collect_results).chain())
-                .add_systems(Last, check_expectations);
+                app.world_mut()
+                    .resource_mut::<Assets<Shader>>()
+                    .insert(
+                        TAG_SHADOW_SHADER.id(),
+                        Shader::from_wesl(TAG_SHADOW_SHADER_SOURCE, "spotlight_tag_shadow.wesl"),
+                    )
+                    .unwrap();
+                app.add_plugins(MaterialPlugin::<TagShadowMaterial>::default())
+                    .add_systems(
+                        Startup,
+                        (
+                            list_lights.after(setup),
+                            spawn_script_casters.after(list_lights),
+                            warm_up_gltf.after(spawn_script_casters),
+                        ),
+                    )
+                    .add_systems(Update, (run_script, move_movers, collect_results).chain())
+                    .add_systems(Last, check_expectations);
             } else {
                 app.add_systems(Update, collect_results);
             }
@@ -435,6 +501,7 @@ mod oracle {
             miss_static_invalidation: fault == "miss_static_invalidation",
             miss_settle_invalidation: fault == "miss_settle_invalidation",
             late_marker: fault == "late_marker",
+            miss_tag_change: fault == "miss_tag_change",
             stale_ack: fault == "stale_ack",
             wrong_layer: fault == "wrong_layer",
             acknowledge_early: fault == "acknowledge_early",
@@ -558,7 +625,8 @@ mod oracle {
             900..912 => "out of view while the movers leave",
             912..915 => "back in view after the movers left",
             915..930 => "a settled caster's mesh replaced under the same id, same bounds",
-            _ => "a settled caster's material replaced under the same id",
+            930..940 => "a settled caster's material replaced under the same id",
+            _ => "a settled caster's mesh tag changed (its shader places its vertices by it)",
         }
     }
 
@@ -582,6 +650,7 @@ mod oracle {
         // Everything the script names settles in the frame after it appears.
         for name in [
             "door", "child", "drifter", "jitter_a", "jitter_b", "forced", "micro", "settler",
+            "tagged",
         ] {
             at(100, name, true);
         }
@@ -635,6 +704,8 @@ mod oracle {
         at(915, "swap_mesh", false);
         at(929, "swap_material", true);
         at(930, "swap_material", false);
+        at(939, "tagged", true);
+        at(940, "tagged", false);
         expect
     }
 
@@ -655,6 +726,7 @@ mod oracle {
         mut commands: Commands,
         mut meshes: ResMut<Assets<Mesh>>,
         mut materials: ResMut<Assets<StandardMaterial>>,
+        mut tag_materials: ResMut<Assets<TagShadowMaterial>>,
         mut script: ResMut<Script>,
         lights: Query<&Transform, With<SpotLight>>,
     ) {
@@ -702,6 +774,16 @@ mod oracle {
             ))
             .id();
         named.extend([("parent", parent), ("parent2", parent2), ("child", child)]);
+        // A caster whose shadow its mesh tag decides, retagged later.
+        let tagged = commands
+            .spawn((
+                cube.clone(),
+                MeshMaterial3d(tag_materials.add(TagShadowMaterial {})),
+                MeshTag::new(0),
+                Transform::from_translation(under(position(5), Vec3::new(0.0, 0.0, -0.3))),
+            ))
+            .id();
+        named.push(("tagged", tagged));
         // A mesh and a material of their own, replaced under the same id later.
         let swap_positions = [position(10), position(9)];
         script.swap_mesh = meshes.add(Cuboid::from_length(0.3));
@@ -1321,6 +1403,13 @@ mod oracle {
                         indices.truncate(24);
                     }
                     meshes.insert(id, mesh).unwrap();
+                }
+            }
+            940 => {
+                // A tag of another value: the same entity, mesh and bounds,
+                // another shadow.
+                if let Some(&tagged) = script.named.get("tagged") {
+                    commands.entity(tagged).insert(MeshTag::new(1));
                 }
             }
             930 => {
