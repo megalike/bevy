@@ -14,13 +14,16 @@ bevy_app = { path = "../bevy_app", version = "0.20.1" }
 bevy_curve = { path = "../bevy_curve", version = "0.20.1" }
 bevy_asset = { path = "../bevy_asset", version = "0.20.1" }
 bevy_image = { path = "../bevy_image", version = "0.20.1" }
-bevy_mesh = { path = "../bevy_mesh", version = "0.20.1" }
+# MPS: `morph` for `MeshMorphWeights`, which makes a shadow caster movable.
+bevy_mesh = { path = "../bevy_mesh", version = "0.20.1", features = ["morph"] }
 bevy_math = { path = "../bevy_math", version = "0.20.1" }
 bevy_shape = { path = "../bevy_shape", version = "0.20.1" }
 bevy_reflect = { path = "../bevy_reflect", version = "0.20.1" }
 bevy_camera = { path = "../bevy_camera", version = "0.20.1" }
 bevy_ecs = { path = "../bevy_ecs", version = "0.20.1" }
 bevy_transform = { path = "../bevy_transform", version = "0.20.1" }
+# MPS: the shadow cache settles casters after a span of simulation time.
+bevy_time = { path = "../bevy_time", version = "0.20.1" }
 bevy_utils = { path = "../bevy_utils", version = "0.20.1" }
 bevy_platform = { path = "../bevy_platform", version = "0.20.1" }
 bevy_color = { path = "../bevy_color", version = "0.20.1", features = [

@@ -372,28 +372,40 @@ impl DepthStencilViewAttachment {
     }
 
     /// Marks this depth attachment as unused this frame so that it'll be
-    /// cleared at first use.
+    /// cleared at first use, if it has a clear value.
     pub fn prepare_for_new_frame(&self) {
-        match &self.depth_stencil_data {
+        self.depth_stencil_data.prepare_for_new_frame();
+    }
+}
+
+impl DepthStencilData {
+    /// Marks each aspect that has a clear value as not yet used this frame.
+    ///
+    /// MPS: an aspect without a clear value is always loaded; marking it as
+    /// unused would make the next `get_attachment` unwrap a missing clear
+    /// value.
+    fn prepare_for_new_frame(&self) {
+        match self {
             DepthStencilData::DepthStencil {
+                depth_clear_value,
+                stencil_clear_value,
                 depth_is_first_call,
                 stencil_is_first_call,
-                ..
             } => {
-                depth_is_first_call.store(true, Ordering::Relaxed);
-                stencil_is_first_call.store(true, Ordering::Relaxed);
+                depth_is_first_call.store(depth_clear_value.is_some(), Ordering::Relaxed);
+                stencil_is_first_call.store(stencil_clear_value.is_some(), Ordering::Relaxed);
             }
             DepthStencilData::DepthOnly {
+                depth_clear_value,
                 depth_is_first_call,
-                ..
             } => {
-                depth_is_first_call.store(true, Ordering::Relaxed);
+                depth_is_first_call.store(depth_clear_value.is_some(), Ordering::Relaxed);
             }
             DepthStencilData::StencilOnly {
+                stencil_clear_value,
                 stencil_is_first_call,
-                ..
             } => {
-                stencil_is_first_call.store(true, Ordering::Relaxed);
+                stencil_is_first_call.store(stencil_clear_value.is_some(), Ordering::Relaxed);
             }
         }
     }
@@ -442,5 +454,90 @@ impl OutputColorAttachment {
     // are always consumed by a render pass that writes to the attachment
     pub fn needs_present(&self) -> bool {
         !self.is_first_call.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_calls(data: &DepthStencilData) -> (Option<bool>, Option<bool>) {
+        match data {
+            DepthStencilData::DepthStencil {
+                depth_is_first_call,
+                stencil_is_first_call,
+                ..
+            } => (
+                Some(depth_is_first_call.load(Ordering::Relaxed)),
+                Some(stencil_is_first_call.load(Ordering::Relaxed)),
+            ),
+            DepthStencilData::DepthOnly {
+                depth_is_first_call,
+                ..
+            } => (Some(depth_is_first_call.load(Ordering::Relaxed)), None),
+            DepthStencilData::StencilOnly {
+                stencil_is_first_call,
+                ..
+            } => (None, Some(stencil_is_first_call.load(Ordering::Relaxed))),
+        }
+    }
+
+    #[test]
+    fn prepare_for_new_frame_marks_only_aspects_with_a_clear_value() {
+        let used = || Arc::new(AtomicBool::new(false));
+        let cases = [
+            (
+                DepthStencilData::DepthOnly {
+                    depth_clear_value: Some(0.0),
+                    depth_is_first_call: used(),
+                },
+                (Some(true), None),
+            ),
+            (
+                DepthStencilData::DepthOnly {
+                    depth_clear_value: None,
+                    depth_is_first_call: used(),
+                },
+                (Some(false), None),
+            ),
+            (
+                DepthStencilData::StencilOnly {
+                    stencil_clear_value: Some(0),
+                    stencil_is_first_call: used(),
+                },
+                (None, Some(true)),
+            ),
+            (
+                DepthStencilData::StencilOnly {
+                    stencil_clear_value: None,
+                    stencil_is_first_call: used(),
+                },
+                (None, Some(false)),
+            ),
+            (
+                DepthStencilData::DepthStencil {
+                    depth_clear_value: Some(0.0),
+                    stencil_clear_value: None,
+                    depth_is_first_call: used(),
+                    stencil_is_first_call: used(),
+                },
+                (Some(true), Some(false)),
+            ),
+            (
+                DepthStencilData::DepthStencil {
+                    depth_clear_value: None,
+                    stencil_clear_value: Some(0),
+                    depth_is_first_call: used(),
+                    stencil_is_first_call: used(),
+                },
+                (Some(false), Some(true)),
+            ),
+        ];
+        for (data, expected) in cases {
+            // Twice: a second frame must not change the result.
+            data.prepare_for_new_frame();
+            data.prepare_for_new_frame();
+            assert_eq!(first_calls(&data), expected);
+        }
     }
 }

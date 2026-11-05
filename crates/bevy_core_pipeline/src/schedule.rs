@@ -125,6 +125,16 @@ struct CameraWindows(EntityHashSet);
 #[reflect(from_reflect = false)]
 pub struct RootNonCameraView(#[reflect(ignore)] pub InternedScheduleLabel);
 
+/// The order in which [`camera_driver`] runs a [`RootNonCameraView`] among the
+/// other views that aren't cameras: lower first, and views without this
+/// component as 0. Views with the same order run in no particular order. All
+/// of them run before the cameras.
+///
+/// MPS: a cached spot light shadow map draws its static casters, then its
+/// moving casters over them, in two views that must run in that order.
+#[derive(Clone, Copy, Component, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RootNonCameraViewOrder(pub i32);
+
 /// The default entry point for camera driven rendering added to the root [`bevy_render::renderer::RenderGraph`]
 /// schedule. This system iterates over all cameras in the world, executing their associated
 /// rendering schedules defined by the [`bevy_render::camera::CameraRenderGraph`] component.
@@ -139,11 +149,17 @@ pub fn camera_driver(
 ) {
     // Gather up all cameras and auxiliary views not associated with a camera.
     let root_views: Vec<_> = {
-        let mut auxiliary_views = world.query_filtered::<Entity, With<RootNonCameraView>>();
+        let mut auxiliary_views = world
+            .query_filtered::<(Entity, Option<&RootNonCameraViewOrder>), With<RootNonCameraView>>();
+        let mut auxiliary_views: Vec<_> = auxiliary_views
+            .iter(world)
+            .map(|(entity, order)| (order.copied().unwrap_or_default(), entity))
+            .collect();
+        auxiliary_views.sort_by_key(|(order, _)| *order);
         let sorted = world.resource::<SortedCameras>();
         auxiliary_views
-            .iter(world)
-            .map(RootView::Auxiliary)
+            .into_iter()
+            .map(|(_, entity)| RootView::Auxiliary(entity))
             .chain(sorted.0.iter().map(|c| RootView::Camera {
                 entity: c.entity,
                 order: c.order,
