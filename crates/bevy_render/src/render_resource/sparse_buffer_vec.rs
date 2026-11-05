@@ -470,6 +470,13 @@ where
     needs_full_reupload: bool,
     /// True if a sparse update is to be performed.
     sparse_update_scheduled: bool,
+    /// True once the shared scatter pipeline was seen compiled.
+    ///
+    /// MPS: until then every upload is a full one. A sparse update staged
+    /// while the pipeline still compiles can't be scattered; reuploading only
+    /// in the next frame left the GPU with the previous upload's values for a
+    /// frame (meshes drawn where they were a frame earlier).
+    scatter_available: bool,
 }
 
 impl<T> AtomicSparseBufferVec<T>
@@ -505,6 +512,7 @@ where
             dirty_bits: vec![],
             needs_full_reupload: false,
             sparse_update_scheduled: false,
+            scatter_available: false,
         }
     }
 
@@ -633,6 +641,7 @@ where
     /// update to be worthwhile.
     fn should_perform_full_reupload(&self, render_device: &RenderDevice) -> bool {
         if self.needs_full_reupload
+            || !self.scatter_available
             || render_device.limits().max_storage_buffers_per_shader_stage < 3
         {
             return true;
@@ -754,6 +763,9 @@ where
         // would drop those writes for good. Reupload the whole buffer next frame instead, which
         // rebuilds it from `values` and needs no compute pipeline.
         let mut retry_with_full_reupload = false;
+        self.scatter_available = sparse_buffer_update_bind_groups
+            .pipeline_id
+            .is_some_and(|pipeline_id| pipeline_cache.get_compute_pipeline(pipeline_id).is_some());
 
         if self.sparse_update_scheduled {
             let scheduled = match (&self.data_buffer, self.metadata_uniform.buffer()) {
