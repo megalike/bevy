@@ -238,7 +238,7 @@ impl Plugin for PbrPlugin {
                 SyncComponentPlugin::<DirectionalLight, Self>::default(),
                 SyncComponentPlugin::<PointLight, Self>::default(),
                 SyncComponentPlugin::<SpotLight, Self>::default(),
-                SpotShadowCachePlugin,
+                ShadowCachePlugin,
                 SyncComponentPlugin::<RectLight, Self>::default(),
                 SyncComponentPlugin::<AmbientLight, Self>::default(),
             ))

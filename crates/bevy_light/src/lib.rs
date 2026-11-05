@@ -75,13 +75,14 @@ mod rect_light;
 pub use rect_light::RectLight;
 mod shadow_cache;
 pub use shadow_cache::{
-    classify_shadow_casters, invalidate_spot_shadow_caches, InvalidateShadowCache,
-    LiveShadowMaterial, LiveShadowMaterials, ShadowCacheCounters, ShadowCacheExempt,
-    ShadowCacheFaults, ShadowCacheFeedback, ShadowCacheLightStatus, ShadowCacheLoading,
-    ShadowCacheSettings, ShadowCacheState, ShadowCasterChange, ShadowCasterLive, ShadowCasterState,
-    ShadowFootprint, ShadowTileMask, SpotLightShadowCache, StaticShadowCaster,
+    classify_shadow_casters, invalidate_shadow_caches, InvalidateShadowCache, LiveShadowMaterial,
+    LiveShadowMaterials, ShadowCacheCounters, ShadowCacheExempt, ShadowCacheFaults,
+    ShadowCacheFeedback, ShadowCacheLoading, ShadowCacheSettings, ShadowCacheState,
+    ShadowCacheViewStatus, ShadowCasterChange, ShadowCasterLive, ShadowCasterState,
+    ShadowFootprint, ShadowSubview, ShadowTileMask, ShadowViewCache, ShadowViewId,
+    SpotLightShadowCache, StaticShadowCaster,
 };
-use shadow_cache::{MoversGrid, SpotShadowProjection};
+use shadow_cache::{MoversGrid, ShadowViewProjection, SpotShadowProjection};
 
 /// Provides gizmo drawing for visualizing light positions.
 #[cfg(feature = "bevy_gizmos")]
@@ -246,9 +247,9 @@ impl Plugin for LightPlugin {
                         // between them).
                         classify_shadow_casters
                             .after(AssetEventSystems)
-                            .before(invalidate_spot_shadow_caches),
-                        check_point_light_mesh_visibility.after(invalidate_spot_shadow_caches),
-                        invalidate_spot_shadow_caches,
+                            .before(invalidate_shadow_caches),
+                        check_point_light_mesh_visibility.after(invalidate_shadow_caches),
+                        invalidate_shadow_caches,
                     )
                         .in_set(SimulationLightSystems::CheckLightVisibility)
                         .after(VisibilitySystems::CalculateBounds)
@@ -633,9 +634,9 @@ pub fn check_point_light_mesh_visibility(
         point_and_spot_light_query.transmute_lens_filtered(),
     );
 
-    // MPS: the render world's reports on cached spot lights, as of the frames
-    // it finished.
-    let shadow_cache_status = shadow_cache_feedback.snapshot();
+    // MPS: the render world's reports on cached shadow views, as of the
+    // frames it finished.
+    let shadow_cache_status = shadow_cache_feedback.views();
 
     let visible_entity_ranges = visible_entity_ranges.as_deref();
     // MPS: the active clustered cameras each light is visible to (by their
@@ -775,7 +776,7 @@ pub fn check_point_light_mesh_visibility(
                     directional_light_shadow_map.size,
                 );
                 let cached = shadow_cache.as_mut().is_some_and(|cache| {
-                    let settled = cache.bypass_change_detection().settle_light(
+                    let settled = cache.bypass_change_detection().settlement.settle(
                         &projection,
                         frame,
                         now,
@@ -790,10 +791,10 @@ pub fn check_point_light_mesh_visibility(
                     && cache.cached != cached
                 {
                     cache.cached = cached;
-                    cache.live_casters = 0;
+                    cache.view.live_casters = 0;
                     if !cached {
                         // Drawn again from scratch once it is cached again.
-                        cache.projection = None;
+                        cache.view.projection = None;
                     }
                 }
 
@@ -872,7 +873,7 @@ pub fn check_point_light_mesh_visibility(
                     }
                 };
 
-                let Some(mut cache) = shadow_cache.filter(|_| cached) else {
+                let Some(mut light_cache) = shadow_cache.filter(|_| cached) else {
                     let check_caster =
                         |spot_visible_entities_local_queue: &mut Vec<Entity>,
                          mut item: PointLightShadowCasterItem| {
@@ -898,15 +899,22 @@ pub fn check_point_light_mesh_visibility(
                     continue;
                 };
 
-                // MPS: a cached spot light. Its first frame cached draws its
-                // static layer.
-                if cache.projection.as_ref() != Some(&projection) {
+                // MPS: a cached spot light: its one shadow view. Its first
+                // frame cached draws its static layer.
+                let view_id = ShadowViewId::spot(light_entity);
+                let cache = &mut light_cache.view;
+                cache.begin();
+                if !cache
+                    .projection
+                    .as_ref()
+                    .is_some_and(|cached| cached.is_spot(&projection))
+                {
                     cache.invalidated = true;
                 }
                 let invalidated = mem::take(&mut cache.invalidated);
                 if invalidated {
                     cache.static_revision += 1;
-                    cache.projection = Some(projection.clone());
+                    cache.projection = Some(ShadowViewProjection::Spot(projection.clone()));
                 }
                 let clip_from_world = projection.clip_from_world();
                 let near_z = projection.near_z();
@@ -921,7 +929,7 @@ pub fn check_point_light_mesh_visibility(
                 // A light without a static layer is drawn whole whenever a
                 // live caster is in its frustum: where they fall doesn't
                 // matter.
-                let status = shadow_cache_status.get(&light_entity);
+                let status = cache.status(&shadow_cache_status, &view_id);
                 cache.single_view = status.is_some_and(|status| status.fallback);
                 if !cache.lights_a_view {
                     cache.live_casters = 0;
