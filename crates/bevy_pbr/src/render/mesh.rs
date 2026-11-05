@@ -1339,6 +1339,25 @@ impl RenderMeshInstancesGpu {
 }
 
 impl RenderMeshInstanceGpuQueue {
+    /// Returns true if this queue holds no changed or removed mesh instances.
+    fn is_empty(&self) -> bool {
+        match self {
+            RenderMeshInstanceGpuQueue::None => true,
+            RenderMeshInstanceGpuQueue::CpuCulling { changed, removed } => {
+                changed.is_empty() && removed.is_empty()
+            }
+            RenderMeshInstanceGpuQueue::GpuCulling {
+                changed_cpu_culling,
+                changed_gpu_culling,
+                removed,
+            } => {
+                changed_cpu_culling.is_empty()
+                    && changed_gpu_culling.is_empty()
+                    && removed.is_empty()
+            }
+        }
+    }
+
     /// Clears out a [`RenderMeshInstanceGpuQueue`], creating or recreating it
     /// as necessary.
     ///
@@ -2620,6 +2639,11 @@ pub fn collect_meshes_for_gpu_building(
             // Iterate through each queue, spawning a task for each queue. This loop completes quickly
             // as it does very little work, it is just spawning and moving data into tasks in a loop.
             for queue in render_mesh_instance_queues.iter_mut() {
+                // MPS: one queue exists per thread that ever extracted; most are empty in a still
+                // scene, and a task per empty queue costs more than the work.
+                if queue.is_empty() {
+                    continue;
+                }
                 match *queue {
                     RenderMeshInstanceGpuQueue::None => {
                         // This can only happen if the queue is empty.

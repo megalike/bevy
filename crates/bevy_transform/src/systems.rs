@@ -158,14 +158,14 @@ pub fn mark_dirty_trees(
     //      cooperatively early exit across threads, send newly changed entities to consumer.
     // - consumer: (single) read incoming messages from traversal
     //
-    // These workers are all running both parallelly and concurrently. They are spawned at the start
-    // of the scope and asynchronously await incoming batches of work. This allows the entire
-    // pipeline to start working as soon as there is available work to process, instead of running
-    // each stage serially with inner parallelism.
+    // These workers are all running both parallelly and concurrently. They are spawned as soon as
+    // the producer finds work and asynchronously await incoming batches of work. This allows the
+    // entire pipeline to start working as soon as there is available work to process, instead of
+    // running each stage serially with inner parallelism, and spawns no tasks when nothing changed.
     #[cfg(feature = "multi_threaded")]
     {
         use bevy_tasks::ComputeTaskPool;
-        use core::sync::atomic::Ordering;
+        use core::sync::atomic::{AtomicUsize, Ordering};
         #[cfg(feature = "trace")]
         use tracing::{info_span, Instrument};
 
@@ -179,7 +179,8 @@ pub fn mark_dirty_trees(
             let parents_ref = &parents;
 
             // Consumer: drain the channel of moved entities and call set_changed() on the marker.
-            scope.spawn({
+            // MPS: spawned with the first message, so that a frame without changes spawns no tasks.
+            let consumer = std::sync::Mutex::new(Some({
                 let fut = async move {
                     while let Ok(mut chunk) = consumer_rx.recv().await {
                         for entity in chunk.drain() {
@@ -192,13 +193,26 @@ pub fn mark_dirty_trees(
                 #[cfg(feature = "trace")]
                 let fut = fut.instrument(info_span!("consumer_mark_dirty"));
                 fut
-            });
+            }));
+            let spawn_consumer = || {
+                if let Some(fut) = consumer.lock().unwrap().take() {
+                    scope.spawn(fut);
+                }
+            };
 
             // Traversal: each task loops until the producer channel is exhausted, walking each
             // entity's ancestor chain and forwarding newly marked entities to the consumer task.
-            for _ in 0..(ComputeTaskPool::get().thread_num() - 1).max(1) {
+            // MPS: one task per producer task that finds work, up to one per other thread, so that
+            // the tasks follow the work instead of the thread count.
+            let max_traversal_tasks = (ComputeTaskPool::get().thread_num() - 1).max(1);
+            let traversal_tasks = AtomicUsize::new(0);
+            let traversal_consumer_tx = consumer_tx.clone();
+            let spawn_traversal = || {
+                if traversal_tasks.fetch_add(1, Ordering::Relaxed) >= max_traversal_tasks {
+                    return;
+                }
                 let traversal_rx = traversal_rx.clone();
-                let mut consumer_tx = consumer_tx.clone();
+                let mut consumer_tx = traversal_consumer_tx.clone();
                 scope.spawn({
                     let fut = async move {
                         while let Ok(mut chunk) = traversal_rx.recv().await {
@@ -256,7 +270,7 @@ pub fn mark_dirty_trees(
                     let fut = fut.instrument(info_span!("par_traversal_mark_dirty"));
                     fut
                 });
-            }
+            };
 
             // Producer: Feed changed entities and orphans into producer tasks. The senders are
             // dropped at the end of this closure, closing the channel and allowing the other tasks
@@ -265,14 +279,21 @@ pub fn mark_dirty_trees(
             // Note that we send changed entities directly to the consumer as well; we do this to
             // start feeding it work as soon as possible. The traversal worker should skip sending
             // these leaves to the consumer because they have already been sent here.
+            let (spawn_consumer, spawn_traversal) = (&spawn_consumer, &spawn_traversal);
             let mut producer = move || {
                 for entity in orphaned.read() {
+                    spawn_consumer();
                     let _ = consumer_tx.send_blocking(entity);
                 }
                 // Changed<> table scans are slow, so we parallelize them to improve performance.
                 changed.par_iter().for_each_init(
-                    || (traversal_tx.clone(), consumer_tx.clone()),
-                    |(traversal_tx, consumer_tx), entity| {
+                    || (traversal_tx.clone(), consumer_tx.clone(), false),
+                    |(traversal_tx, consumer_tx, spawned), entity| {
+                        if !*spawned {
+                            *spawned = true;
+                            spawn_consumer();
+                            spawn_traversal();
+                        }
                         let _ = traversal_tx.send_blocking(entity);
                         let _ = consumer_tx.send_blocking(entity);
                     },
