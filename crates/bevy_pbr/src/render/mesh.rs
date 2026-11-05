@@ -28,7 +28,7 @@ use bevy_ecs::{
 use bevy_image::TextureFormatPixelInfo;
 use bevy_light::{
     EnvironmentMapLight, IrradianceVolume, NotShadowCaster, NotShadowReceiver,
-    ShadowFilteringMethod, TransmittedShadowReceiver,
+    ShadowFilteringMethod, StaticShadowCaster, TransmittedShadowReceiver,
 };
 use bevy_math::{Affine3, Affine3Ext, Rect, UVec2, Vec3, Vec4};
 use bevy_mesh::{
@@ -833,6 +833,10 @@ bitflags::bitflags! {
         /// CPU culling has been disabled because the `NoCpuCulling` component
         /// is present on the mesh instance.
         const NO_CPU_CULLING          = 1 << 5;
+        /// The mesh's shadow is cached in the static layer of cached spot
+        /// lights (it has a `StaticShadowCaster`). Only tracked for meshes
+        /// that are culled on the GPU, whose lights find them here.
+        const STATIC_SHADOW_CASTER    = 1 << 6;
     }
 }
 
@@ -1144,8 +1148,9 @@ impl RenderMeshInstanceSharedFlat {
         not_shadow_caster: bool,
         no_automatic_batching: bool,
         no_cpu_culling: bool,
+        static_shadow_caster: bool,
     ) -> Self {
-        Self::new(
+        let mut shared = Self::new(
             previous_transform,
             mesh,
             tag,
@@ -1153,7 +1158,12 @@ impl RenderMeshInstanceSharedFlat {
             not_shadow_caster,
             no_automatic_batching,
             no_cpu_culling,
-        )
+        );
+        shared.flags.set(
+            RenderMeshInstanceFlags::STATIC_SHADOW_CASTER,
+            static_shadow_caster,
+        );
+        shared
     }
 
     /// The cpu builder does not have an equivalent [`RenderMeshInstanceGpuBuilder`].
@@ -1752,8 +1762,14 @@ pub struct RenderGpuCulledEntities {
     pub removed: Vec<MainEntity>,
 
     /// A list of all entities with GPU culling that changed the set of render
-    /// layers they belong to this frame.
+    /// layers they belong to this frame, or whether they're static shadow
+    /// casters.
     pub changed_layers: Vec<MainEntity>,
+
+    /// The potentially-visible entities that are static shadow casters
+    /// (`StaticShadowCaster`): the static views of cached spot lights draw
+    /// only them, their movers views only the others.
+    pub static_shadow_casters: MainEntityHashSet,
 }
 
 impl RenderGpuCulledEntities {
@@ -1782,11 +1798,17 @@ impl RenderGpuCulledEntities {
         new_entity: MainEntity,
         render_layers: RenderLayers,
         no_cpu_culling: bool,
+        static_shadow_caster: bool,
     ) {
         match self.entities.entry(new_entity) {
             Entry::Occupied(mut occupied_entry) => {
                 if no_cpu_culling {
-                    if *occupied_entry.get() != render_layers {
+                    // MPS: a change of mobility moves the entity between the
+                    // static and movers views of cached spot lights, as a
+                    // change of layers does between views.
+                    let was_static = self.static_shadow_casters.contains(&new_entity);
+                    if *occupied_entry.get() != render_layers || was_static != static_shadow_caster
+                    {
                         self.changed_layers.push(new_entity);
                     }
 
@@ -1803,12 +1825,18 @@ impl RenderGpuCulledEntities {
                 }
             }
         }
+        if no_cpu_culling && static_shadow_caster {
+            self.static_shadow_casters.insert(new_entity);
+        } else {
+            self.static_shadow_casters.remove(&new_entity);
+        }
     }
 
     /// Records that an entity became newly-invisible this frame.
     pub fn remove(&mut self, old_entity: MainEntity) {
         self.removed.push(old_entity);
         self.entities.remove(&old_entity);
+        self.static_shadow_casters.remove(&old_entity);
     }
 }
 
@@ -1946,6 +1974,7 @@ type GpuMeshExtractionQuery = (
         Has<NotShadowCaster>,
         Has<NoAutomaticBatching>,
         Has<NoCpuCulling>,
+        Has<StaticShadowCaster>,
     ),
     Option<Read<VisibilityRange>>,
     Option<Read<RenderLayers>>,
@@ -1981,6 +2010,7 @@ pub fn extract_meshes_for_gpu_building(
                     Changed<NotShadowCaster>,
                     Changed<NoAutomaticBatching>,
                     Changed<NoCpuCulling>,
+                    Changed<StaticShadowCaster>,
                 )>,
                 Changed<VisibilityRange>,
                 Changed<SkinnedMesh>,
@@ -2002,6 +2032,7 @@ pub fn extract_meshes_for_gpu_building(
         mut removed_visibility_range_query,
         mut removed_skinned_mesh_query,
         mut removed_render_layers_query,
+        mut removed_static_shadow_caster_query,
     ): (
         Extract<RemovedComponents<PreviousGlobalTransform>>,
         Extract<RemovedComponents<Lightmap>>,
@@ -2016,6 +2047,7 @@ pub fn extract_meshes_for_gpu_building(
         Extract<RemovedComponents<VisibilityRange>>,
         Extract<RemovedComponents<SkinnedMesh>>,
         Extract<RemovedComponents<RenderLayers>>,
+        Extract<RemovedComponents<StaticShadowCaster>>,
     ),
     all_meshes_query: Extract<Query<GpuMeshExtractionQuery>>,
     mut removed_meshes_query: Extract<RemovedComponents<Mesh3d>>,
@@ -2056,7 +2088,8 @@ pub fn extract_meshes_for_gpu_building(
             .chain(removed_no_cpu_culling_query.read())
             .chain(removed_visibility_range_query.read())
             .chain(removed_skinned_mesh_query.read())
-            .chain(removed_render_layers_query.read()),
+            .chain(removed_render_layers_query.read())
+            .chain(removed_static_shadow_caster_query.read()),
     );
 
     // We have to skip the meshes in the potential reextraction set if we
@@ -2163,6 +2196,7 @@ fn extract_mesh_for_gpu_building(
             not_shadow_caster,
             no_automatic_batching,
             no_cpu_culling,
+            static_shadow_caster,
         ),
         visibility_range,
         render_layers,
@@ -2202,6 +2236,7 @@ fn extract_mesh_for_gpu_building(
         not_shadow_caster,
         no_automatic_batching,
         no_cpu_culling,
+        static_shadow_caster,
     );
 
     // Calculate the lightmap UV rect, if applicable.
@@ -2305,6 +2340,7 @@ pub fn collect_gpu_culled_meshes(
         let just_added_render_visible_entities = render_visible_entities.is_added();
         collect_gpu_culled_meshes_for_subview(
             maybe_render_layers.unwrap_or(&default_render_layers),
+            ShadowViewRole::Full,
             &mut render_visible_entities,
             just_added_render_visible_entities,
             &render_gpu_culled_entities,
@@ -2316,11 +2352,12 @@ pub fn collect_gpu_culled_meshes(
         let last_run = render_shadow_map_visible_entities.last_run();
         let this_run = render_shadow_map_visible_entities.this_run();
 
-        for (render_visible_entities_added_tick, render_visible_entities) in
-            render_shadow_map_visible_entities.subviews.values_mut()
+        for (subview, (render_visible_entities_added_tick, render_visible_entities)) in
+            render_shadow_map_visible_entities.subviews.iter_mut()
         {
             collect_gpu_culled_meshes_for_subview(
                 maybe_render_layers.unwrap_or(&default_render_layers),
+                ShadowViewRole::of_subview_index(subview.subview_index),
                 render_visible_entities,
                 render_visible_entities_added_tick.is_newer_than(last_run, this_run),
                 &render_gpu_culled_entities,
@@ -2337,12 +2374,23 @@ pub fn collect_gpu_culled_meshes(
 /// `collect_visible_cpu_culled_entities_for_subview`.
 fn collect_gpu_culled_meshes_for_subview(
     view_render_layers: &RenderLayers,
+    role: ShadowViewRole,
     render_visible_entities: &mut RenderVisibleEntities,
     just_added_render_visible_entities: bool,
     render_mesh_instance_gpu_queues: &RenderGpuCulledEntities,
 ) {
-    let is_entity_relevant =
-        |render_layers: &RenderLayers| -> bool { view_render_layers.intersects(render_layers) };
+    // MPS: the static and movers views of a cached spot light take only the
+    // static or only the movable shadow casters.
+    let takes_mobility = |main_entity: &MainEntity| -> bool {
+        role.takes(
+            render_mesh_instance_gpu_queues
+                .static_shadow_casters
+                .contains(main_entity),
+        )
+    };
+    let is_entity_relevant = |main_entity: &MainEntity, render_layers: &RenderLayers| -> bool {
+        view_render_layers.intersects(render_layers) && takes_mobility(main_entity)
+    };
 
     // Only 3D meshes can be culled on GPU at the moment.
     let render_view_visible_mesh_entities = render_visible_entities
@@ -2355,7 +2403,7 @@ fn collect_gpu_culled_meshes_for_subview(
     if just_added_render_visible_entities {
         // We assume `RenderVisibleEntities` is completely fresh so there will only be new entities
         for (main_entity, render_layers) in render_mesh_instance_gpu_queues.entities.iter() {
-            if is_entity_relevant(render_layers) {
+            if is_entity_relevant(main_entity, render_layers) {
                 // Update the tables. 3D meshes have no render entity, so it's
                 // appropriate to use `Entity::PLACEHOLDER` here.
                 render_view_visible_mesh_entities
@@ -2387,7 +2435,9 @@ fn collect_gpu_culled_meshes_for_subview(
         for main_entity in &render_mesh_instance_gpu_queues.added {
             // Make sure the entity belongs to our set of render layers.
             let maybe_render_layers = render_mesh_instance_gpu_queues.entities.get(main_entity);
-            if maybe_render_layers.is_none_or(is_entity_relevant) {
+            if maybe_render_layers.map_or(takes_mobility(main_entity), |render_layers| {
+                is_entity_relevant(main_entity, render_layers)
+            }) {
                 // Update the tables. 3D meshes have no render entity, so it's
                 // appropriate to use `Entity::PLACEHOLDER` here.
                 render_view_visible_mesh_entities
@@ -2411,7 +2461,7 @@ fn collect_gpu_culled_meshes_for_subview(
             let entity_was_relevant = render_view_visible_mesh_entities
                 .entities_gpu_culling
                 .contains_key(main_entity);
-            let entity_is_relevant = is_entity_relevant(render_layers);
+            let entity_is_relevant = is_entity_relevant(main_entity, render_layers);
             match (entity_was_relevant, entity_is_relevant) {
                 (false, false) | (true, true) => {
                     // No change; do nothing.
@@ -2656,15 +2706,17 @@ pub fn collect_meshes_for_gpu_building(
                                     continue;
                                 };
 
+                                // MPS: and a change of mobility, which moves the
+                                // entity between shadow views.
+                                let culling_flags = RenderMeshInstanceFlags::NO_CPU_CULLING
+                                    | RenderMeshInstanceFlags::STATIC_SHADOW_CASTER;
                                 if prepared.render_layers != render_mesh_instance.render_layers
-                                    || prepared
-                                        .shared
-                                        .flags
-                                        .contains(RenderMeshInstanceFlags::NO_CPU_CULLING)
+                                    || prepared.shared.flags.intersection(culling_flags).bits()
                                         != render_mesh_instance
                                             .shared
                                             .flags()
-                                            .contains(RenderMeshInstanceFlags::NO_CPU_CULLING)
+                                            .intersection(culling_flags)
+                                            .bits()
                                 {
                                     // We must take the slow path because the
                                     // instance either changed render layers or
@@ -2733,20 +2785,27 @@ pub fn collect_meshes_for_gpu_building(
         }
         // If the instance is already visible, just update the layers.
         // Otherwise, mark it as newly-added.
-        let (render_layers, no_cpu_culling) = match render_mesh_instances.get(&entity) {
-            None => (RenderLayers::default(), false),
-            Some(render_mesh_instance) => (
-                render_mesh_instance
-                    .render_layers
-                    .clone()
-                    .unwrap_or_default(),
-                render_mesh_instance
-                    .shared
-                    .flags()
-                    .contains(RenderMeshInstanceFlags::NO_CPU_CULLING),
-            ),
-        };
-        render_gpu_culled_entities.update(entity, render_layers, no_cpu_culling);
+        let (render_layers, no_cpu_culling, static_shadow_caster) =
+            match render_mesh_instances.get(&entity) {
+                None => (RenderLayers::default(), false, false),
+                Some(render_mesh_instance) => {
+                    let flags = render_mesh_instance.shared.flags();
+                    (
+                        render_mesh_instance
+                            .render_layers
+                            .clone()
+                            .unwrap_or_default(),
+                        flags.contains(RenderMeshInstanceFlags::NO_CPU_CULLING),
+                        flags.contains(RenderMeshInstanceFlags::STATIC_SHADOW_CASTER),
+                    )
+                }
+            };
+        render_gpu_culled_entities.update(
+            entity,
+            render_layers,
+            no_cpu_culling,
+            static_shadow_caster,
+        );
     }
     while let Ok(batch) = removed_rx.recv() {
         let entity = batch;

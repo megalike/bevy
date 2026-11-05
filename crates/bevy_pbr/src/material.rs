@@ -1,7 +1,7 @@
 use crate::*;
 use alloc::sync::Arc;
 use bevy_asset::prelude::AssetChanged;
-use bevy_asset::{Asset, AssetEventSystems, AssetId, AssetServer, UntypedAssetId};
+use bevy_asset::{Asset, AssetEvent, AssetEventSystems, AssetId, AssetServer, UntypedAssetId};
 use bevy_camera::visibility::ViewVisibility;
 use bevy_core_pipeline::core_3d::TransparentSortingInfo3d;
 use bevy_core_pipeline::deferred::{AlphaMask3dDeferred, Opaque3dDeferred};
@@ -20,6 +20,9 @@ use bevy_ecs::{
         lifetimeless::{SRes, SResMut},
         SystemParamItem, SystemState,
     },
+};
+use bevy_light::{
+    LiveShadowMaterials, ShadowCacheSettings, ShadowCasterState, SimulationLightSystems,
 };
 use bevy_material::{
     key::{ErasedMaterialKey, ErasedMaterialPipelineKey, ErasedMeshPipelineKey},
@@ -201,6 +204,17 @@ pub trait Material: Asset + AsBindGroup + Clone + Sized {
         true
     }
 
+    /// MPS: whether a spot light may keep this material's shadow in its
+    /// static layer once the mesh settles (`bevy_light`'s
+    /// `classify_shadow_casters`). Return [`ShadowCaching::Live`] if the
+    /// shadow's depth or coverage can change without a component or asset
+    /// changing: vertex animation, `globals.time`, GPU-written instances or
+    /// vertices, storage-buffer deformation, animated discard.
+    #[inline]
+    fn shadow_caching() -> ShadowCaching {
+        ShadowCaching::Cacheable
+    }
+
     /// Controls whether order independent transparency is enabled for the Material.
     /// This is ignored if the camera does not have [`bevy_core_pipeline::oit::OrderIndependentTransparencySettings`]
     /// or if [`Self::alpha_mode`] is not supported by OIT.
@@ -286,6 +300,43 @@ pub trait Material: Asset + AsBindGroup + Clone + Sized {
         key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
         Ok(())
+    }
+}
+
+/// MPS: how a material's shadow takes part in the spot light shadow cache
+/// ([`Material::shadow_caching`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShadowCaching {
+    /// The shadow changes only when the mesh's components or its mesh and
+    /// material assets change: it is cached once the mesh settles.
+    Cacheable,
+    /// The shadow changes by itself: the mesh is drawn every frame, never
+    /// cached.
+    Live {
+        /// How far, in world units, the material can move a vertex out of
+        /// the mesh's bounds; 0 if the bounds already hold every displaced
+        /// vertex. The mesh's footprint in a cached light's shadow map (the
+        /// tiles restored under it) is its bounds grown by this much; one
+        /// too small leaves trails.
+        max_displacement: f32,
+    },
+}
+
+impl ShadowCaching {
+    /// Both declarations at once (an extended material's base and extension):
+    /// live if either is, the displacements added, since one can move a
+    /// vertex the other already moved.
+    pub fn and(self, other: ShadowCaching) -> ShadowCaching {
+        let displacement = |caching| match caching {
+            ShadowCaching::Cacheable => None,
+            ShadowCaching::Live { max_displacement } => Some(max_displacement),
+        };
+        match (displacement(self), displacement(other)) {
+            (None, None) => ShadowCaching::Cacheable,
+            (a, b) => ShadowCaching::Live {
+                max_displacement: a.unwrap_or(0.0) + b.unwrap_or(0.0),
+            },
+        }
     }
 }
 
@@ -455,7 +506,24 @@ where
                     check_entities_needing_specialization::<M>.after(AssetEventSystems),
                 )
                     .after(mark_3d_meshes_as_changed_if_their_assets_changed),
+            )
+            .add_systems(
+                PostUpdate,
+                note_shadow_caster_materials::<M>
+                    .after(AssetEventSystems)
+                    .before(SimulationLightSystems::CheckLightVisibility),
             );
+        // MPS: a mesh with a material whose shadow changes by itself is
+        // always live in the spot light shadow cache.
+        if let ShadowCaching::Live { max_displacement } = M::shadow_caching() {
+            let component = app.world_mut().register_component::<MeshMaterial3d<M>>();
+            app.world_mut()
+                .get_resource_or_init::<LiveShadowMaterials>()
+                .0
+                .push((component, max_displacement));
+            app.add_observer(sync_live_shadow_material_on_insert::<M>)
+                .add_observer(sync_live_shadow_material_on_remove::<M>);
+        }
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             let shaders = initialize_material_shaders::<M>(render_app.world());
@@ -477,6 +545,68 @@ where
                 );
         }
     }
+}
+
+/// MPS: notes a shadow caster's material for the spot light shadow cache: a
+/// material handle that changes or goes, or a material asset that changes,
+/// makes the caster live (`ShadowCasterState`), compared by value.
+fn note_shadow_caster_materials<M: Material>(
+    settings: Option<Res<ShadowCacheSettings>>,
+    mut casters: ParamSet<(
+        Query<(&MeshMaterial3d<M>, &mut ShadowCasterState), Changed<MeshMaterial3d<M>>>,
+        Query<(&MeshMaterial3d<M>, &mut ShadowCasterState)>,
+    )>,
+    mut without_material: Query<&mut ShadowCasterState, Without<MeshMaterial3d<M>>>,
+    mut removed: RemovedComponents<MeshMaterial3d<M>>,
+    mut asset_events: MessageReader<AssetEvent<M>>,
+    mut modified: Local<HashSet<AssetId<M>>>,
+) {
+    // A material changed in place, or replaced under the same id (removed and
+    // inserted again: `Added` on an id in use).
+    modified.clear();
+    modified.extend(asset_events.read().filter_map(|event| match event {
+        AssetEvent::Modified { id } | AssetEvent::Added { id } => Some(*id),
+        _ => None,
+    }));
+    if !settings.is_some_and(|settings| settings.enabled) {
+        removed.clear();
+        return;
+    }
+    for entity in removed.read() {
+        if let Ok(mut state) = without_material.get_mut(entity) {
+            state.note_material_modified();
+        }
+    }
+    // Only the handles written since the last frame, and every caster of a
+    // modified material.
+    for (material, mut state) in &mut casters.p0() {
+        if state.material() != Some(material.id().untyped()) {
+            state.note_material(material.id().untyped());
+        }
+    }
+    if !modified.is_empty() {
+        for (material, mut state) in &mut casters.p1() {
+            if modified.contains(&material.id()) {
+                state.note_material_modified();
+            }
+        }
+    }
+}
+
+fn sync_live_shadow_material_on_insert<M: Material>(
+    insert: On<Insert<MeshMaterial3d<M>>>,
+    mut commands: Commands,
+) {
+    let entity = insert.entity;
+    commands.queue(move |world: &mut World| LiveShadowMaterials::sync(world, entity));
+}
+
+fn sync_live_shadow_material_on_remove<M: Material>(
+    remove: On<Remove<MeshMaterial3d<M>>>,
+    mut commands: Commands,
+) {
+    let entity = remove.entity;
+    commands.queue(move |world: &mut World| LiveShadowMaterials::sync(world, entity));
 }
 
 fn add_material_bind_group_allocator<M: Material>(

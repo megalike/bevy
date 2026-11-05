@@ -9,18 +9,27 @@ use bevy_asset::{AssetApp, AssetEventSystems};
 use bevy_camera::{
     primitives::{Aabb, CascadesFrusta, CubemapFrusta, Frustum, Sphere},
     visibility::{
-        CascadesVisibleEntities, CubemapVisibleEntities, InheritedVisibility, NoCpuCulling,
-        NoFrustumCulling, RenderLayers, ViewVisibility, VisibilityRange, VisibilitySystems,
-        VisibleEntities, VisibleEntityRanges, VisibleMeshEntities,
+        CascadesVisibleEntities, CubemapVisibleEntities, DynamicSkinnedMeshBounds,
+        InheritedVisibility, NoCpuCulling, NoFrustumCulling, RenderLayers, ViewVisibility,
+        VisibilityRange, VisibilitySystems, VisibleEntities, VisibleEntityRanges,
+        VisibleMeshEntities,
     },
     Camera, Camera3d, CameraUpdateSystems, RenderTarget, ShadowLodOrigin,
 };
-use bevy_ecs::{entity::EntityHashSet, prelude::*, system::QueryLens};
+use bevy_ecs::{
+    entity::{EntityHashMap, EntityHashSet},
+    prelude::*,
+    system::QueryLens,
+};
 #[cfg(feature = "bevy_gizmos")]
 use bevy_gizmos::frustum::FrustumGizmoSystems;
 use bevy_log::warn_once;
 use bevy_math::Vec3A;
-use bevy_mesh::Mesh3d;
+use bevy_mesh::{
+    morph::{MeshMorphWeights, MorphWeights},
+    skinning::SkinnedMesh,
+    Mesh3d,
+};
 use bevy_reflect::prelude::*;
 use bevy_transform::{components::GlobalTransform, TransformSystems};
 use bevy_utils::Parallel;
@@ -64,6 +73,16 @@ pub use directional_light::{
 };
 mod rect_light;
 pub use rect_light::RectLight;
+mod shadow_cache;
+pub use shadow_cache::{
+    classify_shadow_casters, invalidate_spot_shadow_caches, InvalidateShadowCache,
+    LiveShadowMaterial, LiveShadowMaterials, ShadowCacheCounters, ShadowCacheExempt,
+    ShadowCacheFaults, ShadowCacheFeedback, ShadowCacheLightStatus, ShadowCacheLoading,
+    ShadowCacheSettings, ShadowCacheState, ShadowCasterChange, ShadowCasterLive, ShadowCasterState,
+    ShadowFootprint, ShadowTileMask, SpotLightShadowCache, StaticShadowCaster,
+};
+use shadow_cache::{MoversGrid, SpotShadowProjection};
+
 /// Provides gizmo drawing for visualizing light positions.
 #[cfg(feature = "bevy_gizmos")]
 pub mod gizmos;
@@ -168,8 +187,12 @@ impl Plugin for LightPlugin {
         app.init_resource::<GlobalAmbientLight>()
             .init_resource::<DirectionalLightShadowMap>()
             .init_resource::<PointLightShadowMap>()
+            .init_resource::<ShadowCacheSettings>()
+            .init_resource::<ShadowCacheFeedback>()
+            .add_message::<InvalidateShadowCache>()
             .init_asset::<ScatteringMedium>()
             .register_required_components::<Camera3d, Clusters>()
+            .register_required_components::<SpotLight, SpotLightShadowCache>()
             .configure_sets(
                 PostUpdate,
                 SimulationLightSystems::CheckLightVisibility
@@ -217,7 +240,15 @@ impl Plugin for LightPlugin {
                         .after(SimulationLightSystems::AssignLightsToClusters),
                     (
                         check_dir_light_mesh_visibility,
-                        check_point_light_mesh_visibility,
+                        // MPS: the casters' settled state, then the cached
+                        // lights it redraws, then the lights' lists, all in
+                        // one frame (the markers' commands are applied
+                        // between them).
+                        classify_shadow_casters
+                            .after(AssetEventSystems)
+                            .before(invalidate_spot_shadow_caches),
+                        check_point_light_mesh_visibility.after(invalidate_spot_shadow_caches),
+                        invalidate_spot_shadow_caches,
                     )
                         .in_set(SimulationLightSystems::CheckLightVisibility)
                         .after(VisibilitySystems::CalculateBounds)
@@ -245,6 +276,8 @@ impl Plugin for LightPlugin {
                 ),
             );
 
+        shadow_cache::add_shadow_caster_tracking(app);
+
         #[cfg(feature = "bevy_gizmos")]
         app.add_plugins(gizmos::LightGizmoPlugin);
     }
@@ -263,38 +296,6 @@ pub type WithLight = Or<(
 #[derive(Debug, Component, Reflect, Default, Clone, PartialEq)]
 #[reflect(Component, Default, Debug, Clone, PartialEq)]
 pub struct NotShadowCaster;
-
-/// Add this component to a [`PointLight`] or [`SpotLight`] to keep its shadow
-/// maps as they are instead of redrawing them every frame.
-///
-/// While a light has this component, Bevy spends almost no per-frame work on
-/// its shadow maps: it doesn't check which meshes its shadow views see (it only
-/// keeps the meshes it saw visible), doesn't keep shadow views for it, doesn't
-/// queue, batch or GPU-preprocess meshes for them and doesn't run their shadow
-/// passes. Lighting keeps sampling the maps
-/// drawn last, and the light keeps its shadow map layer. The meshes that the
-/// light saw when its maps were last drawn stay visible.
-///
-/// Add it only when the light's shadow maps are drawn and still valid: neither
-/// the light nor any shadow caster it sees moved, appeared, disappeared or
-/// changed its mesh or material since they were drawn, and every caster was
-/// ready (its mesh, material and pipeline) when they were drawn. Remove it to
-/// redraw the maps; they are queued and drawn again from scratch in the same
-/// frame.
-///
-/// Bevy redraws a light's maps anyway, from the meshes the light saw when its
-/// maps were last drawn, when their layer or the shadow map texture changes:
-/// for example when a shadowed light is added, removed or leaves the view, or
-/// when the shadow map size changes. It draws them for three frames in the new
-/// place before it keeps them again, without knowing whether every caster's
-/// pipeline was ready: an application that can tell should remove the marker
-/// on such changes too.
-///
-/// This component has no effect on a [`DirectionalLight`], whose cascades
-/// follow the camera.
-#[derive(Debug, Component, Reflect, Default, Clone, PartialEq)]
-#[reflect(Component, Default, Debug, Clone, PartialEq)]
-pub struct KeepShadowMaps;
 
 /// Add this component to make a [`Mesh3d`] not receive shadows.
 ///
@@ -548,15 +549,27 @@ pub fn check_dir_light_mesh_visibility(
 ///
 /// This only processes entities without [`NoCpuCulling`]. Entities with
 /// [`NoCpuCulling`] receive no view-specific processing in the main world.
+///
+/// A cached spot light (see [`SpotLightShadowCache::is_cached`]) lists only its
+/// live casters in its [`VisibleMeshEntities`], every frame, with the tiles of
+/// its shadow map their [`ShadowFootprint`]s touch ([`ShadowTileMask`]). Its
+/// settled casters ([`StaticShadowCaster`]) go to its [`SpotLightShadowCache`],
+/// and are visited only when the render world may draw them: when they or the
+/// light changed, until the render world acknowledged a shadow map drawn from
+/// them, and every frame while the light has no static layer.
 pub fn check_point_light_mesh_visibility(
-    visible_point_lights: Query<&VisibleEntities>,
+    visible_point_lights: Query<(
+        &VisibleEntities,
+        Option<&Frustum>,
+        Option<&Camera>,
+        Has<Clusters>,
+    )>,
     mut point_lights: Query<(
         &PointLight,
         &GlobalTransform,
         &CubemapFrusta,
         &mut CubemapVisibleEntities,
         Option<&RenderLayers>,
-        Has<KeepShadowMaps>,
     )>,
     mut spot_lights: Query<(
         &SpotLight,
@@ -564,18 +577,55 @@ pub fn check_point_light_mesh_visibility(
         &Frustum,
         &mut VisibleMeshEntities,
         Option<&RenderLayers>,
-        Has<KeepShadowMaps>,
+        Option<Mut<SpotLightShadowCache>>,
+        Has<ShadowCacheExempt>,
     )>,
-    mut visible_entity_query: PointLightShadowCasterQuery,
+    mut movable_casters: PointLightShadowCasterQuery<Without<StaticShadowCaster>>,
+    mut static_casters: PointLightShadowCasterQuery<With<StaticShadowCaster>>,
     mut camera_query: Query<(Entity, &RenderTarget), With<Camera>>,
     mut shadow_lod_origin_query: Query<Entity, With<ShadowLodOrigin>>,
     mut point_and_spot_light_query: Query<Entity, Or<(With<PointLight>, With<SpotLight>)>>,
     visible_entity_ranges: Option<Res<VisibleEntityRanges>>,
+    (directional_light_shadow_map, shadow_cache_feedback, shadow_cache_settings, time, faults): (
+        Res<DirectionalLightShadowMap>,
+        Res<ShadowCacheFeedback>,
+        Res<ShadowCacheSettings>,
+        Option<Res<bevy_time::Time>>,
+        Option<Res<ShadowCacheFaults>>,
+    ),
     mut cubemap_visible_entities_queue: Local<Parallel<[Vec<Entity>; 6]>>,
     mut spot_visible_entities_queue: Local<Parallel<Vec<Entity>>>,
-    mut checked_lights: Local<EntityHashSet>,
+    (mut movers_grid, mut mover_candidates, mut movers_queue, mover_bounds): (
+        Local<MoversGrid>,
+        Local<Vec<Entity>>,
+        Local<Parallel<(Vec<Entity>, ShadowTileMask, bool)>>,
+        MoverBoundsQuery,
+    ),
+    (mut checked_lights, mut frame, mut grid_found_sparse): (
+        Local<EntityHashSet>,
+        Local<u32>,
+        Local<bool>,
+    ),
+    (mut light_views, mut list_scratch, mut static_prints): (
+        Local<LightViews>,
+        Local<Vec<Entity>>,
+        Local<Parallel<StaticCastersPrint>>,
+    ),
 ) {
     checked_lights.clear();
+    *frame = frame.wrapping_add(1);
+    let frame = *frame;
+    let now = time.map_or(core::time::Duration::ZERO, |time| time.elapsed());
+    let stale_ack = faults.is_some_and(|faults| faults.stale_ack);
+    // The movers grid, built at the first cached spot light of a frame that
+    // uses it: while a light had few movers near it when it was last built,
+    // and every 32 frames to see whether one has.
+    let use_grid = *grid_found_sparse || frame.is_multiple_of(32);
+    let mut movers_grid_built = false;
+    let mut found_sparse = false;
+    // A cached light walks a few hundred movers serially: below that, the
+    // tasks of a parallel walk cost more than the walk.
+    let few_movers = movable_casters.iter().len() < 256;
 
     let shadow_lod_origin = get_shadow_lod_origin(
         camera_query.transmute_lens_filtered(),
@@ -583,8 +633,15 @@ pub fn check_point_light_mesh_visibility(
         point_and_spot_light_query.transmute_lens_filtered(),
     );
 
+    // MPS: the render world's reports on cached spot lights, as of the frames
+    // it finished.
+    let shadow_cache_status = shadow_cache_feedback.snapshot();
+
     let visible_entity_ranges = visible_entity_ranges.as_deref();
-    for visible_lights in &visible_point_lights {
+    // MPS: the active clustered cameras each light is visible to (by their
+    // frusta), once per frame: whether a cached light lights a view.
+    light_views.build(&visible_point_lights);
+    for (visible_lights, ..) in &visible_point_lights {
         for &light_entity in visible_lights.get(TypeId::of::<ClusterVisibilityClass>()) {
             if !checked_lights.insert(light_entity) {
                 continue;
@@ -597,18 +654,10 @@ pub fn check_point_light_mesh_visibility(
                 cubemap_frusta,
                 mut cubemap_visible_entities,
                 maybe_view_mask,
-                keep_shadow_maps,
             )) = point_lights.get_mut(light_entity)
             {
                 // NOTE: If shadow mapping is disabled for the light then it must have no visible entities
                 if !point_light.shadow_maps_enabled {
-                    continue;
-                }
-
-                if keep_shadow_maps {
-                    for visible_entities in cubemap_visible_entities.iter() {
-                        keep_shadow_casters_visible(visible_entities, &mut visible_entity_query);
-                    }
                     continue;
                 }
 
@@ -618,19 +667,20 @@ pub fn check_point_light_mesh_visibility(
                     radius: point_light.range,
                 };
 
-                visible_entity_query.par_iter_mut().for_each_init(
-                    || cubemap_visible_entities_queue.borrow_local_mut(),
-                    |cubemap_visible_entities_local_queue,
-                     (
-                        entity,
-                        inherited_visibility,
-                        mut view_visibility,
-                        maybe_entity_mask,
-                        maybe_aabb,
-                        maybe_transform,
-                        has_visibility_range,
-                        has_no_frustum_culling,
-                    )| {
+                let check_caster =
+                    |cubemap_visible_entities_local_queue: &mut [Vec<Entity>; 6],
+                     item: PointLightShadowCasterItem| {
+                        let (
+                            entity,
+                            inherited_visibility,
+                            mut view_visibility,
+                            maybe_entity_mask,
+                            maybe_aabb,
+                            maybe_transform,
+                            has_visibility_range,
+                            has_no_frustum_culling,
+                            _,
+                        ) = item;
                         if !inherited_visibility.get() {
                             return;
                         }
@@ -654,7 +704,7 @@ pub fn check_point_light_mesh_visibility(
                             let model_to_world = transform.affine();
                             // Do a cheap sphere vs obb test to prune out most meshes outside the sphere of the light
                             if !has_no_frustum_culling
-                                && !light_sphere.intersects_obb(aabb, &model_to_world)
+                                && !light_sphere.intersects_obb(&aabb, &model_to_world)
                             {
                                 return;
                             }
@@ -664,7 +714,7 @@ pub fn check_point_light_mesh_visibility(
                                 .zip(cubemap_visible_entities_local_queue.iter_mut())
                             {
                                 if has_no_frustum_culling
-                                    || frustum.intersects_obb(aabb, &model_to_world, true, true)
+                                    || frustum.intersects_obb(&aabb, &model_to_world, true, true)
                                 {
                                     view_visibility.set_visible();
                                     visible_entities.push(entity);
@@ -677,7 +727,16 @@ pub fn check_point_light_mesh_visibility(
                                 visible_entities.push(entity);
                             }
                         }
-                    },
+                    };
+                // MPS: static and movable casters are separate queries; point
+                // lights draw both.
+                movable_casters.par_iter_mut().for_each_init(
+                    || cubemap_visible_entities_queue.borrow_local_mut(),
+                    |queue, item| check_caster(queue, item),
+                );
+                static_casters.par_iter_mut().for_each_init(
+                    || cubemap_visible_entities_queue.borrow_local_mut(),
+                    |queue, item| check_caster(queue, item),
                 );
 
                 // Collect the entities from each parallel queue.
@@ -696,99 +755,488 @@ pub fn check_point_light_mesh_visibility(
 
             // Spot lights
             if let Ok((
-                point_light,
+                spot_light,
                 transform,
                 frustum,
                 mut visible_entities,
                 maybe_view_mask,
-                keep_shadow_maps,
+                mut shadow_cache,
+                exempt,
             )) = spot_lights.get_mut(light_entity)
             {
-                // NOTE: If shadow mapping is disabled for the light then it must have no visible entities
-                if !point_light.shadow_maps_enabled {
-                    continue;
-                }
-
-                if keep_shadow_maps {
-                    keep_shadow_casters_visible(&visible_entities, &mut visible_entity_query);
-                    continue;
-                }
-
                 let view_mask = maybe_view_mask.unwrap_or_default();
+                // MPS: whether the light is cached: the cache on, shadows on,
+                // and what projects its shadow map settled. A light that
+                // changed is drawn whole every frame until it settles.
+                let projection = SpotShadowProjection::new(
+                    transform,
+                    spot_light,
+                    view_mask,
+                    directional_light_shadow_map.size,
+                );
+                let cached = shadow_cache.as_mut().is_some_and(|cache| {
+                    let settled = cache.bypass_change_detection().settle_light(
+                        &projection,
+                        frame,
+                        now,
+                        shadow_cache_settings.settle_time,
+                    );
+                    shadow_cache_settings.enabled
+                        && spot_light.shadow_maps_enabled
+                        && !exempt
+                        && settled
+                });
+                if let Some(cache) = shadow_cache.as_mut()
+                    && cache.cached != cached
+                {
+                    cache.cached = cached;
+                    cache.live_casters = 0;
+                    if !cached {
+                        // Drawn again from scratch once it is cached again.
+                        cache.projection = None;
+                    }
+                }
+
+                // NOTE: If shadow mapping is disabled for the light then it must have no visible entities
+                if !spot_light.shadow_maps_enabled {
+                    continue;
+                }
+
                 let light_sphere = Sphere {
                     center: Vec3A::from(transform.translation()),
-                    radius: point_light.range,
+                    radius: spot_light.range,
                 };
 
-                visible_entity_query.par_iter_mut().for_each_init(
-                    || spot_visible_entities_queue.borrow_local_mut(),
-                    |spot_visible_entities_local_queue,
-                     (
+                // Whether a caster is in the light's frustum (or has no
+                // bounds); marks it visible if so.
+                let caster_is_visible = |item: &mut PointLightShadowCasterItem| -> bool {
+                    let (
                         entity,
                         inherited_visibility,
-                        mut view_visibility,
+                        view_visibility,
                         maybe_entity_mask,
                         maybe_aabb,
                         maybe_transform,
                         has_visibility_range,
                         has_no_frustum_culling,
-                    )| {
-                        if !inherited_visibility.get() {
-                            return;
-                        }
+                        (.., live_material),
+                    ) = item;
+                    if !inherited_visibility.get() {
+                        return false;
+                    }
 
-                        let entity_mask = maybe_entity_mask.unwrap_or_default();
-                        if !view_mask.intersects(entity_mask) {
-                            return;
-                        }
-                        // Check visibility ranges.
-                        if has_visibility_range
-                            && visible_entity_ranges.is_some_and(|visible_entity_ranges| {
-                                shadow_lod_origin.is_none_or(|shadow_lod_origin| {
-                                    !visible_entity_ranges
-                                        .entity_is_in_range_of_view(entity, shadow_lod_origin)
-                                })
+                    let entity_mask = maybe_entity_mask.unwrap_or_default();
+                    if !view_mask.intersects(entity_mask) {
+                        return false;
+                    }
+                    // Check visibility ranges.
+                    if *has_visibility_range
+                        && visible_entity_ranges.is_some_and(|visible_entity_ranges| {
+                            shadow_lod_origin.is_none_or(|shadow_lod_origin| {
+                                !visible_entity_ranges
+                                    .entity_is_in_range_of_view(*entity, shadow_lod_origin)
                             })
+                        })
+                    {
+                        return false;
+                    }
+
+                    // MPS: the bounds grown by what a live material can
+                    // displace; a caster whose grown bounds aren't known is
+                    // visible as one without bounds.
+                    let padded = match (maybe_aabb, maybe_transform) {
+                        (Some(aabb), Some(transform)) => {
+                            padded_aabb(aabb, &transform.affine(), *live_material)
+                                .map(|aabb| (aabb, transform.affine()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((aabb, model_to_world)) = &padded {
+                        // Do a cheap sphere vs obb test to prune out most meshes outside the sphere of the light
+                        if !*has_no_frustum_culling
+                            && !light_sphere.intersects_obb(aabb, model_to_world)
                         {
-                            return;
+                            return false;
                         }
 
-                        if let (Some(aabb), Some(transform)) = (maybe_aabb, maybe_transform) {
-                            let model_to_world = transform.affine();
-                            // Do a cheap sphere vs obb test to prune out most meshes outside the sphere of the light
-                            if !has_no_frustum_culling
-                                && !light_sphere.intersects_obb(aabb, &model_to_world)
-                            {
-                                return;
-                            }
-
-                            if has_no_frustum_culling
-                                || frustum.intersects_obb(aabb, &model_to_world, true, true)
-                            {
-                                view_visibility.set_visible();
-                                spot_visible_entities_local_queue.push(entity);
-                            }
-                        } else {
+                        if *has_no_frustum_culling
+                            || frustum.intersects_obb(aabb, model_to_world, true, true)
+                        {
                             view_visibility.set_visible();
-                            spot_visible_entities_local_queue.push(entity);
+                            return true;
                         }
-                    },
-                );
+                        false
+                    } else {
+                        view_visibility.set_visible();
+                        true
+                    }
+                };
 
-                visible_entities.entities.clear();
-                for thread_entity_queue in spot_visible_entities_queue.iter_mut() {
-                    visible_entities.entities.append(thread_entity_queue);
+                let Some(mut cache) = shadow_cache.filter(|_| cached) else {
+                    let check_caster =
+                        |spot_visible_entities_local_queue: &mut Vec<Entity>,
+                         mut item: PointLightShadowCasterItem| {
+                            if caster_is_visible(&mut item) {
+                                spot_visible_entities_local_queue.push(item.0);
+                            }
+                        };
+                    movable_casters.par_iter_mut().for_each_init(
+                        || spot_visible_entities_queue.borrow_local_mut(),
+                        |queue, item| check_caster(queue, item),
+                    );
+                    static_casters.par_iter_mut().for_each_init(
+                        || spot_visible_entities_queue.borrow_local_mut(),
+                        |queue, item| check_caster(queue, item),
+                    );
+
+                    visible_entities.entities.clear();
+                    for thread_entity_queue in spot_visible_entities_queue.iter_mut() {
+                        visible_entities.entities.append(thread_entity_queue);
+                    }
+                    visible_entities.shrink();
+                    visible_entities.entities.sort_unstable();
+                    continue;
+                };
+
+                // MPS: a cached spot light. Its first frame cached draws its
+                // static layer.
+                if cache.projection.as_ref() != Some(&projection) {
+                    cache.invalidated = true;
                 }
-                visible_entities.shrink();
-                visible_entities.entities.sort_unstable();
+                let invalidated = mem::take(&mut cache.invalidated);
+                if invalidated {
+                    cache.static_revision += 1;
+                    cache.projection = Some(projection.clone());
+                }
+                let clip_from_world = projection.clip_from_world();
+                let near_z = projection.near_z();
+
+                // MPS: a light that reaches into no view (its range misses the
+                // frustum of every active clustered camera that sees it, as
+                // clustering tests it) shades nothing: it finds no casters,
+                // and the render world draws nothing for it.
+                cache.lights_a_view = light_views.lights_a_view(light_entity, &light_sphere);
+
+                let map_size = directional_light_shadow_map.size as u32;
+                // A light without a static layer is drawn whole whenever a
+                // live caster is in its frustum: where they fall doesn't
+                // matter.
+                let status = shadow_cache_status.get(&light_entity);
+                cache.single_view = status.is_some_and(|status| status.fallback);
+                if !cache.lights_a_view {
+                    cache.live_casters = 0;
+                    cache.movers_tiles.reset(map_size);
+                    cache.statics_walked = false;
+                    if !visible_entities.entities.is_empty() {
+                        visible_entities.entities.clear();
+                    }
+                    continue;
+                }
+                // A light without a usable static layer: walked as an uncached
+                // light, all its casters into one list for its one view. No
+                // footprints: its tiles are all set while a live caster is in
+                // its frustum. Its settled casters count only for the
+                // revision, by an order-free print instead of a list: a change
+                // no one reported redraws it.
+                if cache.single_view {
+                    list_scratch.clear();
+                    movable_casters.par_iter_mut().for_each_init(
+                        || spot_visible_entities_queue.borrow_local_mut(),
+                        |queue, mut item| {
+                            if caster_is_visible(&mut item) {
+                                queue.push(item.0);
+                            }
+                        },
+                    );
+                    for queue in spot_visible_entities_queue.iter_mut() {
+                        list_scratch.append(queue);
+                    }
+                    let live = list_scratch.len();
+                    static_casters.par_iter_mut().for_each_init(
+                        || {
+                            (
+                                spot_visible_entities_queue.borrow_local_mut(),
+                                static_prints.borrow_local_mut(),
+                            )
+                        },
+                        |(queue, print), mut item| {
+                            if caster_is_visible(&mut item) {
+                                queue.push(item.0);
+                                print.add(item.0);
+                            }
+                        },
+                    );
+                    for queue in spot_visible_entities_queue.iter_mut() {
+                        list_scratch.append(queue);
+                    }
+                    let mut print = StaticCastersPrint::default();
+                    for thread_print in static_prints.iter_mut() {
+                        print.merge(mem::take(thread_print));
+                    }
+                    list_scratch.sort_unstable();
+                    if visible_entities.entities != *list_scratch {
+                        mem::swap(&mut visible_entities.entities, &mut *list_scratch);
+                    }
+                    if cache.static_print != Some(print) {
+                        if !invalidated {
+                            cache.static_revision += 1;
+                        }
+                        cache.static_print = Some(print);
+                    }
+                    // The split views' list is found again (a new revision)
+                    // when the light has a usable layer again.
+                    cache.static_entities.clear();
+                    cache.statics_walked = false;
+                    cache.live_casters = live as u32;
+                    cache.movers_tiles.reset(map_size);
+                    if live > 0 {
+                        cache.movers_tiles.fill();
+                    }
+                    continue;
+                }
+                cache.static_print = None;
+                // Movable casters, every frame, with where they fall in the
+                // shadow map, by the same test as every other caster: walked
+                // all in parallel, or, while most lights have few near them,
+                // only those the grid puts near the light.
+                if use_grid && !movers_grid_built {
+                    movers_grid_built = true;
+                    movers_grid.build(
+                        mover_bounds
+                            .iter()
+                            .filter(|(_, inherited_visibility, ..)| inherited_visibility.get())
+                            .map(|(entity, _, aabb, transform, no_frustum_culling, live)| {
+                                let bounds = match (aabb, transform) {
+                                    (Some(aabb), Some(transform)) if !no_frustum_culling => {
+                                        let (center, half_extents) =
+                                            MoversGrid::world_bounds(aabb, transform);
+                                        let padding =
+                                            live.map_or(0.0, |live| live.max_displacement);
+                                        Some((center, half_extents + padding))
+                                    }
+                                    _ => None,
+                                };
+                                (entity, bounds)
+                            }),
+                    );
+                }
+                mover_candidates.clear();
+                if use_grid {
+                    movers_grid.candidates(
+                        light_sphere.center,
+                        light_sphere.radius,
+                        &mut *mover_candidates,
+                    );
+                }
+                // (A candidate looked up costs about four movers walked.)
+                let walk_all = !use_grid || mover_candidates.len() * 4 >= movers_grid.len();
+                found_sparse |= !walk_all;
+                // Where a visible mover falls in the shadow map.
+                let footprint = |item: &PointLightShadowCasterItem| -> ShadowFootprint {
+                    let (skinned, dynamic_skinned_bounds, mesh_morphed, morphed, live) = item.8;
+                    match (&item.4, item.5) {
+                        // Bounds that may not hold the mesh this frame:
+                        // skinned without updated bounds, morphed, or drawn
+                        // wherever it is.
+                        (Some(aabb), Some(transform))
+                            if !item.7
+                                && !(mesh_morphed || morphed)
+                                && (!skinned || (dynamic_skinned_bounds && aabb.is_changed())) =>
+                        {
+                            let world_from_local = transform.affine();
+                            padded_aabb(aabb, &world_from_local, live).map_or(
+                                ShadowFootprint::Whole,
+                                |aabb| {
+                                    ShadowFootprint::of_box(
+                                        &clip_from_world,
+                                        near_z,
+                                        &aabb,
+                                        &world_from_local,
+                                    )
+                                },
+                            )
+                        }
+                        _ => ShadowFootprint::Whole,
+                    }
+                };
+                // Each thread with a list and tiles of its own (cleared at its
+                // first mover of the light), merged after.
+                let visit = |queue: &mut (Vec<Entity>, ShadowTileMask, bool),
+                             mut item: PointLightShadowCasterItem| {
+                    if !caster_is_visible(&mut item) {
+                        return;
+                    }
+                    let (entities, tiles, used) = queue;
+                    if !*used {
+                        *used = true;
+                        tiles.reset(map_size);
+                    }
+                    entities.push(item.0);
+                    tiles.insert(footprint(&item));
+                };
+                if walk_all && !few_movers {
+                    // Most movers are near: a walk over all of them in parallel
+                    // (the same test rejects the others) beats looking each
+                    // candidate up.
+                    movable_casters.par_iter_mut().for_each_init(
+                        || movers_queue.borrow_local_mut(),
+                        |queue, item| visit(queue, item),
+                    );
+                } else if walk_all {
+                    let mut queue = movers_queue.borrow_local_mut();
+                    for item in movable_casters.iter_mut() {
+                        visit(&mut queue, item);
+                    }
+                } else {
+                    let mut queue = movers_queue.borrow_local_mut();
+                    for &entity in mover_candidates.iter() {
+                        if let Ok(item) = movable_casters.get_mut(entity) {
+                            visit(&mut queue, item);
+                        }
+                    }
+                }
+                let movers = &mut *list_scratch;
+                movers.clear();
+                let mut movers_tiles = mem::take(&mut cache.movers_tiles);
+                movers_tiles.reset(map_size);
+                for (entities, tiles, used) in movers_queue.iter_mut().filter(|queue| queue.2) {
+                    movers.append(entities);
+                    movers_tiles.union_with(tiles);
+                    *used = false;
+                }
+                movers.sort_unstable();
+                cache.live_casters = movers.len() as u32;
+                // Touch the list only when it changes.
+                if visible_entities.entities != *movers {
+                    mem::swap(&mut visible_entities.entities, movers);
+                }
+
+                // Static casters, only when the render world may draw them:
+                // a new revision until it acknowledged a map drawn from them.
+                let walk_statics = invalidated
+                    || status.is_none_or(|status| {
+                        let acknowledged = status.acknowledged_static_revision;
+                        acknowledged != Some(cache.static_revision)
+                            // The fault: the previous revision's
+                            // acknowledgement taken for this one.
+                            && !(stale_ack && acknowledged == Some(cache.static_revision - 1))
+                    });
+                cache.movers_tiles = movers_tiles;
+                cache.statics_walked = walk_statics;
+                if walk_statics {
+                    static_casters.par_iter_mut().for_each_init(
+                        || spot_visible_entities_queue.borrow_local_mut(),
+                        |entities, mut item| {
+                            if caster_is_visible(&mut item) {
+                                entities.push(item.0);
+                            }
+                        },
+                    );
+                    let statics = &mut *list_scratch;
+                    statics.clear();
+                    for thread_entity_queue in spot_visible_entities_queue.iter_mut() {
+                        statics.append(thread_entity_queue);
+                    }
+                    statics.sort_unstable();
+                    if *statics != cache.static_entities {
+                        // A change that wasn't reported (or the first list).
+                        if !invalidated {
+                            cache.static_revision += 1;
+                        }
+                        mem::swap(&mut cache.static_entities, statics);
+                    }
+                }
             }
         }
+    }
+    if use_grid {
+        *grid_found_sparse = found_sparse;
+    }
+}
+
+/// MPS: for [`check_point_light_mesh_visibility`], the active clustered
+/// cameras each light is visible to, built once a frame.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct LightViews {
+    /// The frusta of the active clustered cameras (`None`: no frustum).
+    frusta: Vec<Option<Frustum>>,
+    /// By light, the indices of the cameras it is visible to.
+    by_light: EntityHashMap<SmallVec<[u32; 2]>>,
+}
+
+impl LightViews {
+    fn build(
+        &mut self,
+        views: &Query<(
+            &VisibleEntities,
+            Option<&Frustum>,
+            Option<&Camera>,
+            Has<Clusters>,
+        )>,
+    ) {
+        self.frusta.clear();
+        self.by_light.clear();
+        for (visible, frustum, camera, clustered) in views {
+            if !(clustered && camera.is_some_and(|camera| camera.is_active)) {
+                continue;
+            }
+            let index = self.frusta.len() as u32;
+            self.frusta.push(frustum.copied());
+            for &light in visible.get(TypeId::of::<ClusterVisibilityClass>()) {
+                self.by_light.entry(light).or_default().push(index);
+            }
+        }
+    }
+
+    /// Whether a light reaches into a view: it is visible to an active
+    /// clustered camera whose frustum its range meets (as clustering tests
+    /// it).
+    fn lights_a_view(&self, light: Entity, range: &Sphere) -> bool {
+        self.by_light.get(&light).is_some_and(|views| {
+            views.iter().any(|&index| {
+                self.frusta[index as usize]
+                    .is_none_or(|frustum| frustum.intersects_sphere(range, true))
+            })
+        })
+    }
+}
+
+/// MPS: an order-free print of a set of casters (a count, a sum and a xor of
+/// mixed entity bits), merged across threads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct StaticCastersPrint {
+    count: u64,
+    sum: u64,
+    xor: u64,
+}
+
+impl StaticCastersPrint {
+    fn add(&mut self, entity: Entity) {
+        // SplitMix64's finalizer, twice with different seeds.
+        let mix = |mut z: u64| {
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let bits = entity.to_bits();
+        self.count += 1;
+        self.sum = self.sum.wrapping_add(mix(bits));
+        self.xor ^= mix(bits ^ 0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn merge(&mut self, other: StaticCastersPrint) {
+        self.count += other.count;
+        self.sum = self.sum.wrapping_add(other.sum);
+        self.xor ^= other.xor;
     }
 }
 
 /// The meshes that [`check_point_light_mesh_visibility`] tests against the
-/// frusta of point and spot lights.
-type PointLightShadowCasterQuery<'w, 's> = Query<
+/// frusta of point and spot lights: either the static or the movable ones
+/// (`F`).
+type PointLightShadowCasterQuery<'w, 's, F> = Query<
     'w,
     's,
     (
@@ -796,35 +1244,98 @@ type PointLightShadowCasterQuery<'w, 's> = Query<
         &'static InheritedVisibility,
         &'static mut ViewVisibility,
         Option<&'static RenderLayers>,
-        Option<&'static Aabb>,
+        Option<Ref<'static, Aabb>>,
         Option<&'static GlobalTransform>,
         Has<VisibilityRange>,
         Has<NoFrustumCulling>,
+        (
+            Has<SkinnedMesh>,
+            Has<DynamicSkinnedMeshBounds>,
+            Has<MeshMorphWeights>,
+            Has<MorphWeights>,
+            Option<&'static LiveShadowMaterial>,
+        ),
     ),
     (
         Without<NotShadowCaster>,
         Without<DirectionalLight>,
         Without<NoCpuCulling>,
         With<Mesh3d>,
+        F,
     ),
 >;
 
-/// Marks the meshes that a light with [`KeepShadowMaps`] saw when its shadow
-/// maps were last drawn as visible, without testing them against its frusta
-/// again. Its list of visible meshes stays as it is (and unchanged, so that it
-/// isn't extracted again).
-fn keep_shadow_casters_visible(
-    visible_entities: &VisibleMeshEntities,
-    visible_entity_query: &mut PointLightShadowCasterQuery,
-) {
-    for &entity in &visible_entities.entities {
-        if let Ok((_, inherited_visibility, mut view_visibility, ..)) =
-            visible_entity_query.get_mut(entity)
-            && inherited_visibility.get()
-        {
-            view_visibility.set_visible();
-        }
+/// The bounds of the movable casters that [`check_point_light_mesh_visibility`]
+/// puts into its [`MoversGrid`]: those of [`PointLightShadowCasterQuery`]
+/// without [`StaticShadowCaster`].
+type MoverBoundsQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static InheritedVisibility,
+        Option<&'static Aabb>,
+        Option<&'static GlobalTransform>,
+        Has<NoFrustumCulling>,
+        Option<&'static LiveShadowMaterial>,
+    ),
+    (
+        Without<NotShadowCaster>,
+        Without<DirectionalLight>,
+        Without<NoCpuCulling>,
+        With<Mesh3d>,
+        Without<StaticShadowCaster>,
+    ),
+>;
+
+/// An item of [`PointLightShadowCasterQuery`].
+type PointLightShadowCasterItem<'w> = (
+    Entity,
+    &'w InheritedVisibility,
+    Mut<'w, ViewVisibility>,
+    Option<&'w RenderLayers>,
+    Option<Ref<'w, Aabb>>,
+    Option<&'w GlobalTransform>,
+    bool,
+    bool,
+    (bool, bool, bool, bool, Option<&'w LiveShadowMaterial>),
+);
+
+/// MPS: a caster's bounds grown by what its live material can displace a
+/// vertex, in world units (see [`LiveShadowMaterial`]); `None` when no local
+/// box holds the displaced mesh (a singular or nonfinite transform): the
+/// caster is then unbounded.
+///
+/// A world displacement `d` moves a vertex by `local_from_world * d` in local
+/// space, so local axis `i` grows by the padding times the length of row `i`
+/// of the inverse: exact for any transform, shear included.
+fn padded_aabb(
+    aabb: &Aabb,
+    world_from_local: &bevy_math::Affine3A,
+    live: Option<&LiveShadowMaterial>,
+) -> Option<Aabb> {
+    let Some(padding) = live
+        .map(|live| live.max_displacement)
+        .filter(|padding| *padding > 0.0)
+    else {
+        return Some(*aabb);
+    };
+    let axes = world_from_local.matrix3;
+    let determinant = axes.determinant();
+    if !(determinant.is_finite() && determinant != 0.0) {
+        return None;
     }
+    let local_from_world = axes.inverse().transpose();
+    let grow = Vec3A::new(
+        local_from_world.x_axis.length(),
+        local_from_world.y_axis.length(),
+        local_from_world.z_axis.length(),
+    ) * padding;
+    let half_extents = aabb.half_extents + grow;
+    half_extents.is_finite().then_some(Aabb {
+        center: aabb.center,
+        half_extents,
+    })
 }
 
 /// Determines the LOD origin for spot and point light shadow maps.

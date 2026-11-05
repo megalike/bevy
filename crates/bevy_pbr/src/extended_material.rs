@@ -14,7 +14,9 @@ use bevy_render::{
 };
 use bevy_shader::ShaderRef;
 
-use crate::{Material, MaterialPipeline, MaterialPipelineKey, MeshPipeline, MeshPipelineKey};
+use crate::{
+    Material, MaterialPipeline, MaterialPipelineKey, MeshPipeline, MeshPipelineKey, ShadowCaching,
+};
 
 pub struct MaterialExtensionPipeline {
     pub mesh_pipeline: MeshPipeline,
@@ -57,6 +59,16 @@ pub trait MaterialExtension: Asset + AsBindGroup + Clone + Sized {
     #[inline]
     fn enable_shadows() -> bool {
         true
+    }
+
+    /// MPS: what the extension does to the shadow in the spot light shadow
+    /// cache, as [`Material::shadow_caching`]: return
+    /// [`ShadowCaching::Live`] if its shaders move vertices or change coverage
+    /// by themselves. Combined with the base material's declaration
+    /// ([`ShadowCaching::and`]).
+    #[inline]
+    fn shadow_caching() -> ShadowCaching {
+        ShadowCaching::Cacheable
     }
 
     /// Controls whether order independent transparency is enabled for the Material.
@@ -270,6 +282,10 @@ impl<B: Material, E: MaterialExtension> Material for ExtendedMaterial<B, E> {
         E::enable_oit()
     }
 
+    fn shadow_caching() -> ShadowCaching {
+        B::shadow_caching().and(E::shadow_caching())
+    }
+
     fn prepass_vertex_shader() -> ShaderRef {
         match E::prepass_vertex_shader() {
             ShaderRef::Default => B::prepass_vertex_shader(),
@@ -352,3 +368,71 @@ impl<B: Material, E: MaterialExtension> Material for ExtendedMaterial<B, E> {
 
 #[deprecated = "Use `bevy_render::combined_bind_group::CombinedBindGroupData` instead"]
 pub type MaterialExtensionBindGroupData<B, E> = cbg::CombinedBindGroupData<B, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ShadowCaching, StandardMaterial};
+    use bevy_reflect::TypePath;
+
+    /// A base material whose shadow changes by itself.
+    #[derive(Asset, AsBindGroup, TypePath, Clone, Debug)]
+    struct LiveBase {}
+
+    impl Material for LiveBase {
+        fn shadow_caching() -> ShadowCaching {
+            ShadowCaching::Live {
+                max_displacement: 0.5,
+            }
+        }
+    }
+
+    /// An extension that adds nothing to the shadow.
+    #[derive(Asset, AsBindGroup, TypePath, Clone, Debug)]
+    struct PlainExtension {}
+
+    impl MaterialExtension for PlainExtension {}
+
+    /// An extension whose vertex shader moves vertices by itself.
+    #[derive(Asset, AsBindGroup, TypePath, Clone, Debug)]
+    struct LiveExtension {}
+
+    impl MaterialExtension for LiveExtension {
+        fn shadow_caching() -> ShadowCaching {
+            ShadowCaching::Live {
+                max_displacement: 0.25,
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_base_stays_live_when_extended() {
+        assert_eq!(
+            ExtendedMaterial::<LiveBase, PlainExtension>::shadow_caching(),
+            ShadowCaching::Live {
+                max_displacement: 0.5
+            }
+        );
+        assert_eq!(
+            ExtendedMaterial::<StandardMaterial, PlainExtension>::shadow_caching(),
+            ShadowCaching::Cacheable
+        );
+    }
+
+    #[test]
+    fn a_live_extension_makes_the_material_live() {
+        assert_eq!(
+            ExtendedMaterial::<StandardMaterial, LiveExtension>::shadow_caching(),
+            ShadowCaching::Live {
+                max_displacement: 0.25
+            }
+        );
+        // Both live: the displacements add up.
+        assert_eq!(
+            ExtendedMaterial::<LiveBase, LiveExtension>::shadow_caching(),
+            ShadowCaching::Live {
+                max_displacement: 0.75
+            }
+        );
+    }
+}
