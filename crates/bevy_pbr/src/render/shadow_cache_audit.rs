@@ -1,7 +1,8 @@
 //! A debug check of the shadow cache (`bevy_light`'s `ShadowCacheSettings`)
 //! against full redraws, texel by texel, view by view:
-//! [`ShadowCacheAuditPlugin`]. It checks spot lights (with twins) and cached
-//! directional cascades (with reference views of their exact projection).
+//! [`ShadowCacheAuditPlugin`]. It checks spot lights and point lights' faces
+//! (with twins) and cached directional cascades (with reference views of
+//! their exact projection).
 
 use alloc::{borrow::Cow, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -12,8 +13,8 @@ use bevy_camera::visibility::{NoFrustumCulling, RenderLayers, ViewVisibility};
 use bevy_diagnostic::FrameCount;
 use bevy_ecs::prelude::*;
 use bevy_light::{
-    DirectionalLightShadowCache, ShadowCacheExempt, ShadowCacheFaults, ShadowSubview, ShadowViewId,
-    SpotLight,
+    DirectionalLightShadowCache, PointLight, ShadowCacheExempt, ShadowCacheFaults, ShadowSubview,
+    ShadowViewId, SpotLight,
 };
 use bevy_math::UVec2;
 use bevy_render::{
@@ -30,8 +31,8 @@ use crate::{
     ShadowViewCaches, ShadowViewKey, ViewShadowBindings, CORE_3D_SHADOW_MAP_FORMAT,
 };
 
-/// Checks every cached spot light's shadow map against a full redraw, every
-/// frame. A debug tool: add it only to look for a fault of the cache, it
+/// Checks every cached spot light's shadow map and every cached point light's
+/// faces against a full redraw, every frame. A debug tool: add it only to look for a fault of the cache, it
 /// costs a shadow map per cached light and a compare pass and read-back per
 /// frame.
 ///
@@ -43,6 +44,11 @@ use crate::{
 /// as `u32` bits, each cached light's shadow map (the working layer) with its
 /// twin's, and its static layer with the twin's and with the working layer.
 /// The results arrive a few frames later in [`ShadowCacheAuditResults`].
+///
+/// A shadowed [`PointLight`] gets a twin the same way (a child point light
+/// with its range, near plane and layers, no intensity, no cache), and each
+/// of its six faces is compared with the twin's face (its layers
+/// `light_index * 6 + face` of the point light texture), one record a face.
 ///
 /// The twins change what the cache sees and does: their full views find every
 /// caster in the light's frustum every frame, so its settled casters stay
@@ -94,7 +100,7 @@ impl Plugin for ShadowCacheAuditPlugin {
             .add_systems(
                 PostUpdate,
                 (
-                    add_audit_twins
+                    (add_audit_twins, add_point_audit_twins)
                         .run_if(|settings: Res<ShadowCacheAuditSettings>| {
                             settings.enabled && settings.fresh_redraws
                         })
@@ -118,8 +124,8 @@ impl Plugin for ShadowCacheAuditPlugin {
     }
 }
 
-/// The twin of a spot light (its parent), drawn from scratch every frame by
-/// [`ShadowCacheAuditPlugin`]; never cached.
+/// The twin of a spot or point light (its parent), drawn from scratch every
+/// frame by [`ShadowCacheAuditPlugin`]; never cached.
 #[derive(Component, Clone, Copy, Debug)]
 #[require(ShadowCacheExempt)]
 pub struct ShadowCacheAuditTwin {
@@ -127,7 +133,7 @@ pub struct ShadowCacheAuditTwin {
     pub light: Entity,
 }
 
-/// A cached spot light's audit twin.
+/// A spot or point light's audit twin.
 #[derive(Component)]
 struct HasShadowCacheAuditTwin(Entity);
 
@@ -303,6 +309,70 @@ fn add_audit_twins(
     }
 }
 
+/// Gives every shadowed point light a twin and keeps what decides the twin's
+/// shadow maps the light's: its range, near plane and render layers (its
+/// translation is the parent's; Bevy ignores rotation and scale).
+fn add_point_audit_twins(
+    mut commands: Commands,
+    lights: Query<
+        (
+            Entity,
+            &PointLight,
+            Option<&RenderLayers>,
+            Option<&HasShadowCacheAuditTwin>,
+        ),
+        (Without<ShadowCacheAuditTwin>, Without<ShadowCacheExempt>),
+    >,
+    mut twins: Query<(&mut PointLight, Option<&RenderLayers>), With<ShadowCacheAuditTwin>>,
+) {
+    for (entity, point_light, layers, twin) in &lights {
+        let wanted = PointLight {
+            intensity: 0.0,
+            contact_shadows_enabled: false,
+            ..*point_light
+        };
+        let projection = |light: &PointLight| {
+            (
+                light.shadow_maps_enabled,
+                light.range,
+                light.radius,
+                light.shadow_map_near_z,
+            )
+        };
+        match twin {
+            Some(HasShadowCacheAuditTwin(twin_entity)) => {
+                if let Ok((mut twin, twin_layers)) = twins.get_mut(*twin_entity) {
+                    if projection(&twin) != projection(&wanted) {
+                        *twin = wanted;
+                    }
+                    if twin_layers != layers {
+                        match layers {
+                            Some(layers) => commands.entity(*twin_entity).insert(layers.clone()),
+                            None => commands.entity(*twin_entity).remove::<RenderLayers>(),
+                        };
+                    }
+                }
+            }
+            None if point_light.shadow_maps_enabled => {
+                let mut twin = commands.spawn((
+                    wanted,
+                    ShadowCacheAuditTwin { light: entity },
+                    NoFrustumCulling,
+                ));
+                if let Some(layers) = layers {
+                    twin.insert(layers.clone());
+                }
+                let twin = twin.id();
+                commands
+                    .entity(entity)
+                    .add_child(twin)
+                    .insert(HasShadowCacheAuditTwin(twin));
+            }
+            None => {}
+        }
+    }
+}
+
 /// Asks the cached directional cascades for their reference lists while the
 /// audit compares with full redraws.
 fn request_directional_references(
@@ -337,6 +407,8 @@ struct AuditPairs {
     /// (view, its light's render entity): every cached directional cascade
     /// the main world extracted.
     directional: Vec<(ShadowViewId, Entity)>,
+    /// As `pairs`, for shadowed point lights (six views each).
+    points: Vec<(Entity, Entity, Option<Entity>)>,
 }
 
 fn extract_audit_pairs(
@@ -357,6 +429,18 @@ fn extract_audit_pairs(
     >,
     twins: Extract<Query<RenderEntity, With<ShadowCacheAuditTwin>>>,
     directional_lights: Extract<Query<(Entity, RenderEntity, &DirectionalLightShadowCache)>>,
+    point_lights: Extract<
+        Query<
+            (
+                Entity,
+                RenderEntity,
+                &PointLight,
+                &ViewVisibility,
+                Option<&HasShadowCacheAuditTwin>,
+            ),
+            (Without<ShadowCacheAuditTwin>, Without<ShadowCacheExempt>),
+        >,
+    >,
 ) {
     pairs.settings = Some(**settings);
     pairs.frame = frame.as_deref().map_or(0, |frame| frame.0);
@@ -394,6 +478,19 @@ fn extract_audit_pairs(
         .collect();
     directional.sort_unstable_by_key(|(view, _)| *view);
     pairs.directional = directional;
+    let mut points: Vec<_> = point_lights
+        .iter()
+        .filter(|(_, _, light, visibility, _)| light.shadow_maps_enabled && visibility.get())
+        .map(|(light, render_light, _, _, twin)| {
+            (
+                light,
+                render_light,
+                twin.and_then(|twin| twins.get(twin.0).ok()),
+            )
+        })
+        .collect();
+    points.sort_unstable_by_key(|(light, ..)| *light);
+    pairs.points = points;
 }
 
 /// One pair's slice of the results buffer, in `u32` words; its first words
@@ -659,8 +756,8 @@ impl AuditGpu {
     }
 }
 
-/// Where a shadow view (by render entity) drew this frame: its texture and
-/// layer.
+/// Where a light's (by render entity) shadow view of a kind (a spot light's,
+/// a point light's face) drew this frame: its texture and layer.
 fn drawn_target(
     lights: &Query<(
         Option<&ExtractedPointLight>,
@@ -668,13 +765,15 @@ fn drawn_target(
     )>,
     keys: &Query<&ShadowViewKey>,
     light: Entity,
+    subview: ShadowSubview,
 ) -> Option<(TextureId, u32)> {
     let Ok((Some(_), Some(views))) = lights.get(light) else {
         return None;
     };
     views
-        .first()
-        .and_then(|view| keys.get(*view).ok())
+        .iter()
+        .filter_map(|view| keys.get(*view).ok())
+        .find(|key| key.id.subview == subview)
         .map(|key| (key.region.texture, key.region.layer))
 }
 
@@ -706,7 +805,7 @@ fn audit_shadow_caches(
     let Some(settings) = pairs.settings.filter(|settings| settings.enabled) else {
         return;
     };
-    // The shadow map texture lighting reads: one for every view.
+    // The shadow map textures lighting reads: the same for every view.
     let mut bound = bindings.iter();
     let binding = match bound.next() {
         None => Err("no view binds a shadow map"),
@@ -714,12 +813,28 @@ fn audit_shadow_caches(
             if bound.any(|other| {
                 other.directional_light_depth_texture.id()
                     != first.directional_light_depth_texture.id()
+                    || other.point_light_depth_texture.id()
+                        != first.point_light_depth_texture.id()
             }) =>
         {
             Err("the views bind different shadow map textures")
         }
         Some(first) => Ok(first),
     };
+    // The point light texture's faces as a 2D array, for the compare.
+    let point_maps = binding.ok().map(|binding| {
+        (
+            binding
+                .point_light_depth_texture
+                .create_view(&TextureViewDescriptor {
+                    label: Some("shadow_cache_audit_point_faces"),
+                    dimension: Some(TextureViewDimension::D2Array),
+                    aspect: TextureAspect::DepthOnly,
+                    ..default()
+                }),
+            binding.point_light_depth_texture.width(),
+        )
+    });
     let hashes = settings.hashes && !settings.fresh_redraws;
     // (view, its light's render entity, the twin's): with twins or hashes
     // the view of every shadowed spot light the main world extracted, else
@@ -730,6 +845,19 @@ fn audit_shadow_caches(
             .pairs
             .iter()
             .map(|&(light, render_light, twin)| (ShadowViewId::spot(light), render_light, twin))
+            // Point lights: each face with the twin's.
+            .chain(pairs.points.iter().flat_map(|&(light, render_light, twin)| {
+                (0..6u8).map(move |face| {
+                    (
+                        ShadowViewId {
+                            light,
+                            subview: ShadowSubview::PointFace(face),
+                        },
+                        render_light,
+                        twin,
+                    )
+                })
+            }))
             // Cached directional cascades: compared with their references
             // (not hashed).
             .chain(
@@ -754,6 +882,7 @@ fn audit_shadow_caches(
     for (view, render_light, twin) in expected {
         let info = caches.audit(&view);
         let directional = matches!(view.subview, ShadowSubview::Directional { .. });
+        let point = matches!(view.subview, ShadowSubview::PointFace(_));
         let mut record = ShadowCacheAuditRecord {
             frame: pairs.frame,
             expected: count,
@@ -787,9 +916,15 @@ fn audit_shadow_caches(
         let target = info
             .as_ref()
             .map(|info| (info.texture, info.layer))
-            .or_else(|| drawn_target(&lights, &keys, render_light));
-        let twin_target = twin.and_then(|twin| drawn_target(&lights, &keys, twin));
-        let read = binding.map(|binding| binding.directional_light_depth_texture.id());
+            .or_else(|| drawn_target(&lights, &keys, render_light, view.subview));
+        let twin_target = twin.and_then(|twin| drawn_target(&lights, &keys, twin, view.subview));
+        let read = binding.map(|binding| {
+            if point {
+                binding.point_light_depth_texture.id()
+            } else {
+                binding.directional_light_depth_texture.id()
+            }
+        });
         // A directional cascade's map and reference, copied and drawn into a
         // texture of the audit's during the camera's passes.
         let reference = directional
@@ -851,6 +986,14 @@ fn audit_shadow_caches(
             continue;
         }
         let static_layer = info.and_then(|info| info.static_layer).filter(|_| !hashes);
+        // The texture compared: a directional cascade's own (its map and
+        // reference), the point light texture's faces, or the shadow map
+        // texture of spot lights (`None`).
+        let maps = match reference {
+            Some((maps, size, _)) => Some((maps, size)),
+            None if point => point_maps.clone(),
+            None => None,
+        };
         audited.push((
             PendingPair {
                 has_static: static_layer.is_some(),
@@ -858,7 +1001,7 @@ fn audit_shadow_caches(
                 record,
             },
             static_layer,
-            reference.map(|(maps, size, _)| (maps, size)),
+            maps,
         ));
     }
     if !skipped.is_empty()

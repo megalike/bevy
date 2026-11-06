@@ -53,7 +53,7 @@ use std::sync::Mutex;
 
 use bevy_asset::{AssetEvent, AssetId, UntypedAssetId};
 use bevy_camera::{
-    primitives::{Aabb, CascadesFrusta, Frustum, Sphere},
+    primitives::{Aabb, CascadesFrusta, CubeMapFace, CubemapFrusta, Frustum, Sphere, CUBE_MAP_FACES},
     visibility::{InheritedVisibility, NoFrustumCulling, RenderLayers, VisibilityRange},
 };
 use bevy_ecs::{
@@ -63,7 +63,7 @@ use bevy_ecs::{
     prelude::*,
     world::DeferredWorld,
 };
-use bevy_math::{Affine3A, Mat4, URect, Vec2, Vec3A, Vec4Swizzles};
+use bevy_math::{Affine3A, Mat4, URect, Vec2, Vec3, Vec3A, Vec4Swizzles};
 use bevy_mesh::{
     morph::{MeshMorphWeights, MorphWeights},
     skinning::SkinnedMesh,
@@ -76,11 +76,12 @@ use bevy_platform::{
 use bevy_reflect::prelude::*;
 use bevy_shape::{HalfSpace, ViewFrustum};
 use bevy_time::Time;
-use bevy_transform::components::GlobalTransform;
+use bevy_transform::components::{GlobalTransform, Transform};
 
 use crate::{
     spot_light_clip_from_view, spot_light_world_from_view, stable_cascade::view_takes,
-    DirectionalLightShadowMap, NotShadowCaster, ShadowRepresentation, SpotLight,
+    DirectionalLightShadowMap, NotShadowCaster, PointLight, PointLightShadowMap,
+    ShadowRepresentation, SpotLight,
 };
 
 /// The marker Bevy keeps on a mesh whose shadow is settled: it is drawn into
@@ -241,8 +242,9 @@ pub struct ShadowCacheFaults {
     /// Take a cached directional cascade's map for current although another
     /// camera drew its own cascade into the same layer since.
     pub miss_ownership: bool,
-    /// Keep a cached directional cascade's static layer when its projection
-    /// changes (a re-center, a new depth interval).
+    /// Keep a cached directional cascade's or point light's static layers
+    /// when its projection changes (a re-center, a new depth interval, a
+    /// point light that moved).
     pub stale_projection: bool,
     /// Find where a cached far cascade's live casters fall with the cascade
     /// before it.
@@ -250,6 +252,18 @@ pub struct ShadowCacheFaults {
     /// Never re-center a stable far cascade (a projection fault: its coverage
     /// expires; caught by the coverage check, not by the maps).
     pub miss_recenter: bool,
+    /// Find where a cached point light face's live casters fall with the
+    /// next face's projection.
+    pub wrong_face: bool,
+    /// List a cached point light's live caster only in the first face it is
+    /// in (one crossing a face edge misses the other face).
+    pub miss_face_edge: bool,
+    /// A settled caster that settles or leaves redraws only the first face
+    /// of a cached point light it touches.
+    pub miss_face_invalidation: bool,
+    /// Take a cached view's shadow map for current although it is now drawn
+    /// into another layer (a point light whose index changed).
+    pub miss_index_change: bool,
     /// Not a fault: each cached directional cascade also lists every caster
     /// it draws, found anew each frame, for the audit's reference view
     /// (`bevy_pbr`'s `ShadowCacheAuditPlugin` sets it).
@@ -486,6 +500,25 @@ impl ShadowViewBounds {
             sphere: Some(Sphere {
                 center: transform.translation_vec3a(),
                 radius: spot_light.range,
+            }),
+            frustum: *frustum,
+            layers,
+            stand_ins: false,
+        }
+    }
+
+    /// A point light's face: its range, the face's frustum and the layers
+    /// that projected its static layer.
+    pub(crate) fn point(
+        point_light: &PointLight,
+        transform: &GlobalTransform,
+        frustum: &Frustum,
+        layers: RenderLayers,
+    ) -> ShadowViewBounds {
+        ShadowViewBounds {
+            sphere: Some(Sphere {
+                center: transform.translation_vec3a(),
+                radius: point_light.range,
             }),
             frustum: *frustum,
             layers,
@@ -983,6 +1016,62 @@ impl SpotShadowProjection {
     }
 }
 
+/// The clip-from-world matrix of a point light's cube face, as its shadow
+/// view renders it: the light's translation only (Bevy ignores its rotation
+/// and scale), the face's fixed orientation ([`CUBE_MAP_FACES`]) and a 90°
+/// reversed infinite projection with `near_z`.
+pub fn point_light_face_clip_from_world(translation: Vec3, near_z: f32, face: usize) -> Mat4 {
+    let CubeMapFace { target, up } = CUBE_MAP_FACES[face];
+    let world_from_view =
+        Transform::from_translation(translation) * Transform::IDENTITY.looking_at(target, up);
+    bevy_math::proj::perspective_infinite_reverse(core::f32::consts::FRAC_PI_2, 1.0, near_z)
+        * world_from_view.compute_affine().inverse()
+}
+
+/// What decides a cached point light's static layers besides its casters:
+/// when any of it changes, every face is drawn again. Its rotation and scale
+/// don't count (Bevy ignores them), nor does the layer its faces are drawn
+/// into (a new layer restores the static layers there).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PointShadowProjection {
+    /// The translation's bits.
+    translation: [u32; 3],
+    near_z: f32,
+    range: f32,
+    map_size: usize,
+    render_layers: RenderLayers,
+}
+
+impl PointShadowProjection {
+    pub(crate) fn new(
+        transform: &GlobalTransform,
+        point_light: &PointLight,
+        render_layers: &RenderLayers,
+        map_size: usize,
+    ) -> Self {
+        Self {
+            translation: transform.translation().to_array().map(f32::to_bits),
+            near_z: point_light.shadow_map_near_z,
+            range: point_light.range,
+            map_size,
+            render_layers: render_layers.clone(),
+        }
+    }
+
+    /// A face's clip-from-world matrix, as its shadow view renders.
+    pub(crate) fn face_clip_from_world(&self, face: usize) -> Mat4 {
+        point_light_face_clip_from_world(
+            Vec3::from_array(self.translation.map(f32::from_bits)),
+            self.near_z,
+            face,
+        )
+    }
+
+    pub(crate) fn near_z(&self) -> f32 {
+        self.near_z
+    }
+}
+
 /// The movable shadow casters of a frame, bucketed by where they are, so that
 /// a cached spot light tests only the casters near it instead of every movable
 /// caster in the world.
@@ -1142,6 +1231,8 @@ pub(crate) enum ShadowViewProjection {
     Spot(SpotShadowProjection),
     /// A directional light's cascade for a camera.
     Directional(DirectionalShadowProjection),
+    /// A point light's (the same for each face).
+    Point(PointShadowProjection),
 }
 
 impl ShadowViewProjection {
@@ -1150,6 +1241,7 @@ impl ShadowViewProjection {
         match self {
             ShadowViewProjection::Spot(projection) => &projection.render_layers,
             ShadowViewProjection::Directional(projection) => &projection.render_layers,
+            ShadowViewProjection::Point(projection) => &projection.render_layers,
         }
     }
 
@@ -1157,7 +1249,7 @@ impl ShadowViewProjection {
     pub(crate) fn is_spot(&self, spot: &SpotShadowProjection) -> bool {
         match self {
             ShadowViewProjection::Spot(projection) => projection == spot,
-            ShadowViewProjection::Directional(_) => false,
+            _ => false,
         }
     }
 
@@ -1165,7 +1257,15 @@ impl ShadowViewProjection {
     pub(crate) fn is_directional(&self, directional: &DirectionalShadowProjection) -> bool {
         match self {
             ShadowViewProjection::Directional(projection) => projection == directional,
-            ShadowViewProjection::Spot(_) => false,
+            _ => false,
+        }
+    }
+
+    /// Whether it is this point light projection.
+    pub(crate) fn is_point(&self, point: &PointShadowProjection) -> bool {
+        match self {
+            ShadowViewProjection::Point(projection) => projection == point,
+            _ => false,
         }
     }
 }
@@ -1385,6 +1485,44 @@ impl SpotLightShadowCache {
     /// See [`ShadowViewCache::single_view`].
     pub fn single_view(&self) -> bool {
         self.view.single_view()
+    }
+}
+
+/// What the main world keeps for a point light: whether it is cached (the
+/// cache on and the light settled), and the shadow views of its six cube
+/// faces ([`ShadowSubview::PointFace`], in [`CUBE_MAP_FACES`]' order). Each
+/// face is cached on its own (its static layer, revision, live casters and
+/// budget); the light settles as a whole. Bevy adds and updates it on every
+/// [`PointLight`].
+#[derive(Component, Clone, Debug, Default)]
+pub struct PointLightShadowCache {
+    /// Whether the light is cached this frame.
+    pub(crate) cached: bool,
+    pub(crate) settlement: LightSettlement<PointShadowProjection>,
+    pub(crate) faces: [ShadowViewCache; 6],
+}
+
+impl PointLightShadowCache {
+    /// Whether the light is cached: shadows on, the cache on, and the light
+    /// settled.
+    pub fn is_cached(&self) -> bool {
+        self.cached
+    }
+
+    /// A face's shadow view (0..6, as [`CUBE_MAP_FACES`]).
+    pub fn face(&self, face: usize) -> &ShadowViewCache {
+        &self.faces[face]
+    }
+
+    /// The faces' shadow views, in order.
+    pub fn faces(&self) -> &[ShadowViewCache; 6] {
+        &self.faces
+    }
+
+    /// The live casters in the light's faces this frame (a caster in two
+    /// faces counts twice).
+    pub fn live_casters(&self) -> u32 {
+        self.faces.iter().map(ShadowViewCache::live_casters).sum()
     }
 }
 
@@ -1709,12 +1847,20 @@ pub fn classify_shadow_casters(
         Query<Entity, With<StaticShadowCaster>>,
         Query<(), (With<StaticShadowCaster>, With<Mesh3d>)>,
     ),
-    lights: Query<(
-        &SpotLight,
-        &GlobalTransform,
-        &Frustum,
-        &SpotLightShadowCache,
-    )>,
+    (lights, point_lights): (
+        Query<(
+            &SpotLight,
+            &GlobalTransform,
+            &Frustum,
+            &SpotLightShadowCache,
+        )>,
+        Query<(
+            &PointLight,
+            &GlobalTransform,
+            &CubemapFrusta,
+            &PointLightShadowCache,
+        )>,
+    ),
     faults: Option<Res<ShadowCacheFaults>>,
     mut local: Local<ClassifyState>,
 ) {
@@ -2059,6 +2205,22 @@ pub fn classify_shadow_casters(
             ))
         },
     ));
+    // Each face of a cached point light is a view of its own.
+    for (point_light, transform, frusta, cache) in &point_lights {
+        if !cache.cached {
+            continue;
+        }
+        for (face, frustum) in cache.faces.iter().zip(frusta.iter()) {
+            if let Some(projection) = &face.projection {
+                cached_views.push(ShadowViewBounds::point(
+                    point_light,
+                    transform,
+                    frustum,
+                    projection.render_layers().clone(),
+                ));
+            }
+        }
+    }
     in_wave.clear();
     in_wave.resize(cached_views.len(), false);
     let mut wave_views = 0;
@@ -2119,7 +2281,7 @@ fn set_settled(commands: &mut Commands, entity: Entity, settle: bool) {
 /// [`check_point_light_mesh_visibility`]: crate::check_point_light_mesh_visibility
 pub fn invalidate_shadow_caches(
     settings: Res<ShadowCacheSettings>,
-    shadow_map: Res<DirectionalLightShadowMap>,
+    (shadow_map, point_shadow_map): (Res<DirectionalLightShadowMap>, Res<PointLightShadowMap>),
     mut invalidations: MessageReader<InvalidateShadowCache>,
     mut transitions: ResMut<ShadowCasterTransitions>,
     mut counters: ResMut<ShadowCacheCounters>,
@@ -2131,10 +2293,17 @@ pub fn invalidate_shadow_caches(
         &Frustum,
     )>,
     mut directional_lights: Query<(Entity, Mut<DirectionalLightShadowCache>, &CascadesFrusta)>,
-    mut redraw_key: Local<Option<(u64, usize)>>,
+    mut point_lights: Query<(
+        Entity,
+        Mut<PointLightShadowCache>,
+        &PointLight,
+        &GlobalTransform,
+        &CubemapFrusta,
+    )>,
+    mut redraw_key: Local<Option<(u64, usize, usize)>>,
     faults: Option<Res<ShadowCacheFaults>>,
 ) {
-    let key = (settings.budget_bytes, shadow_map.size);
+    let key = (settings.budget_bytes, shadow_map.size, point_shadow_map.size);
     let mut all = redraw_key.replace(key).is_some_and(|old| old != key);
     let mut invalidated_lights = Vec::new();
     for invalidation in invalidations.read() {
@@ -2216,7 +2385,7 @@ pub fn invalidate_shadow_caches(
                     };
                     let stand_ins = match projection {
                         ShadowViewProjection::Directional(projection) => projection.stand_ins(),
-                        ShadowViewProjection::Spot(_) => false,
+                        _ => false,
                     };
                     let bounds = ShadowViewBounds::directional(
                         frustum,
@@ -2234,6 +2403,58 @@ pub fn invalidate_shadow_caches(
                         })
                 });
             if touched {
+                view.invalidated = true;
+                counters.rebuild_requests += 1;
+            }
+        }
+    }
+    // A point light's cached faces: each face's frustum within the light's
+    // range. A caster across a face edge touches every face it is in.
+    let first_face_only = faults
+        .as_ref()
+        .is_some_and(|faults| faults.miss_face_invalidation);
+    for (light_entity, mut cache, point_light, transform, frusta) in &mut point_lights {
+        if !cache.cached {
+            continue;
+        }
+        let light_invalidated = all || invalidated_lights.contains(&light_entity);
+        let cache = cache.bypass_change_detection();
+        let bounds: [Option<ShadowViewBounds>; 6] = core::array::from_fn(|face| {
+            let projection = cache.faces[face].projection.as_ref()?;
+            Some(ShadowViewBounds::point(
+                point_light,
+                transform,
+                &frusta.frusta[face],
+                projection.render_layers().clone(),
+            ))
+        });
+        let mut touched = [light_invalidated; 6];
+        for (face, bounds) in bounds.iter().enumerate() {
+            // A face without a projection draws its static layer anew.
+            if bounds.is_none() {
+                touched[face] = true;
+            }
+        }
+        if !light_invalidated {
+            for signature in transitions.settled.iter().chain(&transitions.left) {
+                for (face, bounds) in bounds.iter().enumerate() {
+                    let Some(bounds) = bounds else {
+                        continue;
+                    };
+                    if signature
+                        .as_ref()
+                        .is_none_or(|signature| signature.touches(bounds))
+                    {
+                        touched[face] = true;
+                        if first_face_only {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for (face, view) in cache.faces.iter_mut().enumerate() {
+            if touched[face] && !view.invalidated {
                 view.invalidated = true;
                 counters.rebuild_requests += 1;
             }
@@ -2867,5 +3088,290 @@ mod tests {
         assert!(app.world().entity(hidden).contains::<StaticShadowCaster>());
         step(&mut app, 1.0);
         assert!(app.world().entity(mover).contains::<StaticShadowCaster>());
+    }
+
+    #[test]
+    fn point_faces_project_as_bevy_renders_them() {
+        // Each face looks along its target with its up vector at the top of
+        // the map, as the render world's cube face views (`CUBE_MAP_FACES`,
+        // `looking_at`) and the frusta of `update_point_light_frusta`.
+        let light = Vec3::new(1.0, 2.0, 3.0);
+        let mut frusta = CubemapFrusta::default();
+        let view_rotations: Vec<_> = CUBE_MAP_FACES
+            .iter()
+            .map(|CubeMapFace { target, up }| Transform::IDENTITY.looking_at(*target, *up))
+            .collect();
+        for (rotation, frustum) in view_rotations.iter().zip(frusta.iter_mut()) {
+            let clip_from_world = bevy_math::proj::perspective_infinite_reverse(
+                core::f32::consts::FRAC_PI_2,
+                1.0,
+                0.1,
+            ) * (Transform::from_translation(light) * *rotation)
+                .compute_affine()
+                .inverse();
+            *frustum = Frustum(ViewFrustum::from_clip_from_world(
+                &clip_from_world,
+            ));
+        }
+        for (face, CubeMapFace { target, up }) in CUBE_MAP_FACES.iter().enumerate() {
+            let clip_from_world = point_light_face_clip_from_world(light, 0.1, face);
+            let ndc = |point: Vec3| {
+                let clip = clip_from_world * point.extend(1.0);
+                clip.xy() / clip.w
+            };
+            let ahead = ndc(light + *target * 5.0);
+            assert!(ahead.abs().max_element() < 1e-5, "face {face}: {ahead:?}");
+            // Up is +v in clip space: the top of the map (small v).
+            let above = ndc(light + *target * 5.0 + *up * 2.0);
+            assert!(above.y > 0.3 && above.x.abs() < 1e-5, "face {face}: {above:?}");
+            // The same frustum as the culling's.
+            let aabb = Aabb {
+                center: Vec3A::ZERO,
+                half_extents: Vec3A::splat(0.2),
+            };
+            let inside = Affine3A::from_translation(light + *target * 5.0 + *up * 1.0);
+            assert!(frusta.frusta[face].intersects_obb(&aabb, &inside, true, true));
+            let ShadowFootprint::Rect { max, .. } =
+                ShadowFootprint::of_box(&clip_from_world, 0.1, &aabb, &inside)
+            else {
+                panic!("face {face}: expected a rectangle");
+            };
+            assert!(max.y < 0.5, "face {face}: up lands at the top: {max:?}");
+        }
+    }
+
+    /// An app with the main world's point light cache systems, a camera
+    /// that sees the light, and the light (range 20 at the origin).
+    fn point_app() -> (bevy_app::App, Entity) {
+        use bevy_camera::{
+            visibility::{CubemapVisibleEntities, ViewVisibility, VisibleEntities},
+            Camera,
+        };
+        let mut app = classify_app();
+        app.init_resource::<ShadowCacheFeedback>()
+            .init_resource::<DirectionalLightShadowMap>()
+            .init_resource::<PointLightShadowMap>()
+            .add_systems(
+                bevy_app::Update,
+                (
+                    crate::update_point_light_frusta.before(classify_shadow_casters),
+                    invalidate_shadow_caches.after(classify_shadow_casters),
+                    crate::check_point_light_mesh_visibility.after(invalidate_shadow_caches),
+                ),
+            );
+        let light = app
+            .world_mut()
+            .spawn((
+                PointLight {
+                    range: 20.0,
+                    shadow_maps_enabled: true,
+                    ..Default::default()
+                },
+                GlobalTransform::IDENTITY,
+                ViewVisibility::VISIBLE,
+                PointLightShadowCache::default(),
+            ))
+            .id();
+        assert!(app.world().entity(light).contains::<CubemapVisibleEntities>());
+        let mut visible = VisibleEntities::default();
+        visible.push(
+            light,
+            core::any::TypeId::of::<crate::cluster::ClusterVisibilityClass>(),
+        );
+        app.world_mut().spawn((
+            Camera::default(),
+            crate::cluster::Clusters::default(),
+            visible,
+        ));
+        (app, light)
+    }
+
+    fn caster(app: &mut bevy_app::App, at: Vec3, half: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Mesh3d::default(),
+                GlobalTransform::from_translation(at),
+                Aabb {
+                    center: Vec3A::ZERO,
+                    half_extents: half.into(),
+                },
+                InheritedVisibility::VISIBLE,
+                bevy_camera::visibility::ViewVisibility::default(),
+            ))
+            .id()
+    }
+
+    fn face_list(app: &bevy_app::App, light: Entity, face: usize) -> Vec<Entity> {
+        app.world()
+            .get::<bevy_camera::visibility::CubemapVisibleEntities>(light)
+            .unwrap()
+            .get(face)
+            .entities
+            .clone()
+    }
+
+    fn point_cache(app: &bevy_app::App, light: Entity) -> PointLightShadowCache {
+        app.world()
+            .get::<PointLightShadowCache>(light)
+            .unwrap()
+            .clone()
+    }
+
+
+    /// Acknowledges every face's current static revision, as the render
+    /// world does once it drew them: their settled casters are no longer
+    /// walked, so only invalidations redraw them.
+    fn acknowledge(app: &bevy_app::App, light: Entity) {
+        let cache = point_cache(app, light);
+        let feedback = app.world().resource::<ShadowCacheFeedback>();
+        let mut map = feedback.0.lock().unwrap();
+        for (face, view) in cache.faces().iter().enumerate() {
+            map.insert(
+                ShadowViewId {
+                    light,
+                    subview: ShadowSubview::PointFace(face as u8),
+                },
+                ShadowCacheViewStatus {
+                    generation: view.generation(),
+                    acknowledged_static_revision: Some(view.static_revision()),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn a_still_point_light_caches_each_face_with_its_own_lists() {
+        let (mut app, light) = point_app();
+        // A settled caster in face 0 (+X) only, and one across the edge of
+        // faces 0 (+X) and 4 (world -Z).
+        let settled = caster(&mut app, Vec3::new(6.0, 0.0, 0.0), Vec3::splat(0.5));
+        let across = caster(&mut app, Vec3::new(5.0, 0.0, -5.0), Vec3::splat(0.5));
+        step(&mut app, 0.016);
+        step(&mut app, 0.016);
+        step(&mut app, 0.016);
+        assert!(app.world().entity(settled).contains::<StaticShadowCaster>());
+        let cache = point_cache(&app, light);
+        assert!(cache.is_cached(), "a still light settles in its second frame");
+        // Settled casters are in the faces' static lists, not their lists.
+        let mut both = vec![settled, across];
+        both.sort_unstable();
+        assert_eq!(cache.face(0).static_entities(), &both[..]);
+        assert_eq!(cache.face(4).static_entities(), &[across][..]);
+        assert!(cache.face(1).static_entities().is_empty());
+        assert!(face_list(&app, light, 0).is_empty());
+        let revisions: Vec<u64> = cache.faces().iter().map(ShadowViewCache::static_revision).collect();
+        acknowledge(&app, light);
+        step(&mut app, 0.016);
+        assert!(!point_cache(&app, light).face(0).statics_walked());
+
+        // The caster across the edge moves: live, listed in both faces with
+        // tiles in both; each face it was settled in redraws.
+        *app.world_mut().get_mut::<GlobalTransform>(across).unwrap() =
+            GlobalTransform::from_xyz(5.0, 0.1, -5.0);
+        step(&mut app, 0.016);
+        let cache = point_cache(&app, light);
+        assert!(!app.world().entity(across).contains::<StaticShadowCaster>());
+        for face in [0, 4] {
+            assert_eq!(face_list(&app, light, face), vec![across], "face {face}");
+            assert!(!cache.face(face).movers_tiles().is_empty(), "face {face}");
+            assert_eq!(cache.face(face).live_casters(), 1);
+            assert!(
+                cache.face(face).static_revision() > revisions[face],
+                "face {face} redraws its static layer"
+            );
+            assert!(!cache.face(face).static_entities().contains(&across));
+        }
+        for face in [1, 2, 3, 5] {
+            assert!(face_list(&app, light, face).is_empty(), "face {face}");
+            assert!(cache.face(face).movers_tiles().is_empty(), "face {face}");
+            assert_eq!(
+                cache.face(face).static_revision(),
+                revisions[face],
+                "face {face} keeps its static layer"
+            );
+        }
+        // Its tiles fall on the side of each face's map toward the other
+        // face, as the face views render (`looking_at`: right is up x back):
+        // on +X world -Z is left (u < 0.5); on world -Z, +X is right.
+        let u_of = |face: usize| {
+            let mut runs = Vec::new();
+            cache
+                .face(face)
+                .movers_tiles()
+                .for_each_run(|rect| runs.push(rect));
+            runs[0].min.x as f32 / cache.face(face).movers_tiles().size() as f32
+        };
+        assert!(u_of(0) < 0.5 && u_of(4) > 0.5);
+    }
+
+    #[test]
+    fn a_moved_point_light_is_drawn_whole_until_it_settles() {
+        let (mut app, light) = point_app();
+        caster(&mut app, Vec3::new(6.0, 0.0, 0.0), Vec3::splat(0.5));
+        step(&mut app, 0.016);
+        step(&mut app, 0.016);
+        assert!(point_cache(&app, light).is_cached());
+        let revision = point_cache(&app, light).face(0).static_revision();
+        // Rotation doesn't count (Bevy ignores it).
+        *app.world_mut().get_mut::<GlobalTransform>(light).unwrap() =
+            GlobalTransform::from_rotation(bevy_math::Quat::from_rotation_y(0.3));
+        step(&mut app, 0.016);
+        assert!(point_cache(&app, light).is_cached());
+        // A move: uncached, every caster in its faces' lists, until it was
+        // still for the settle time; then every face redraws.
+        *app.world_mut().get_mut::<GlobalTransform>(light).unwrap() =
+            GlobalTransform::from_xyz(0.0, 0.5, 0.0);
+        step(&mut app, 0.016);
+        assert!(!point_cache(&app, light).is_cached());
+        assert_eq!(face_list(&app, light, 0).len(), 1, "drawn whole");
+        step(&mut app, 0.5);
+        assert!(!point_cache(&app, light).is_cached());
+        step(&mut app, 0.6);
+        let cache = point_cache(&app, light);
+        assert!(cache.is_cached());
+        assert!(face_list(&app, light, 0).is_empty());
+        for face in cache.faces() {
+            assert!(face.static_revision() > revision);
+        }
+    }
+
+    #[test]
+    fn a_settled_caster_leaving_redraws_every_face_it_was_in() {
+        for first_face_only in [false, true] {
+            let (mut app, light) = point_app();
+            app.insert_resource(ShadowCacheFaults {
+                miss_face_invalidation: first_face_only,
+                ..Default::default()
+            });
+            // Across the faces +X (0), +Y (2) and world -Z (4): a corner.
+            let corner = caster(&mut app, Vec3::new(4.0, 4.0, -4.0), Vec3::splat(0.5));
+            step(&mut app, 0.016);
+            step(&mut app, 0.016);
+            step(&mut app, 0.016);
+            let before = point_cache(&app, light);
+            for face in [0, 2, 4] {
+                assert!(before.face(face).static_entities().contains(&corner));
+            }
+            acknowledge(&app, light);
+            step(&mut app, 0.016);
+            assert_eq!(
+                point_cache(&app, light).face(0).static_revision(),
+                before.face(0).static_revision()
+            );
+            app.world_mut().despawn(corner);
+            step(&mut app, 0.016);
+            let after = point_cache(&app, light);
+            let redrawn: Vec<usize> = (0..6)
+                .filter(|&face| {
+                    after.face(face).static_revision() > before.face(face).static_revision()
+                })
+                .collect();
+            if first_face_only {
+                assert_eq!(redrawn, vec![0], "the fault redraws one face");
+            } else {
+                assert_eq!(redrawn, vec![0, 2, 4]);
+            }
+        }
     }
 }

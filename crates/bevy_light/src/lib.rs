@@ -85,12 +85,13 @@ pub use shadow_cache::{
     InvalidateShadowCache, LiveShadowMaterial, LiveShadowMaterials, ShadowCacheCounters,
     ShadowCacheExempt, ShadowCacheFaults, ShadowCacheFeedback, ShadowCacheLoading,
     ShadowCacheSettings, ShadowCacheState, ShadowCacheViewStatus, ShadowCasterChange,
-    ShadowCasterLive, ShadowCasterState, ShadowFootprint, ShadowSubview, ShadowTileMask,
-    ShadowViewCache, ShadowViewId, SpotLightShadowCache, StaticShadowCaster,
+    point_light_face_clip_from_world, PointLightShadowCache, ShadowCasterLive, ShadowCasterState,
+    ShadowFootprint, ShadowSubview, ShadowTileMask, ShadowViewCache, ShadowViewId,
+    SpotLightShadowCache, StaticShadowCaster,
 };
 use shadow_cache::{
-    DirectionalLightSettle, DirectionalShadowProjection, MoversGrid, ShadowViewProjection,
-    SpotShadowProjection,
+    DirectionalLightSettle, DirectionalShadowProjection, MoversGrid, PointShadowProjection,
+    ShadowViewProjection, SpotShadowProjection,
 };
 
 /// Provides gizmo drawing for visualizing light positions.
@@ -204,6 +205,7 @@ impl Plugin for LightPlugin {
             .init_asset::<ScatteringMedium>()
             .register_required_components::<Camera3d, Clusters>()
             .register_required_components::<SpotLight, SpotLightShadowCache>()
+            .register_required_components::<PointLight, PointLightShadowCache>()
             .register_required_components::<DirectionalLight, DirectionalLightShadowCache>()
             .configure_sets(
                 PostUpdate,
@@ -922,6 +924,8 @@ pub fn check_point_light_mesh_visibility(
         &CubemapFrusta,
         &mut CubemapVisibleEntities,
         Option<&RenderLayers>,
+        Option<Mut<PointLightShadowCache>>,
+        Has<ShadowCacheExempt>,
     )>,
     mut spot_lights: Query<(
         &SpotLight,
@@ -938,14 +942,24 @@ pub fn check_point_light_mesh_visibility(
     mut shadow_lod_origin_query: Query<Entity, With<ShadowLodOrigin>>,
     mut point_and_spot_light_query: Query<Entity, Or<(With<PointLight>, With<SpotLight>)>>,
     visible_entity_ranges: Option<Res<VisibleEntityRanges>>,
-    (directional_light_shadow_map, shadow_cache_feedback, shadow_cache_settings, time, faults): (
-        Res<DirectionalLightShadowMap>,
+    (
+        (directional_light_shadow_map, point_light_shadow_map),
+        shadow_cache_feedback,
+        shadow_cache_settings,
+        time,
+        faults,
+    ): (
+        (Res<DirectionalLightShadowMap>, Res<PointLightShadowMap>),
         Res<ShadowCacheFeedback>,
         Res<ShadowCacheSettings>,
         Option<Res<bevy_time::Time>>,
         Option<Res<ShadowCacheFaults>>,
     ),
-    mut cubemap_visible_entities_queue: Local<Parallel<[Vec<Entity>; 6]>>,
+    (mut cubemap_visible_entities_queue, mut point_faces_queue, mut statics_scratch): (
+        Local<Parallel<[Vec<Entity>; 6]>>,
+        Local<Parallel<PointFacesQueue>>,
+        Local<Vec<Entity>>,
+    ),
     mut spot_visible_entities_queue: Local<Parallel<Vec<Entity>>>,
     (mut movers_grid, mut mover_candidates, mut movers_queue, mover_bounds): (
         Local<MoversGrid>,
@@ -968,7 +982,11 @@ pub fn check_point_light_mesh_visibility(
     *frame = frame.wrapping_add(1);
     let frame = *frame;
     let now = time.map_or(core::time::Duration::ZERO, |time| time.elapsed());
-    let stale_ack = faults.is_some_and(|faults| faults.stale_ack);
+    let fault = |pick: fn(&ShadowCacheFaults) -> bool| faults.as_deref().is_some_and(pick);
+    let stale_ack = fault(|faults| faults.stale_ack);
+    let stale_projection = fault(|faults| faults.stale_projection);
+    let wrong_face = fault(|faults| faults.wrong_face);
+    let miss_face_edge = fault(|faults| faults.miss_face_edge);
     // The movers grid, built at the first cached spot light of a frame that
     // uses it: while a light had few movers near it when it was last built,
     // and every 32 frames to see whether one has.
@@ -1006,106 +1024,394 @@ pub fn check_point_light_mesh_visibility(
                 cubemap_frusta,
                 mut cubemap_visible_entities,
                 maybe_view_mask,
+                mut shadow_cache,
+                exempt,
             )) = point_lights.get_mut(light_entity)
             {
+                let view_mask = maybe_view_mask.unwrap_or_default();
+                // MPS: whether the light is cached: the cache on, shadows on,
+                // and what projects its faces settled. A light that changed
+                // is drawn whole every frame until it settles.
+                let projection = PointShadowProjection::new(
+                    transform,
+                    point_light,
+                    view_mask,
+                    point_light_shadow_map.size,
+                );
+                let cached = shadow_cache.as_mut().is_some_and(|cache| {
+                    let settled = cache.bypass_change_detection().settlement.settle(
+                        &projection,
+                        frame,
+                        now,
+                        shadow_cache_settings.settle_time,
+                    );
+                    shadow_cache_settings.enabled
+                        && point_light.shadow_maps_enabled
+                        && !exempt
+                        && settled
+                });
+                if let Some(cache) = shadow_cache.as_mut()
+                    && cache.cached != cached
+                {
+                    cache.cached = cached;
+                    for face in cache.faces.iter_mut() {
+                        face.live_casters = 0;
+                        // Drawn again from scratch once it is cached again
+                        // (the fault keeps what the static layers were drawn
+                        // with).
+                        if !cached && !stale_projection {
+                            face.projection = None;
+                        }
+                    }
+                }
+
                 // NOTE: If shadow mapping is disabled for the light then it must have no visible entities
                 if !point_light.shadow_maps_enabled {
                     continue;
                 }
 
-                let view_mask = maybe_view_mask.unwrap_or_default();
                 let light_sphere = Sphere {
                     center: Vec3A::from(transform.translation()),
                     radius: point_light.range,
                 };
 
-                let check_caster =
-                    |cubemap_visible_entities_local_queue: &mut [Vec<Entity>; 6],
-                     item: PointLightShadowCasterItem| {
-                        let (
-                            entity,
-                            inherited_visibility,
-                            mut view_visibility,
-                            maybe_entity_mask,
-                            maybe_aabb,
-                            maybe_transform,
-                            has_visibility_range,
-                            has_no_frustum_culling,
-                            (.., representation),
-                        ) = item;
-                        // MPS: a far cascade's stand-ins cast only into far
-                        // cascades.
-                        if !inherited_visibility.get()
-                            || !view_takes(false, representation.copied())
-                        {
-                            return;
-                        }
-                        let entity_mask = maybe_entity_mask.unwrap_or_default();
-                        if !view_mask.intersects(entity_mask) {
-                            return;
-                        }
-                        if has_visibility_range
-                            && visible_entity_ranges.is_some_and(|visible_entity_ranges| {
-                                shadow_lod_origin.is_none_or(|shadow_lod_origin| {
-                                    !visible_entity_ranges
-                                        .entity_is_in_range_of_view(entity, shadow_lod_origin)
-                                })
+                // MPS: where a caster can be drawn: `None` if nowhere, else
+                // its bounds grown by what a live material can displace, or
+                // `Some(None)` without bounds (anywhere).
+                let caster_reach = |item: &PointLightShadowCasterItem| -> Option<CasterReach> {
+                    let (
+                        entity,
+                        inherited_visibility,
+                        _,
+                        maybe_entity_mask,
+                        maybe_aabb,
+                        maybe_transform,
+                        has_visibility_range,
+                        has_no_frustum_culling,
+                        (.., live_material, representation),
+                    ) = item;
+                    // MPS: a far cascade's stand-ins cast only into far
+                    // cascades.
+                    if !inherited_visibility.get() || !view_takes(false, representation.copied()) {
+                        return None;
+                    }
+                    let entity_mask = maybe_entity_mask.unwrap_or_default();
+                    if !view_mask.intersects(entity_mask) {
+                        return None;
+                    }
+                    if *has_visibility_range
+                        && visible_entity_ranges.is_some_and(|visible_entity_ranges| {
+                            shadow_lod_origin.is_none_or(|shadow_lod_origin| {
+                                !visible_entity_ranges
+                                    .entity_is_in_range_of_view(*entity, shadow_lod_origin)
                             })
-                        {
-                            return;
+                        })
+                    {
+                        return None;
+                    }
+                    let padded = match (maybe_aabb, maybe_transform) {
+                        (Some(aabb), Some(transform)) if !*has_no_frustum_culling => {
+                            padded_aabb(aabb, &transform.affine(), *live_material)
+                                .map(|aabb| (aabb, transform.affine()))
                         }
+                        _ => None,
+                    };
+                    match padded {
+                        // Do a cheap sphere vs obb test to prune out most meshes outside the sphere of the light
+                        Some((aabb, model_to_world)) => light_sphere
+                            .intersects_obb(&aabb, &model_to_world)
+                            .then_some(Some((aabb, model_to_world))),
+                        None => Some(None),
+                    }
+                };
+                // Whether a caster that can be drawn is in a face's frustum.
+                let in_face = |reach: &CasterReach, face: usize| match reach {
+                    Some((aabb, model_to_world)) => {
+                        cubemap_frusta.frusta[face].intersects_obb(aabb, model_to_world, true, true)
+                    }
+                    None => true,
+                };
 
-                        // If we have an aabb and transform, do frustum culling
-                        if let (Some(aabb), Some(transform)) = (maybe_aabb, maybe_transform) {
-                            let model_to_world = transform.affine();
-                            // Do a cheap sphere vs obb test to prune out most meshes outside the sphere of the light
-                            if !has_no_frustum_culling
-                                && !light_sphere.intersects_obb(&aabb, &model_to_world)
-                            {
+                let Some(mut light_cache) = shadow_cache.filter(|_| cached) else {
+                    let check_caster =
+                        |cubemap_visible_entities_local_queue: &mut [Vec<Entity>; 6],
+                         mut item: PointLightShadowCasterItem| {
+                            let Some(reach) = caster_reach(&item) else {
                                 return;
-                            }
-
-                            for (frustum, visible_entities) in cubemap_frusta
-                                .iter()
-                                .zip(cubemap_visible_entities_local_queue.iter_mut())
+                            };
+                            for (face, visible_entities) in
+                                cubemap_visible_entities_local_queue.iter_mut().enumerate()
                             {
-                                if has_no_frustum_culling
-                                    || frustum.intersects_obb(&aabb, &model_to_world, true, true)
-                                {
-                                    view_visibility.set_visible();
-                                    visible_entities.push(entity);
+                                if in_face(&reach, face) {
+                                    item.2.set_visible();
+                                    visible_entities.push(item.0);
                                 }
                             }
-                        } else {
-                            view_visibility.set_visible();
-                            for visible_entities in cubemap_visible_entities_local_queue.iter_mut()
-                            {
-                                visible_entities.push(entity);
+                        };
+                    // MPS: static and movable casters are separate queries; point
+                    // lights draw both.
+                    movable_casters.par_iter_mut().for_each_init(
+                        || cubemap_visible_entities_queue.borrow_local_mut(),
+                        |queue, item| check_caster(queue, item),
+                    );
+                    static_casters.par_iter_mut().for_each_init(
+                        || cubemap_visible_entities_queue.borrow_local_mut(),
+                        |queue, item| check_caster(queue, item),
+                    );
+
+                    // Collect the entities from each parallel queue.
+                    for (view_dest_index, view_dest) in
+                        cubemap_visible_entities.iter_mut().enumerate()
+                    {
+                        view_dest.entities.clear();
+                        for thread_entity_queue in cubemap_visible_entities_queue.iter_mut() {
+                            view_dest
+                                .entities
+                                .append(&mut thread_entity_queue[view_dest_index]);
+                        }
+                        view_dest.shrink();
+                        view_dest.entities.sort_unstable();
+                    }
+                    continue;
+                };
+
+                // MPS: a cached point light: six shadow views, one per face,
+                // each with its own static layer, revision and live casters.
+                // A change of what projects the light redraws every face.
+                let faces = &mut light_cache.faces;
+                let mut invalidated = [false; 6];
+                for (face, view) in faces.iter_mut().enumerate() {
+                    view.begin();
+                    if !view
+                        .projection
+                        .as_ref()
+                        .is_some_and(|cached| cached.is_point(&projection) || stale_projection)
+                    {
+                        view.invalidated = true;
+                    }
+                    invalidated[face] = mem::take(&mut view.invalidated);
+                    if invalidated[face] {
+                        view.static_revision += 1;
+                        view.projection = Some(ShadowViewProjection::Point(projection.clone()));
+                    }
+                }
+                let map_size = point_light_shadow_map.size as u32;
+                // A light that reaches into no view shades nothing: no face
+                // finds casters, and the render world draws none (as a spot
+                // light). Its faces keep what they hold.
+                let lights_a_view = light_views.lights_a_view(light_entity, &light_sphere);
+                for view in faces.iter_mut() {
+                    view.lights_a_view = lights_a_view;
+                }
+                if !lights_a_view {
+                    for (view, list) in faces.iter_mut().zip(cubemap_visible_entities.iter_mut())
+                    {
+                        view.live_casters = 0;
+                        view.movers_tiles.reset(map_size);
+                        view.statics_walked = false;
+                        if !list.entities.is_empty() {
+                            list.entities.clear();
+                        }
+                    }
+                    continue;
+                }
+                // Per face: whether it has no usable static layer (one list
+                // of every caster, as an uncached light), and whether its
+                // settled casters are walked (until the render world
+                // acknowledged a map drawn from them).
+                let mut single_view = [false; 6];
+                let mut walk_statics = [false; 6];
+                let mut clip_from_world = [bevy_math::Mat4::IDENTITY; 6];
+                for (face, view) in faces.iter_mut().enumerate() {
+                    let id = ShadowViewId {
+                        light: light_entity,
+                        subview: ShadowSubview::PointFace(face as u8),
+                    };
+                    let status = view.status(&shadow_cache_status, &id);
+                    view.single_view = status.is_some_and(|status| status.fallback);
+                    single_view[face] = view.single_view;
+                    walk_statics[face] = !view.single_view
+                        && (invalidated[face]
+                            || status.is_none_or(|status| {
+                                let acknowledged = status.acknowledged_static_revision;
+                                acknowledged != Some(view.static_revision)
+                                    && !(stale_ack
+                                        && acknowledged == Some(view.static_revision - 1))
+                            }));
+                    // The fault: the next face's projection.
+                    let projected = if wrong_face { (face + 1) % 6 } else { face };
+                    clip_from_world[face] = projection.face_clip_from_world(projected);
+                }
+                let near_z = projection.near_z();
+
+                // Movable casters, every frame, into each face they are in,
+                // with where they fall in that face's map. A caster across a
+                // face edge is in both faces.
+                if use_grid && !movers_grid_built {
+                    movers_grid_built = true;
+                    build_movers_grid(&mut movers_grid, &mover_bounds);
+                }
+                mover_candidates.clear();
+                if use_grid {
+                    movers_grid.candidates(
+                        light_sphere.center,
+                        light_sphere.radius,
+                        &mut *mover_candidates,
+                    );
+                }
+                let walk_all = !use_grid || mover_candidates.len() * 4 >= movers_grid.len();
+                found_sparse |= !walk_all;
+                let visit_mover = |queue: &mut PointFacesQueue,
+                                   mut item: PointLightShadowCasterItem| {
+                    let Some(reach) = caster_reach(&item) else {
+                        return;
+                    };
+                    queue.begin(map_size);
+                    // Bounds that may not hold the mesh this frame (skinned
+                    // without updated bounds, morphed) or none cover the
+                    // whole map.
+                    let (skinned, dynamic_skinned_bounds, mesh_morphed, morphed, ..) = item.8;
+                    let bounds_hold = !(mesh_morphed || morphed)
+                        && (!skinned
+                            || (dynamic_skinned_bounds
+                                && item.4.as_ref().is_some_and(Ref::is_changed)));
+                    for face in 0..6 {
+                        if !in_face(&reach, face) {
+                            continue;
+                        }
+                        item.2.set_visible();
+                        queue.lists[face].push(item.0);
+                        queue.live[face] += 1;
+                        if !single_view[face] {
+                            let footprint = match &reach {
+                                Some((aabb, model_to_world)) if bounds_hold => {
+                                    ShadowFootprint::of_box(
+                                        &clip_from_world[face],
+                                        near_z,
+                                        aabb,
+                                        model_to_world,
+                                    )
+                                }
+                                _ => ShadowFootprint::Whole,
+                            };
+                            queue.tiles[face].insert(footprint);
+                        }
+                        if miss_face_edge {
+                            break;
+                        }
+                    }
+                };
+                if walk_all && !few_movers {
+                    movable_casters.par_iter_mut().for_each_init(
+                        || point_faces_queue.borrow_local_mut(),
+                        |queue, item| visit_mover(queue, item),
+                    );
+                } else if walk_all {
+                    let mut queue = point_faces_queue.borrow_local_mut();
+                    for item in movable_casters.iter_mut() {
+                        visit_mover(&mut queue, item);
+                    }
+                } else {
+                    let mut queue = point_faces_queue.borrow_local_mut();
+                    for &entity in mover_candidates.iter() {
+                        if let Ok(item) = movable_casters.get_mut(entity) {
+                            visit_mover(&mut queue, item);
+                        }
+                    }
+                }
+                // Settled casters: into the list of a face without a usable
+                // static layer (counted by a print), into the static list of
+                // a face whose settled casters are walked.
+                if single_view.iter().any(|single| *single)
+                    || walk_statics.iter().any(|walk| *walk)
+                {
+                    static_casters.par_iter_mut().for_each_init(
+                        || point_faces_queue.borrow_local_mut(),
+                        |queue, mut item| {
+                            let Some(reach) = caster_reach(&item) else {
+                                return;
+                            };
+                            queue.begin(map_size);
+                            for face in 0..6 {
+                                if !(single_view[face] || walk_statics[face])
+                                    || !in_face(&reach, face)
+                                {
+                                    continue;
+                                }
+                                item.2.set_visible();
+                                if single_view[face] {
+                                    queue.lists[face].push(item.0);
+                                    queue.prints[face].add(item.0);
+                                } else {
+                                    queue.statics[face].push(item.0);
+                                }
+                            }
+                        },
+                    );
+                }
+
+                // Each face's lists, tiles and revision.
+                for (face, (view, visible_entities)) in faces
+                    .iter_mut()
+                    .zip(cubemap_visible_entities.iter_mut())
+                    .enumerate()
+                {
+                    let list = &mut *list_scratch;
+                    list.clear();
+                    let statics = &mut *statics_scratch;
+                    statics.clear();
+                    let mut tiles = mem::take(&mut view.movers_tiles);
+                    tiles.reset(map_size);
+                    let mut print = StaticCastersPrint::default();
+                    let mut live = 0;
+                    for queue in point_faces_queue.iter_mut().filter(|queue| queue.used) {
+                        list.append(&mut queue.lists[face]);
+                        statics.append(&mut queue.statics[face]);
+                        tiles.union_with(&queue.tiles[face]);
+                        print.merge(mem::take(&mut queue.prints[face]));
+                        live += mem::take(&mut queue.live[face]);
+                    }
+                    list.sort_unstable();
+                    view.live_casters = live;
+                    if visible_entities.entities != *list {
+                        mem::swap(&mut visible_entities.entities, list);
+                    }
+                    if single_view[face] {
+                        // Its tiles are all set while a live caster is in it;
+                        // its settled casters count for the revision by an
+                        // order-free print. The split face's list is found
+                        // again (a new revision) when it has a usable layer.
+                        tiles.reset(map_size);
+                        if live > 0 {
+                            tiles.fill();
+                        }
+                        if view.static_print != Some(print) {
+                            if !invalidated[face] {
+                                view.static_revision += 1;
+                            }
+                            view.static_print = Some(print);
+                        }
+                        view.static_entities.clear();
+                        view.statics_walked = false;
+                    } else {
+                        view.static_print = None;
+                        view.statics_walked = walk_statics[face];
+                        if walk_statics[face] {
+                            statics.sort_unstable();
+                            if *statics != view.static_entities {
+                                // A change that wasn't reported (or the
+                                // first list).
+                                if !invalidated[face] {
+                                    view.static_revision += 1;
+                                }
+                                mem::swap(&mut view.static_entities, statics);
                             }
                         }
-                    };
-                // MPS: static and movable casters are separate queries; point
-                // lights draw both.
-                movable_casters.par_iter_mut().for_each_init(
-                    || cubemap_visible_entities_queue.borrow_local_mut(),
-                    |queue, item| check_caster(queue, item),
-                );
-                static_casters.par_iter_mut().for_each_init(
-                    || cubemap_visible_entities_queue.borrow_local_mut(),
-                    |queue, item| check_caster(queue, item),
-                );
-
-                // Collect the entities from each parallel queue.
-                for (view_dest_index, view_dest) in cubemap_visible_entities.iter_mut().enumerate()
-                {
-                    view_dest.entities.clear();
-                    for thread_entity_queue in cubemap_visible_entities_queue.iter_mut() {
-                        view_dest
-                            .entities
-                            .append(&mut thread_entity_queue[view_dest_index]);
                     }
-                    view_dest.shrink();
-                    view_dest.entities.sort_unstable();
+                    view.movers_tiles = tiles;
+                }
+                for queue in point_faces_queue.iter_mut() {
+                    queue.used = false;
                 }
             }
 
@@ -1366,24 +1672,7 @@ pub fn check_point_light_mesh_visibility(
                 // only those the grid puts near the light.
                 if use_grid && !movers_grid_built {
                     movers_grid_built = true;
-                    movers_grid.build(
-                        mover_bounds
-                            .iter()
-                            .filter(|(_, inherited_visibility, ..)| inherited_visibility.get())
-                            .map(|(entity, _, aabb, transform, no_frustum_culling, live)| {
-                                let bounds = match (aabb, transform) {
-                                    (Some(aabb), Some(transform)) if !no_frustum_culling => {
-                                        let (center, half_extents) =
-                                            MoversGrid::world_bounds(aabb, transform);
-                                        let padding =
-                                            live.map_or(0.0, |live| live.max_displacement);
-                                        Some((center, half_extents + padding))
-                                    }
-                                    _ => None,
-                                };
-                                (entity, bounds)
-                            }),
-                    );
+                    build_movers_grid(&mut movers_grid, &mover_bounds);
                 }
                 mover_candidates.clear();
                 if use_grid {
@@ -1517,6 +1806,63 @@ pub fn check_point_light_mesh_visibility(
     if use_grid {
         *grid_found_sparse = found_sparse;
     }
+}
+
+/// MPS: a caster's reach for a point light's faces (see
+/// [`check_point_light_mesh_visibility`]): its bounds, grown by what a live
+/// material can displace, and its transform, or `None` without bounds.
+type CasterReach = Option<(Aabb, bevy_math::Affine3A)>;
+
+/// MPS: a thread's share of a cached point light's walk in
+/// [`check_point_light_mesh_visibility`]: per face, the casters listed, the
+/// settled casters found, the tiles live casters touch, the print of the
+/// settled casters of a face without a usable static layer, the live count.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct PointFacesQueue {
+    used: bool,
+    lists: [Vec<Entity>; 6],
+    statics: [Vec<Entity>; 6],
+    tiles: [ShadowTileMask; 6],
+    prints: [StaticCastersPrint; 6],
+    live: [u32; 6],
+}
+
+impl PointFacesQueue {
+    /// Clears the thread's share at its first caster of a light.
+    fn begin(&mut self, map_size: u32) {
+        if self.used {
+            return;
+        }
+        self.used = true;
+        for face in 0..6 {
+            self.lists[face].clear();
+            self.statics[face].clear();
+            self.tiles[face].reset(map_size);
+            self.prints[face] = StaticCastersPrint::default();
+            self.live[face] = 0;
+        }
+    }
+}
+
+/// MPS: fills the [`MoversGrid`] from this frame's visible movable casters.
+fn build_movers_grid(movers_grid: &mut MoversGrid, mover_bounds: &MoverBoundsQuery) {
+    movers_grid.build(
+        mover_bounds
+            .iter()
+            .filter(|(_, inherited_visibility, ..)| inherited_visibility.get())
+            .map(|(entity, _, aabb, transform, no_frustum_culling, live)| {
+                let bounds = match (aabb, transform) {
+                    (Some(aabb), Some(transform)) if !no_frustum_culling => {
+                        let (center, half_extents) = MoversGrid::world_bounds(aabb, transform);
+                        let padding = live.map_or(0.0, |live| live.max_displacement);
+                        Some((center, half_extents + padding))
+                    }
+                    _ => None,
+                };
+                (entity, bounds)
+            }),
+    );
 }
 
 /// MPS: for [`check_point_light_mesh_visibility`], the active clustered
