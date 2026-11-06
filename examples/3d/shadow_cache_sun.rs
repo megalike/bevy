@@ -1,5 +1,5 @@
 //! A sun whose far shadow cascade is cached: a stable far projection
-//! ([`StableFarCascade`]) that only a camera translation beyond a guard
+//! ([`StableCascades`]: the far and the middle one) that only a camera translation beyond a guard
 //! moves, the shadow cache on top of it, and a terrain whose camera patches
 //! swap level of detail as the camera moves while the far cascade draws
 //! stable stand-ins ([`ShadowRepresentation`]).
@@ -26,10 +26,10 @@ use bevy::{
     camera::{visibility::VisibleEntities, Viewport},
     diagnostic::FrameCount,
     light::{
-        CascadeShadowConfigBuilder, Cascades, DirectionalLightShadowCache,
+        CascadeShadowConfig, CascadeShadowConfigBuilder, Cascades, DirectionalLightShadowCache,
         DirectionalLightShadowMap, ShadowCacheCounters, ShadowCacheFaults, ShadowCacheFeedback,
-        ShadowCacheLoading, ShadowCacheSettings, ShadowRepresentation, ShadowSubview,
-        StableFarCascade, StableFarProjections,
+        ShadowCacheLoading, ShadowCacheSettings, ShadowCacheState, ShadowRepresentation,
+        ShadowSubview, StableCascadeProjections, StableCascades,
     },
     math::ops,
     mesh::{Indices, PrimitiveTopology},
@@ -78,6 +78,9 @@ const ONE_CAMERA: u32 = 590;
 /// In the single-camera stretch: a fast mover jumps 40 m, then the other goes.
 const JUMP: u32 = 640;
 const GONE: u32 = 680;
+/// Every mover hidden from here to STAND_INS_OFF: the cached cascades must
+/// reach Kept (nothing to restore or draw).
+const NO_MOVERS: u32 = 695;
 
 fn main() -> AppExit {
     let oracle = std::env::args().any(|arg| arg == "--oracle");
@@ -233,10 +236,17 @@ fn setup(
                 DetailTile { center, fine: true },
                 ShadowRepresentation::Detail,
             ));
+            // Stand-ins: a coarse tier for the far cascade, a finer one for
+            // the middle cascade.
             commands.spawn((
                 Mesh3d(meshes.add(tile_mesh(x0, z0, 4))),
                 MeshMaterial3d(ground.clone()),
-                ShadowRepresentation::FarCascadeStandIn,
+                ShadowRepresentation::CascadeStandIn(2),
+            ));
+            commands.spawn((
+                Mesh3d(meshes.add(tile_mesh(x0, z0, 12))),
+                MeshMaterial3d(ground.clone()),
+                ShadowRepresentation::CascadeStandIn(1),
             ));
         }
     }
@@ -321,8 +331,9 @@ fn setup(
         ))
         .id();
     if env("SUN_STABLE").unwrap_or(1) != 0 {
-        commands.entity(sun).insert(StableFarCascade {
-            stand_ins: stand_ins(),
+        commands.entity(sun).insert(StableCascades {
+            count: 2,
+            stand_ins: if stand_ins() { 0b110 } else { 0 },
             ..default()
         });
     }
@@ -427,8 +438,13 @@ mod oracle {
         /// Frames whose state checks failed, with what.
         failed: Vec<(u32, String)>,
         checks: u32,
-        /// Per main-camera frame: the far projection's rebuild count.
-        rebuilds: Vec<(u32, u64)>,
+        /// The main camera's projection rebuild count, by stable cascade.
+        rebuilds: HashMap<usize, u64>,
+        /// By (camera, stable cascade): its rebuild count, the frame it last
+        /// changed, whether the view was cached in that frame.
+        changes: HashMap<(Entity, u32), (u64, u32, bool)>,
+        /// The stable cascades seen Kept while no mover moved.
+        kept: bevy::platform::collections::HashSet<usize>,
         /// The rebuild requests counted at the start of the walk.
         walk_requests: Option<u64>,
         scripted: Vec<(u32, Entity)>,
@@ -451,6 +467,12 @@ mod oracle {
             stale_projection: fault == "stale_projection",
             wrong_cascade: fault == "wrong_cascade",
             miss_recenter: fault == "miss_recenter",
+            miss_recenter_middle: fault == "miss_recenter_middle",
+            no_stagger: fault == "no_stagger",
+            early_view_settle: fault == "early_view_settle",
+            middle_stand_in_routing: fault == "middle_stand_in_routing",
+            stuck_stock: fault == "stuck_stock",
+            no_speed_fallback: fault == "no_speed_fallback",
             ..default()
         };
         if !fault.is_empty() {
@@ -549,8 +571,9 @@ mod oracle {
         mut camera: Query<&mut Transform, With<MainCamera>>,
         mut second: Query<&mut Camera, With<SecondCamera>>,
         mut fast: Query<(Entity, &FastMover, &mut Mover)>,
+        mut movers: Query<&mut Visibility, With<Mover>>,
         mut sun_light: Query<
-            (&mut Transform, Option<&mut StableFarCascade>),
+            (&mut Transform, Option<&mut StableCascades>),
             (With<DirectionalLight>, Without<MainCamera>),
         >,
         mut casters: Query<
@@ -580,9 +603,9 @@ mod oracle {
             }
             if f == STAND_INS_OFF
                 && let Some(stable_far) = stable_far.as_mut()
-                && stable_far.stand_ins
+                && stable_far.stand_ins != 0
             {
-                stable_far.stand_ins = false;
+                stable_far.stand_ins = 0;
             }
         }
         if f == WALK {
@@ -594,6 +617,15 @@ mod oracle {
             }
             if f == GONE && fast.0 == 1 {
                 commands.entity(entity).despawn();
+            }
+        }
+        if f == NO_MOVERS || f == STAND_INS_OFF {
+            for mut visibility in &mut movers {
+                *visibility = if f == NO_MOVERS {
+                    Visibility::Hidden
+                } else {
+                    Visibility::Inherited
+                };
             }
         }
         if let Ok(mut second) = second.single_mut() {
@@ -656,7 +688,8 @@ mod oracle {
         light: Query<(
             Entity,
             &Cascades,
-            (&StableFarCascade, &StableFarProjections),
+            &CascadeShadowConfig,
+            (&StableCascades, &StableCascadeProjections),
             &DirectionalLightShadowCache,
             &bevy::camera::visibility::CascadesVisibleEntities,
         )>,
@@ -675,10 +708,19 @@ mod oracle {
         if !(CHECK_FROM..=CHECK_TO).contains(&f) {
             return;
         }
-        let Ok((light_entity, cascades, (stable_far, projections), cache, visible)) =
+        let Ok((light_entity, cascades, config, (stable_far, projections), cache, visible)) =
             light.single()
         else {
             return;
+        };
+        let count = config.bounds.len();
+        // Each cascade's slice (near, far), with the blend overlap.
+        let slice = |index: usize| {
+            let near = match index {
+                0 => config.minimum_distance,
+                _ => (1.0 - config.overlap_proportion) * config.bounds[index - 1],
+            };
+            (near, config.bounds[index])
         };
         let oracle = &mut *oracle;
         let mut fail = |what: String| oracle.failed.push((f, what));
@@ -691,38 +733,56 @@ mod oracle {
                 fail(format!("camera {camera} has no cascades"));
                 continue;
             };
-            let far = view_cascades.last().unwrap();
-            // Coverage: the far slice (with the blend overlap) in any
-            // orientation is inside the far cascade's map.
-            checks += 1;
+            // Coverage: each stable cascade's slice (with the blend
+            // overlap) in any orientation is inside its map.
             let world_from_view = transform.affine();
-            let corners = projection.get_frustum_corners(-0.8 * (10.0 * 20f32.sqrt()), -200.0);
-            let outside = corners.iter().any(|corner| {
-                let clip =
-                    far.clip_from_world * world_from_view.transform_point3a(*corner).extend(1.0);
-                clip.x.abs() > 1.0 || clip.y.abs() > 1.0
-            });
-            if outside {
-                fail(format!(
-                    "camera {camera}: the far slice leaves the far cascade's map"
-                ));
-            }
-            // The far projection survives a turn.
-            if main {
-                let rebuilds = projections.rebuilds(camera).unwrap_or(0);
-                if (TURN + 1..WALK).contains(&f) {
-                    checks += 1;
-                    if oracle
-                        .rebuilds
-                        .last()
-                        .is_some_and(|&(_, last)| last != rebuilds)
-                    {
-                        fail(format!(
-                            "the far projection moved while the camera only turned ({rebuilds})"
-                        ));
-                    }
+            for index in stable_far.stable(count) {
+                checks += 1;
+                let (near, far_bound) = slice(index);
+                let corners = projection.get_frustum_corners(-near, -far_bound);
+                let outside = corners.iter().any(|corner| {
+                    let clip = view_cascades[index].clip_from_world
+                        * world_from_view.transform_point3a(*corner).extend(1.0);
+                    clip.x.abs() > 1.0 || clip.y.abs() > 1.0
+                });
+                if outside {
+                    fail(format!(
+                        "camera {camera}: the slice of cascade {index} leaves its map"
+                    ));
                 }
-                oracle.rebuilds.push((f, rebuilds));
+                // The projections survive a turn.
+                if main {
+                    let rebuilds = projections.rebuilds(camera, index as u32).unwrap_or(0);
+                    if (TURN + 1..WALK).contains(&f) {
+                        checks += 1;
+                        if oracle
+                            .rebuilds
+                            .get(&index)
+                            .is_some_and(|&last| last != rebuilds)
+                        {
+                            fail(format!(
+                                "cascade {index}'s projection moved while the camera only turned ({rebuilds})"
+                            ));
+                        }
+                    }
+                    oracle.rebuilds.insert(index, rebuilds);
+                }
+                // A view is cached again only once its projection settled: a
+                // view cached in the frame its projection changed stays
+                // uncached for the settle time.
+                let rebuilds = projections.rebuilds(camera, index as u32).unwrap_or(0);
+                let cached_now = cache.view(camera, index as u32).is_some();
+                let key = (camera, index as u32);
+                let entry = oracle.changes.entry(key).or_insert((rebuilds, 0, false));
+                if entry.0 != rebuilds {
+                    *entry = (rebuilds, f, cached_now);
+                }
+                checks += 1;
+                if cached_now && entry.2 && f - entry.1 < SETTLE {
+                    fail(format!(
+                        "camera {camera}: cascade {index} cached in the frame its projection changed"
+                    ));
+                }
             }
             // Stand-ins never reach a camera.
             checks += 1;
@@ -732,27 +792,25 @@ mod oracle {
                 .any(|entity| {
                     matches!(
                         representations.get(*entity),
-                        Ok(ShadowRepresentation::FarCascadeStandIn)
+                        Ok(ShadowRepresentation::CascadeStandIn(_))
                     )
                 })
             {
-                fail(format!("camera {camera} sees a far stand-in"));
+                fail(format!("camera {camera} sees a stand-in"));
             }
-            // The near cascades never draw stand-ins; the far one draws them
-            // instead of the detail when the light selects them.
+            // A stable cascade that selects stand-ins draws its own instead
+            // of the detail; no other cascade draws stand-ins.
             if let Some(lists) = visible.entities.get(&camera) {
                 checks += 1;
-                let last = lists.len() - 1;
                 for (index, list) in lists.iter().enumerate() {
+                    let selects = stable_far.selects_stand_ins(index, lists.len());
                     for entity in &list.entities {
                         let representation = representations.get(*entity).ok();
                         let wrong = match representation {
-                            Some(ShadowRepresentation::FarCascadeStandIn) => {
-                                index != last || !stable_far.stand_ins
+                            Some(ShadowRepresentation::CascadeStandIn(cascade)) => {
+                                selects != Some(*cascade)
                             }
-                            Some(ShadowRepresentation::Detail) => {
-                                index == last && stable_far.stand_ins
-                            }
+                            Some(ShadowRepresentation::Detail) => selects.is_some(),
                             None => false,
                         };
                         if wrong {
@@ -769,13 +827,10 @@ mod oracle {
         // settled casters (the render world draws them only from such a
         // frame's list).
         let statuses = feedback.views();
-        for (camera, view) in cache.views() {
+        for (camera, cascade, view) in cache.views() {
             let id = ShadowViewId {
                 light: light_entity,
-                subview: ShadowSubview::Directional {
-                    camera,
-                    cascade: cache.cascade(),
-                },
+                subview: ShadowSubview::Directional { camera, cascade },
             };
             let acknowledged = statuses
                 .get(&id)
@@ -792,6 +847,69 @@ mod oracle {
                 ));
             }
         }
+        // A camera holding still has every stable cascade cached (each
+        // registered: the audit enumerates the registered views), and with no
+        // mover they reach Kept.
+        if settings.enabled
+            && let Ok((main_camera, ..)) = cameras.iter().find(|(.., main, _, _)| *main).ok_or(())
+        {
+            for index in stable_far.stable(count) {
+                let id = ShadowViewId {
+                    light: light_entity,
+                    subview: ShadowSubview::Directional {
+                        camera: main_camera,
+                        cascade: index as u32,
+                    },
+                };
+                if (SUN_STOP + 3 * SETTLE..STAND_INS_OFF).contains(&f) {
+                    checks += 1;
+                    if cache.view(main_camera, index as u32).is_none() {
+                        fail(format!("the held camera's cascade {index} isn't cached"));
+                    }
+                }
+                if (NO_MOVERS..STAND_INS_OFF).contains(&f)
+                    && statuses
+                        .get(&id)
+                        .is_some_and(|status| status.state == ShadowCacheState::Kept)
+                {
+                    oracle.kept.insert(index);
+                }
+                if f + 1 == STAND_INS_OFF {
+                    checks += 1;
+                    if !oracle.kept.contains(&index) {
+                        fail(format!("cascade {index} never reached Kept without movers"));
+                    }
+                }
+            }
+        }
+        // The speed fallback: in the fast fly the middle window re-centers
+        // every frame or two, so it takes Bevy's projection (stock cost).
+        if let Ok((main_camera, ..)) = cameras.iter().find(|(.., main, _, _)| *main).ok_or(())
+            && (FLY + 20..=CHECK_TO).contains(&f)
+            && count >= 2
+        {
+            checks += 1;
+            if !projections.is_stock(main_camera, count as u32 - 2) {
+                fail("the middle window re-centers every frame or two but isn't stock".into());
+            }
+        }
+        // No settled view waits long for its turn (the longest waiting goes
+        // first: four views take at most four frames).
+        checks += 1;
+        if cache.longest_wait() > 8 {
+            fail(format!(
+                "a settled view waited {} frames to be cached",
+                cache.longest_wait()
+            ));
+        }
+        // At most one view of the light starts being cached in a frame.
+        checks += 1;
+        if cache.entered_this_frame() > 1 {
+            fail(format!(
+                "{} views started being cached in one frame",
+                cache.entered_this_frame()
+            ));
+        }
         // A moving sun is never cached; a still one is, once settled.
         // (The sun first turns in the frame after SUN_MOVE.)
         let moving = (SUN_MOVE + 1..SUN_STOP).contains(&f);
@@ -806,7 +924,10 @@ mod oracle {
         }
         // Camera LOD swaps never redraw the far cascade while it draws
         // stand-ins (only re-centers do, by projection, not by request).
-        if settings.enabled && stable_far.stand_ins && (WALK + 1..CUT).contains(&f) {
+        let all_stand_ins = stable_far
+            .stable(count)
+            .all(|index| stable_far.selects_stand_ins(index, count).is_some());
+        if settings.enabled && all_stand_ins && (WALK + 1..CUT).contains(&f) {
             checks += 1;
             if oracle
                 .walk_requests
@@ -865,7 +986,15 @@ mod oracle {
         // cached (it moved and hasn't settled).
         let unsettled = |frame: u32| {
             (SUN_STEP..SUN_STEP + SETTLE + 4).contains(&frame)
-                || (SUN_MOVE..SUN_STOP + SETTLE + 4).contains(&frame)
+                // (A moving sun re-centers every frame: the speed fallback
+                // keeps Bevy's projection for twice the settle time after.)
+                || (SUN_MOVE..SUN_STOP + 3 * SETTLE + 4).contains(&frame)
+                // (Switching stand-ins off changes every stable view's
+                // projection: they are drawn whole until they settled.)
+                || (STAND_INS_OFF..STAND_INS_OFF + SETTLE + 4).contains(&frame)
+                // (The fast fly re-centers both windows too often: both take
+                // Bevy's projection, uncached.)
+                || frame >= FLY
         };
         let cache_on = env("SUN_ORACLE_CACHE").unwrap_or(1) != 0;
         let incomplete: Vec<u32> = (CHECK_FROM..=CHECK_TO)

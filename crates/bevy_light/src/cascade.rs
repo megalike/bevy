@@ -4,12 +4,13 @@ use bevy_camera::{Camera, Projection};
 use bevy_ecs::{change_detection::DetectChangesMut, entity::EntityHashMap, prelude::*};
 use bevy_math::{ops, Mat4, Vec3A, Vec4};
 use bevy_reflect::prelude::*;
+use bevy_time::Time;
 use bevy_transform::components::GlobalTransform;
 
 use crate::{
     stable_cascade::{far_coverage_radius, FarProjectionInputs, RetainedFarProjection},
-    DirectionalLight, DirectionalLightShadowMap, ShadowSceneBounds, StableFarCascade,
-    StableFarProjections,
+    DirectionalLight, DirectionalLightShadowMap, ShadowSceneBounds, StableCascadeProjections,
+    StableCascades,
 };
 
 /// Controls how cascaded shadow mapping works.
@@ -205,12 +206,21 @@ pub fn build_directional_light_cascades(
         &DirectionalLight,
         &CascadeShadowConfig,
         &mut Cascades,
-        Option<(&StableFarCascade, &mut StableFarProjections)>,
+        Option<(&StableCascades, &mut StableCascadeProjections)>,
     )>,
     scene_bounds: Option<Res<ShadowSceneBounds>>,
     faults: Option<Res<crate::ShadowCacheFaults>>,
+    (time, cache_settings): (Option<Res<Time>>, Option<Res<crate::ShadowCacheSettings>>),
 ) {
-    let recenter = !faults.is_some_and(|faults| faults.miss_recenter);
+    let now = time.map_or(core::time::Duration::ZERO, |time| time.elapsed());
+    let settle_time = cache_settings.map_or(core::time::Duration::from_secs(1), |settings| {
+        settings.settle_time
+    });
+    let fallback_faults = faults.as_ref().map_or((false, false), |faults| {
+        (faults.stuck_stock, faults.no_speed_fallback)
+    });
+    let recenter = !faults.as_ref().is_some_and(|faults| faults.miss_recenter);
+    let recenter_middle = !faults.is_some_and(|faults| faults.miss_recenter_middle);
     let views = views
         .iter()
         .filter_map(|(entity, transform, projection, camera)| {
@@ -229,8 +239,8 @@ pub fn build_directional_light_cascades(
             continue;
         }
         cascades.cascades.clear();
-        // MPS: a stable far cascade needs another cascade for close contacts.
-        // (Its retained state changes without the policy changing.)
+        // MPS: stable cascades need another cascade for close contacts.
+        // (Their retained state changes without the policy changing.)
         let mut stable_far = stable_far
             .as_mut()
             .map(|(policy, projections)| (*policy, projections.bypass_change_detection()))
@@ -238,7 +248,10 @@ pub fn build_directional_light_cascades(
         if let Some((_, projections)) = stable_far.as_mut() {
             projections
                 .retained
-                .retain(|camera, _| views.iter().any(|(view, ..)| view == camera));
+                .retain(|(camera, _), _| views.iter().any(|(view, ..)| view == camera));
+            projections
+                .fallback
+                .retain(|(camera, _), _| views.iter().any(|(view, ..)| view == camera));
         }
 
         // It is very important to the numerical and thus visual stability of shadows that
@@ -258,16 +271,18 @@ pub fn build_directional_light_cascades(
             let near_bounds = [cascades_config.minimum_distance]
                 .into_iter()
                 .chain(far_bounds.clone().map(|bound| overlap_factor * bound));
-            let last = cascades_config.bounds.len() - 1;
+            let count = cascades_config.bounds.len();
             let view_cascades = near_bounds
                 .zip(far_bounds)
                 .enumerate()
                 .map(|(index, (near_bound, far_bound))| {
-                    // MPS: the far cascade's stable projection, kept bit for
-                    // bit while the camera only turns.
-                    if index == last
-                        && let Some((stable_far, projections)) = stable_far.as_mut()
+                    // MPS: a stable cascade's projection, kept bit for bit
+                    // while the camera only turns.
+                    if let Some((stable_far, projections)) = stable_far.as_mut()
+                        && stable_far.is_stable(index, count)
                     {
+                        // (The fault: the middle cascade never re-centers.)
+                        let recenter = recenter && (recenter_middle || index + 2 != count);
                         let inputs = FarProjectionInputs {
                             rotation: transform.rotation(),
                             camera: world_from_view.w_axis.truncate().into(),
@@ -277,12 +292,24 @@ pub fn build_directional_light_cascades(
                             filter_texels: stable_far.filter_texels,
                             scene_bounds,
                         };
-                        let mut retained = projections.retained.remove(&view_entity);
-                        RetainedFarProjection::update(&mut retained, &inputs, recenter);
+                        let key = (view_entity, index as u32);
+                        let mut retained = projections.retained.remove(&key);
+                        let changed =
+                            RetainedFarProjection::update(&mut retained, &inputs, recenter);
                         let retained = retained.expect("built");
                         let cascade = retained.cascade.clone();
-                        projections.retained.insert(view_entity, retained);
-                        return cascade;
+                        projections.retained.insert(key, retained);
+                        // The speed fallback: Bevy's projection while the
+                        // window can't settle.
+                        let stock = projections.fallback.entry(key).or_default().note(
+                            changed,
+                            now,
+                            settle_time,
+                            fallback_faults,
+                        );
+                        if !stock {
+                            return cascade;
+                        }
                     }
                     // Negate bounds as -z is camera forward direction.
                     let corners = projection.get_frustum_corners(-near_bound, -far_bound);

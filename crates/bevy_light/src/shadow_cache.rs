@@ -241,8 +241,8 @@ pub struct ShadowCacheFaults {
     /// Take a cached directional cascade's map for current although another
     /// camera drew its own cascade into the same layer since.
     pub miss_ownership: bool,
-    /// Keep a cached directional cascade's static layer when its projection
-    /// changes (a re-center, a new depth interval).
+    /// Keep a cached directional cascade's view and static layer when its
+    /// projection changes (a re-center, a new depth interval).
     pub stale_projection: bool,
     /// Find where a cached far cascade's live casters fall with the cascade
     /// before it.
@@ -250,6 +250,22 @@ pub struct ShadowCacheFaults {
     /// Never re-center a stable far cascade (a projection fault: its coverage
     /// expires; caught by the coverage check, not by the maps).
     pub miss_recenter: bool,
+    /// Never re-center the middle stable cascade (the one before the last).
+    pub miss_recenter_middle: bool,
+    /// Let every cached directional view of a light that settled enter in
+    /// the same frame (all of them rebuild at once), not one a frame.
+    pub no_stagger: bool,
+    /// Cache a directional view in the frame its projection changed, without
+    /// waiting for it to settle.
+    pub early_view_settle: bool,
+    /// The middle stable cascade draws the far cascade's stand-ins instead
+    /// of its own.
+    pub middle_stand_in_routing: bool,
+    /// A stable cascade that fell back to Bevy's projection never returns.
+    pub stuck_stock: bool,
+    /// A stable cascade never falls back to Bevy's projection, however
+    /// often it re-centers.
+    pub no_speed_fallback: bool,
     /// Not a fault: each cached directional cascade also lists every caster
     /// it draws, found anew each frame, for the audit's reference view
     /// (`bevy_pbr`'s `ShadowCacheAuditPlugin` sets it).
@@ -469,8 +485,8 @@ pub(crate) struct ShadowViewBounds {
     sphere: Option<Sphere>,
     frustum: Frustum,
     layers: RenderLayers,
-    /// It draws far cascade stand-ins instead of their detail.
-    stand_ins: bool,
+    /// The stand-ins it draws instead of the detail.
+    stand_ins: Option<u32>,
 }
 
 impl ShadowViewBounds {
@@ -489,7 +505,7 @@ impl ShadowViewBounds {
             }),
             frustum: *frustum,
             layers,
-            stand_ins: false,
+            stand_ins: None,
         }
     }
 
@@ -499,7 +515,7 @@ impl ShadowViewBounds {
     pub(crate) fn directional(
         frustum: &Frustum,
         layers: RenderLayers,
-        stand_ins: bool,
+        stand_ins: Option<u32>,
     ) -> ShadowViewBounds {
         let mut frustum = *frustum;
         frustum.half_spaces[ViewFrustum::NEAR_PLANE_IDX] = HalfSpace::new(
@@ -1092,14 +1108,14 @@ impl MoversGrid {
 
 /// What decides a cached directional cascade's static layer besides its
 /// casters: its exact projection (a stable far cascade keeps it bit for bit
-/// while the camera only turns), the map size, the layers and whether it
-/// draws far stand-ins.
+/// while the camera only turns), the map size, the layers and the stand-ins
+/// it draws instead of the detail.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DirectionalShadowProjection {
     clip_from_world: [u32; 16],
     map_size: usize,
     render_layers: RenderLayers,
-    stand_ins: bool,
+    stand_ins: Option<u32>,
 }
 
 impl DirectionalShadowProjection {
@@ -1107,7 +1123,7 @@ impl DirectionalShadowProjection {
         clip_from_world: &Mat4,
         map_size: usize,
         render_layers: &RenderLayers,
-        stand_ins: bool,
+        stand_ins: Option<u32>,
     ) -> Self {
         Self {
             clip_from_world: clip_from_world.to_cols_array().map(f32::to_bits),
@@ -1117,8 +1133,8 @@ impl DirectionalShadowProjection {
         }
     }
 
-    /// Whether the view draws far stand-ins instead of their detail.
-    pub(crate) fn stand_ins(&self) -> bool {
+    /// The stand-ins the view draws instead of the detail.
+    pub(crate) fn stand_ins(&self) -> Option<u32> {
         self.stand_ins
     }
 }
@@ -1389,42 +1405,86 @@ impl SpotLightShadowCache {
 }
 
 /// What the main world keeps for a directional light: whether it is cached
-/// (the cache on, the light settled, and a stable far cascade,
-/// [`StableFarCascade`](crate::StableFarCascade)), and the shadow view of its
-/// far cascade for each camera ([`ShadowSubview::Directional`]). Its other
+/// (the cache on, the light settled, and stable cascades,
+/// [`StableCascades`](crate::StableCascades)), and the shadow view of each
+/// stable cascade of each camera ([`ShadowSubview::Directional`]). Its other
 /// cascades are drawn whole every frame. Bevy adds and updates it on every
 /// [`DirectionalLight`](crate::DirectionalLight).
+///
+/// A stable cascade's view follows the rule of lights on its own projection:
+/// one whose projection changed (it re-centered) is drawn whole, with no
+/// cache work, until its projection is unchanged for
+/// [`ShadowCacheSettings::settle_time`]; then it is cached again and drawn
+/// anew once. At most one view of a light starts being cached in a frame, so
+/// a middle and a far cascade never rebuild in the same frame.
 #[derive(Component, Clone, Debug, Default)]
 pub struct DirectionalLightShadowCache {
     /// Whether the light is cached this frame.
     pub(crate) cached: bool,
     pub(crate) settlement: LightSettlement<DirectionalLightSettle>,
-    /// The cached cascade's index (the last one).
-    pub(crate) cascade: u32,
-    /// The cached far cascade's view, by camera.
-    pub(crate) views: EntityHashMap<ShadowViewCache>,
+    /// The stable cascades' views, by camera and cascade.
+    pub(crate) views: HashMap<(Entity, u32), DirectionalViewState>,
+    /// Views that started being cached this frame.
+    pub(crate) entered: u32,
+    /// The longest a settled view has waited for its turn, in frames.
+    pub(crate) longest_wait: u32,
+}
+
+/// A stable cascade's view of a camera ([`DirectionalLightShadowCache`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DirectionalViewState {
+    /// Settles on the view's projection.
+    pub(crate) settlement: LightSettlement<DirectionalShadowProjection>,
+    /// The cached view, while it is cached.
+    pub(crate) view: Option<ShadowViewCache>,
+    /// The frame it settled and started waiting for its turn to be cached.
+    pub(crate) waiting_since: Option<u32>,
+}
+
+/// Of views waiting for their turn (key, the frame each started waiting), the
+/// one that waited longest (the first of equals).
+pub(crate) fn longest_waiting<K: Copy>(views: impl IntoIterator<Item = (K, u32)>) -> Option<K> {
+    let mut oldest: Option<(u32, K)> = None;
+    for (key, since) in views {
+        if oldest.is_none_or(|(first, _)| since < first) {
+            oldest = Some((since, key));
+        }
+    }
+    oldest.map(|(_, key)| key)
 }
 
 impl DirectionalLightShadowCache {
-    /// Whether the light is cached: shadows on, the cache on, a stable far
-    /// cascade, and the light settled.
+    /// Whether the light is cached: shadows on, the cache on, stable
+    /// cascades, and the light settled. Each view is cached once its own
+    /// projection settled ([`Self::view`]).
     pub fn is_cached(&self) -> bool {
         self.cached
     }
 
-    /// The index of the cascade that is cached (the far one).
-    pub fn cascade(&self) -> u32 {
-        self.cascade
+    /// A stable cascade's view of a camera, while it is cached.
+    pub fn view(&self, camera: Entity, cascade: u32) -> Option<&ShadowViewCache> {
+        self.views
+            .get(&(camera, cascade))
+            .and_then(|state| state.view.as_ref())
     }
 
-    /// The far cascade's view for a camera, while the light is cached.
-    pub fn view(&self, camera: Entity) -> Option<&ShadowViewCache> {
-        self.views.get(&camera)
+    /// The cached views: (camera, cascade, view).
+    pub fn views(&self) -> impl Iterator<Item = (Entity, u32, &ShadowViewCache)> {
+        self.views.iter().filter_map(|((camera, cascade), state)| {
+            state.view.as_ref().map(|view| (*camera, *cascade, view))
+        })
     }
 
-    /// The cached views: (camera, view).
-    pub fn views(&self) -> impl Iterator<Item = (Entity, &ShadowViewCache)> {
-        self.views.iter().map(|(camera, view)| (*camera, view))
+    /// How many views started being cached in this frame (at most one, see
+    /// above). For tests.
+    pub fn entered_this_frame(&self) -> u32 {
+        self.entered
+    }
+
+    /// The longest a settled view of the light has waited this frame for its
+    /// turn to be cached, in frames. For tests.
+    pub fn longest_wait(&self) -> u32 {
+        self.longest_wait
     }
 }
 
@@ -1468,11 +1528,61 @@ pub enum ShadowCacheState {
     Dormant,
 }
 
-/// The render world's reports on cached shadow views. Both worlds share it.
+/// How many frames a shadow view spent in each plan since it was first
+/// cached, whatever its generation (for tools: a stand's `stat` or a log
+/// line). The render world counts the plans of the frames whose passes were
+/// planned; the main world counts the frames a stable directional cascade
+/// was drawn whole while its projection settled (or waited for its turn to be
+/// cached again).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShadowViewFrameCounts {
+    /// [`ShadowCacheState::Kept`].
+    pub kept: u64,
+    /// [`ShadowCacheState::Movers`].
+    pub movers: u64,
+    /// [`ShadowCacheState::Restore`].
+    pub restore: u64,
+    /// [`ShadowCacheState::Rebuild`].
+    pub rebuild: u64,
+    /// [`ShadowCacheState::Fallback`].
+    pub fallback: u64,
+    /// [`ShadowCacheState::Dormant`].
+    pub dormant: u64,
+    /// Drawn whole, uncached, while its projection settled.
+    pub settling: u64,
+    /// Drawn whole with Bevy's projection: its stable window couldn't settle
+    /// (the speed fallback, `StableCascadeProjections::is_stock`).
+    pub stock: u64,
+}
+
+impl ShadowViewFrameCounts {
+    /// Counts a frame planned so.
+    pub fn add(&mut self, state: ShadowCacheState) {
+        match state {
+            ShadowCacheState::Kept => self.kept += 1,
+            ShadowCacheState::Movers => self.movers += 1,
+            ShadowCacheState::Restore => self.restore += 1,
+            ShadowCacheState::Rebuild => self.rebuild += 1,
+            ShadowCacheState::Fallback => self.fallback += 1,
+            ShadowCacheState::Dormant => self.dormant += 1,
+        }
+    }
+}
+
+/// The render world's reports on cached shadow views, and every view's frame
+/// counts ([`ShadowViewFrameCounts`]). Both worlds share it.
 #[derive(Resource, Clone, Default)]
-pub struct ShadowCacheFeedback(pub Arc<Mutex<HashMap<ShadowViewId, ShadowCacheViewStatus>>>);
+pub struct ShadowCacheFeedback(
+    pub Arc<Mutex<HashMap<ShadowViewId, ShadowCacheViewStatus>>>,
+    pub Arc<Mutex<HashMap<ShadowViewId, ShadowViewFrameCounts>>>,
+);
 
 impl ShadowCacheFeedback {
+    /// A copy of every view's frame counts.
+    pub fn frame_counts(&self) -> HashMap<ShadowViewId, ShadowViewFrameCounts> {
+        self.1.lock().map(|map| map.clone()).unwrap_or_default()
+    }
+
     /// A copy of the reports on every view.
     pub fn views(&self) -> HashMap<ShadowViewId, ShadowCacheViewStatus> {
         self.0.lock().map(|map| map.clone()).unwrap_or_default()
@@ -2199,9 +2309,12 @@ pub fn invalidate_shadow_caches(
         if !cache.cached {
             continue;
         }
-        let cascade = cache.cascade as usize;
         let light_invalidated = all || invalidated_lights.contains(&light_entity);
-        for (camera, view) in cache.bypass_change_detection().views.iter_mut() {
+        for ((camera, cascade), state) in cache.bypass_change_detection().views.iter_mut() {
+            let cascade = *cascade as usize;
+            let Some(view) = state.view.as_mut() else {
+                continue;
+            };
             if view.invalidated {
                 continue;
             }
@@ -2216,7 +2329,7 @@ pub fn invalidate_shadow_caches(
                     };
                     let stand_ins = match projection {
                         ShadowViewProjection::Directional(projection) => projection.stand_ins(),
-                        ShadowViewProjection::Spot(_) => false,
+                        ShadowViewProjection::Spot(_) => None,
                     };
                     let bounds = ShadowViewBounds::directional(
                         frustum,
@@ -2308,6 +2421,42 @@ mod tests {
         };
         assert_eq!((face.camera(), face.subview_index()), (None, 5));
         assert!(spot != cascade && cascade != face);
+    }
+
+    #[test]
+    fn the_view_that_waited_longest_is_cached_first() {
+        // Two views settle every other frame (a camera that keeps
+        // re-centering), a third is settled all the time; one view is cached a
+        // frame. Taking the first waiting view in walk order would starve the
+        // third; the longest waiting one gets its turn at once.
+        let mut since: [Option<u32>; 3] = [None; 3];
+        let mut cached = [false; 3];
+        let mut first_cached = None;
+        for frame in 0..40u32 {
+            for view in 0..2 {
+                // Re-centered: drawn whole again, its wait starts over.
+                if (frame + view as u32) % 2 == 0 {
+                    cached[view] = false;
+                    since[view] = None;
+                }
+            }
+            let waiting = (0..3)
+                .filter(|view| !cached[*view] && ((frame + *view as u32) % 2 == 1 || *view == 2))
+                .map(|view| (view, *since[view].get_or_insert(frame)));
+            if let Some(view) = longest_waiting(waiting.collect::<Vec<_>>()) {
+                cached[view] = true;
+                since[view] = None;
+                if view == 2 && first_cached.is_none() {
+                    first_cached = Some(frame);
+                }
+            }
+        }
+        assert!(
+            first_cached.is_some_and(|frame| frame <= 2),
+            "{first_cached:?}"
+        );
+        assert_eq!(longest_waiting([(7, 5), (8, 3), (9, 3)]), Some(8));
+        assert_eq!(longest_waiting(core::iter::empty::<(u8, u32)>()), None);
     }
 
     #[test]

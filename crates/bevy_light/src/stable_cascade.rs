@@ -1,5 +1,5 @@
-//! MPS: a stable projection for a directional light's far cascade, opt-in
-//! ([`StableFarCascade`]).
+//! MPS: stable projections for a directional light's far cascades (the far
+//! one, and the middle one), opt-in ([`StableCascades`]).
 //!
 //! Bevy fits every cascade to the camera's frustum slice each frame: its
 //! center follows the camera's rotation and its depth mapping the slice's
@@ -21,78 +21,164 @@ use bevy_camera::{
     visibility::{NoCpuCulling, NotCameraVisible},
     Projection,
 };
-use bevy_ecs::{entity::EntityHashMap, lifecycle::HookContext, prelude::*, world::DeferredWorld};
+use bevy_ecs::{lifecycle::HookContext, prelude::*, world::DeferredWorld};
 use bevy_log::warn_once;
 use bevy_math::{ops, Mat4, Quat, Vec2, Vec3A, Vec4};
 use bevy_mesh::Mesh3d;
+use bevy_platform::collections::HashMap;
 use bevy_reflect::prelude::*;
 use bevy_transform::components::GlobalTransform;
 
 use crate::cascade::Cascade;
 
-/// Opt-in: a [`DirectionalLight`](crate::DirectionalLight)'s last cascade
-/// takes a stable projection that only a camera translation beyond
-/// [`Self::guard`] moves (see the module docs). The other cascades keep
-/// Bevy's projection. Needs at least two cascades; with one, the policy does
-/// nothing (its one cascade covers close contacts too).
+/// Opt-in: a [`DirectionalLight`](crate::DirectionalLight)'s last
+/// [`Self::count`] cascades take stable projections that only a camera
+/// translation beyond [`Self::guard`] moves (see the module docs); the others
+/// keep Bevy's projection. The first cascade always keeps Bevy's (it covers
+/// close contacts), so a light with one cascade has none stable. Each stable
+/// cascade covers its own slice, so the windows nest (the middle one inside
+/// the far one) and Bevy's cascade bounds, overlap and blend are unchanged.
 ///
-/// The stable cascade covers a larger area than Bevy's fitted one, so its
+/// A stable cascade covers a larger area than Bevy's fitted one, so its
 /// texels are larger (about `2 (1 + guard) r / D₀` times, `r` being the
-/// distance to the slice's far corners and `D₀` Bevy's diameter).
+/// distance to its slice's far corners and `D₀` Bevy's diameter).
 #[derive(Component, Clone, Debug, Reflect)]
 #[reflect(Component, Default, Debug, Clone)]
-#[require(StableFarProjections)]
-pub struct StableFarCascade {
-    /// How far the camera may move from the projection's center before it
-    /// re-centers, as a share of the coverage radius (the distance from the
-    /// camera to the far slice's corners).
+#[require(StableCascadeProjections)]
+pub struct StableCascades {
+    /// How many cascades, counted from the far one, are stable: 1 the far
+    /// one, 2 the middle one too.
+    pub count: u32,
+    /// How far the camera may move from a projection's center before it
+    /// re-centers, as a share of that cascade's coverage radius (the
+    /// distance from the camera to its slice's far corners).
     pub guard: f32,
     /// Texels kept at every edge beyond the coverage, for the receivers'
     /// filter taps and normal bias.
     pub filter_texels: f32,
-    /// The far cascade draws the casters marked as its stand-ins
-    /// ([`ShadowRepresentation::FarCascade`](crate::ShadowRepresentation))
-    /// instead of those marked as their detail
-    /// ([`ShadowRepresentation::Detail`](crate::ShadowRepresentation)).
-    /// Unmarked casters cast into every cascade either way.
-    pub stand_ins: bool,
+    /// Bit `i`: stable cascade `i` draws the casters marked as its stand-ins
+    /// ([`ShadowRepresentation::CascadeStandIn`]`(i)`) instead of those
+    /// marked as their detail ([`ShadowRepresentation::Detail`]). Unmarked
+    /// casters cast into every cascade either way. A bit of a cascade that
+    /// isn't stable does nothing.
+    pub stand_ins: u32,
 }
 
-/// The retained far projection of each camera of a light with
-/// [`StableFarCascade`] (added with it).
-#[derive(Component, Clone, Debug, Default)]
-pub struct StableFarProjections {
-    pub(crate) retained: EntityHashMap<RetainedFarProjection>,
-}
-
-impl Default for StableFarCascade {
+impl Default for StableCascades {
     fn default() -> Self {
         Self {
+            count: 1,
             guard: 0.125,
             filter_texels: 8.0,
-            stand_ins: false,
+            stand_ins: 0,
         }
     }
 }
 
-impl StableFarProjections {
-    /// How many times a camera's far projection was (re)built since the
-    /// light got the policy: a new sun direction, a re-center, a new depth
-    /// interval or a new camera projection. For tools and tests.
-    pub fn rebuilds(&self, camera: Entity) -> Option<u64> {
-        self.retained.get(&camera).map(|retained| retained.rebuilds)
+impl StableCascades {
+    /// Whether cascade `index` of `cascades` is stable.
+    pub fn is_stable(&self, index: usize, cascades: usize) -> bool {
+        let count = (self.count as usize).min(cascades.saturating_sub(1));
+        index < cascades && index + count >= cascades
+    }
+
+    /// The stable cascades' indices among `cascades`.
+    pub fn stable(&self, cascades: usize) -> impl Iterator<Item = usize> + '_ {
+        (0..cascades).filter(move |index| self.is_stable(*index, cascades))
+    }
+
+    /// The stand-ins cascade `index` of `cascades` draws instead of the
+    /// detail, if it does: `Some(index)`.
+    pub fn selects_stand_ins(&self, index: usize, cascades: usize) -> Option<u32> {
+        (self.is_stable(index, cascades) && index < 32 && self.stand_ins & (1 << index) != 0)
+            .then_some(index as u32)
+    }
+}
+
+/// The retained stable projection of each camera and stable cascade of a
+/// light with [`StableCascades`] (added with it).
+#[derive(Component, Clone, Debug, Default)]
+pub struct StableCascadeProjections {
+    pub(crate) retained: HashMap<(Entity, u32), RetainedFarProjection>,
+    /// Whether each view uses Bevy's fitted projection for now.
+    pub(crate) fallback: HashMap<(Entity, u32), SpeedFallback>,
+}
+
+/// A stable cascade's speed fallback: while its window re-centers again
+/// sooner than the settle time after the last re-center (the camera moves
+/// too fast for the view to settle, so it would be drawn whole every frame,
+/// with a window larger than Bevy's), the cascade takes Bevy's fitted
+/// projection instead, at stock cost. It returns to the stable window once
+/// the window held for twice the settle time (hysteresis). The stable window
+/// is still followed meanwhile, to know when it would hold.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpeedFallback {
+    last_change: Option<core::time::Duration>,
+    stock: bool,
+}
+
+impl SpeedFallback {
+    /// Notes this frame (whether the stable window changed) and returns
+    /// whether the cascade uses Bevy's projection. `stuck` and `never` are
+    /// faults (never return, never fall back).
+    pub(crate) fn note(
+        &mut self,
+        changed: bool,
+        now: core::time::Duration,
+        settle_time: core::time::Duration,
+        (stuck, never): (bool, bool),
+    ) -> bool {
+        if changed {
+            if !never
+                && self
+                    .last_change
+                    .is_some_and(|last| now.saturating_sub(last) < settle_time)
+            {
+                self.stock = true;
+            }
+            self.last_change = Some(now);
+        } else if self.stock
+            && !stuck
+            && self
+                .last_change
+                .is_none_or(|last| now.saturating_sub(last) >= settle_time * 2)
+        {
+            self.stock = false;
+        }
+        self.stock
+    }
+}
+
+impl StableCascadeProjections {
+    /// Whether a camera's stable cascade uses Bevy's fitted projection for
+    /// now (its speed fallback): it can't settle, so it is drawn whole at
+    /// stock cost.
+    pub fn is_stock(&self, camera: Entity, cascade: u32) -> bool {
+        self.fallback
+            .get(&(camera, cascade))
+            .is_some_and(|fallback| fallback.stock)
+    }
+
+    /// How many times a camera's projection of a stable cascade was (re)built
+    /// since the light got the policy: a new sun direction, a re-center, a
+    /// new depth interval or a new camera projection. For tools and tests.
+    pub fn rebuilds(&self, camera: Entity, cascade: u32) -> Option<u64> {
+        self.retained
+            .get(&(camera, cascade))
+            .map(|retained| retained.rebuilds)
     }
 }
 
 /// MPS: which shadow views a mesh casts into, besides its render layers: a
-/// mesh can stand in for others in the far cascade of lights that select
-/// stand-ins ([`StableFarCascade::stand_ins`]). Meshes without it cast into
-/// every shadow view.
+/// mesh can stand in for others in a stable cascade of lights that select
+/// stand-ins for it ([`StableCascades::stand_ins`]). Meshes without it cast
+/// into every shadow view.
 ///
-/// | View | [`Self::Detail`] | [`Self::FarCascadeStandIn`] |
+/// | View | [`Self::Detail`] | [`Self::CascadeStandIn`]`(i)` |
 /// | --- | --- | --- |
 /// | cameras | drawn | not drawn ([`NotCameraVisible`], inserted with it) |
-/// | far cascade of a light selecting stand-ins | not drawn | drawn |
+/// | stable cascade `i` of a light selecting stand-ins there | not drawn | drawn |
+/// | another stable cascade selecting stand-ins | not drawn | not drawn |
 /// | other cascades, spot and point lights | drawn | not drawn |
 ///
 /// The selection belongs to the shadow view, never to the shadow cache: a
@@ -103,14 +189,15 @@ impl StableFarProjections {
 #[reflect(Component, Default, Debug, Clone, PartialEq)]
 #[component(on_insert = on_insert_shadow_representation)]
 pub enum ShadowRepresentation {
-    /// The detail a far cascade's stand-ins replace (terrain patches the
-    /// camera selects): cast into every shadow view except the far cascades
-    /// of lights that select stand-ins.
+    /// The detail the stand-ins replace (terrain patches the camera
+    /// selects): cast into every shadow view except the stable cascades that
+    /// select stand-ins.
     #[default]
     Detail,
-    /// A stand-in cast only into the far cascades of lights that select
-    /// stand-ins; never drawn by cameras.
-    FarCascadeStandIn,
+    /// A stand-in for cascade `i` (the far one of three is 2, the middle one
+    /// 1): cast only into that cascade of lights that select stand-ins for
+    /// it; never drawn by cameras.
+    CascadeStandIn(u32),
 }
 
 fn on_insert_shadow_representation(mut world: DeferredWorld, context: HookContext) {
@@ -120,30 +207,32 @@ fn on_insert_shadow_representation(mut world: DeferredWorld, context: HookContex
             "ShadowRepresentation on an entity with NoCpuCulling is ignored on the GPU culling path"
         );
     }
-    if world.get::<ShadowRepresentation>(entity) == Some(&ShadowRepresentation::FarCascadeStandIn)
-        && world.get::<NotCameraVisible>(entity).is_none()
+    if matches!(
+        world.get::<ShadowRepresentation>(entity),
+        Some(ShadowRepresentation::CascadeStandIn(_))
+    ) && world.get::<NotCameraVisible>(entity).is_none()
     {
         world.commands().entity(entity).insert(NotCameraVisible);
     }
 }
 
 /// Whether a shadow view draws a caster of this representation (`None`:
-/// unmarked). `selects_stand_ins`: the view is the far cascade of a light
-/// that selects stand-ins.
+/// unmarked). `selects`: the stand-ins the view draws instead of the detail
+/// (`Some(i)` for stable cascade `i` of a light that selects them there).
 pub(crate) fn view_takes(
-    selects_stand_ins: bool,
+    selects: Option<u32>,
     representation: Option<ShadowRepresentation>,
 ) -> bool {
     match representation {
         None => true,
-        Some(ShadowRepresentation::Detail) => !selects_stand_ins,
-        Some(ShadowRepresentation::FarCascadeStandIn) => selects_stand_ins,
+        Some(ShadowRepresentation::Detail) => selects.is_none(),
+        Some(ShadowRepresentation::CascadeStandIn(cascade)) => selects == Some(cascade),
     }
 }
 
 /// The world-space bounds of every mesh, grown as meshes move or appear and
 /// never shrunk (until [`Self::reset`]): the depth interval of stable far
-/// cascades covers them. Kept only while a light has [`StableFarCascade`].
+/// cascades covers them. Kept only while a light has [`StableCascades`].
 #[derive(Resource, Clone, Debug, Default)]
 pub struct ShadowSceneBounds {
     bounds: Option<(Vec3A, Vec3A)>,
@@ -270,7 +359,7 @@ pub(crate) struct RetainedFarProjection {
     /// The light-space depth interval (low, high; high faces the light).
     depth: (f32, f32),
     pub(crate) cascade: Cascade,
-    /// Times built (see [`StableFarCascade::rebuilds`]).
+    /// Times built (see [`StableCascadeProjections::rebuilds`]).
     rebuilds: u64,
 }
 
@@ -707,22 +796,126 @@ mod tests {
     #[test]
     fn views_take_casters_by_representation() {
         use ShadowRepresentation::*;
-        for selects in [false, true] {
+        for selects in [None, Some(1), Some(2)] {
             assert!(
                 view_takes(selects, None),
                 "unmarked casters cast everywhere"
             );
         }
-        assert!(view_takes(false, Some(Detail)));
-        assert!(!view_takes(true, Some(Detail)));
-        assert!(!view_takes(false, Some(FarCascadeStandIn)));
-        assert!(view_takes(true, Some(FarCascadeStandIn)));
+        assert!(view_takes(None, Some(Detail)));
+        assert!(!view_takes(Some(2), Some(Detail)));
+        assert!(!view_takes(None, Some(CascadeStandIn(2))));
+        assert!(view_takes(Some(2), Some(CascadeStandIn(2))));
+        // Each stable cascade takes only its own stand-ins.
+        assert!(view_takes(Some(1), Some(CascadeStandIn(1))));
+        assert!(!view_takes(Some(1), Some(CascadeStandIn(2))));
+        assert!(!view_takes(Some(2), Some(CascadeStandIn(1))));
+    }
+
+    #[test]
+    fn the_speed_fallback_takes_stock_while_the_window_cant_settle() {
+        use core::time::Duration;
+        let settle = Duration::from_millis(1000);
+        let at = Duration::from_millis;
+        let mut fallback = SpeedFallback::default();
+        let no = (false, false);
+        // The first window, then a re-center 1.5 s later: it settled between.
+        assert!(!fallback.note(true, at(0), settle, no));
+        assert!(!fallback.note(false, at(500), settle, no));
+        assert!(!fallback.note(true, at(1500), settle, no));
+        // Re-centers every 0.4 s (flight): stock from the second one on, and
+        // it stays stock while they go on.
+        assert!(fallback.note(true, at(1900), settle, no));
+        for step in 1..10 {
+            assert!(fallback.note(true, at(1900 + 400 * step), settle, no));
+            assert!(fallback.note(false, at(2100 + 400 * step), settle, no));
+        }
+        // Slowed down: still stock one settle time after the last re-center
+        // (hysteresis), stable again after two.
+        let last = 1900 + 400 * 9;
+        assert!(fallback.note(false, at(last + 1000), settle, no));
+        assert!(fallback.note(false, at(last + 1999), settle, no));
+        assert!(!fallback.note(false, at(last + 2000), settle, no));
+        // The faults: never returning, never falling back.
+        let mut stuck = SpeedFallback::default();
+        stuck.note(true, at(0), settle, (true, false));
+        assert!(stuck.note(true, at(100), settle, (true, false)));
+        assert!(stuck.note(false, at(60_000), settle, (true, false)));
+        let mut never = SpeedFallback::default();
+        never.note(true, at(0), settle, (false, true));
+        assert!(!never.note(true, at(100), settle, (false, true)));
+    }
+
+    #[test]
+    fn stable_cascades_count_from_the_far_one() {
+        let far = StableCascades::default();
+        assert_eq!(far.stable(3).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(far.stable(1).count(), 0, "the first cascade stays Bevy's");
+        let both = StableCascades {
+            count: 2,
+            stand_ins: 0b110,
+            ..Default::default()
+        };
+        assert_eq!(both.stable(3).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(both.stable(4).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(both.stable(2).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(both.selects_stand_ins(1, 3), Some(1));
+        assert_eq!(both.selects_stand_ins(2, 3), Some(2));
+        assert_eq!(both.selects_stand_ins(0, 3), None);
+        // A bit of a cascade that isn't stable does nothing.
+        assert_eq!(both.selects_stand_ins(1, 4), None);
+        let many = StableCascades {
+            count: 9,
+            ..Default::default()
+        };
+        assert_eq!(many.stable(4).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn the_middle_window_nests_in_the_far_one() {
+        // Crater-like: 3 cascades to 3000 m, the middle slice 16-245 m, the
+        // far 196-3000 m: each window covers its own slice in any
+        // orientation, and the middle one lies inside the far one.
+        let rotation = sun(35.0);
+        let camera = Vec3A::new(5.0, 3.0, -7.0);
+        let projection = projection();
+        let window = |near: f32, far: f32| {
+            let mut retained = None;
+            let mut inputs = inputs(rotation, camera, crater());
+            inputs.radius = far_coverage_radius(&projection, near, far);
+            RetainedFarProjection::update(&mut retained, &inputs, true);
+            retained.unwrap()
+        };
+        let middle = window(16.0, 245.0);
+        let far = window(196.0, 3000.0);
+        assert!(middle.texel < far.texel);
+        let half = |w: &RetainedFarProjection| 0.5 * w.diameter;
+        assert!((middle.center - far.center).abs().max_element() + half(&middle) <= half(&far));
+        // Turning keeps both.
+        let mut random = numbers(3);
+        for _ in 0..50 {
+            let world_from_view = Affine3A::from_rotation_translation(
+                Quat::from_euler(
+                    EulerRot::YXZ,
+                    random.next().unwrap() * 6.3,
+                    (random.next().unwrap() - 0.5) * 3.1,
+                    0.0,
+                ),
+                camera.into(),
+            );
+            for (w, near, far_bound) in [(&middle, 16.0, 245.0), (&far, 196.0, 3000.0)] {
+                for corner in projection.get_frustum_corners(-near, -far_bound) {
+                    let point = clip(&w.cascade, world_from_view.transform_point3a(corner));
+                    assert!(point.x.abs() <= 1.0 && point.y.abs() <= 1.0);
+                }
+            }
+        }
     }
 
     #[test]
     fn a_stand_in_is_never_camera_visible() {
         let mut world = World::new();
-        let stand_in = world.spawn(ShadowRepresentation::FarCascadeStandIn).id();
+        let stand_in = world.spawn(ShadowRepresentation::CascadeStandIn(2)).id();
         let detail = world.spawn(ShadowRepresentation::Detail).id();
         world.flush();
         assert!(world.get::<NotCameraVisible>(stand_in).is_some());
@@ -730,7 +923,7 @@ mod tests {
         // Made a stand-in later.
         world
             .entity_mut(detail)
-            .insert(ShadowRepresentation::FarCascadeStandIn);
+            .insert(ShadowRepresentation::CascadeStandIn(1));
         world.flush();
         assert!(world.get::<NotCameraVisible>(detail).is_some());
     }

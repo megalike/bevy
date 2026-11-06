@@ -378,14 +378,11 @@ fn extract_audit_pairs(
         .iter()
         .filter(|(_, _, cache)| cache.is_cached())
         .flat_map(|(light, render_light, cache)| {
-            cache.views().map(move |(camera, _)| {
+            cache.views().map(move |(camera, cascade, _)| {
                 (
                     ShadowViewId {
                         light,
-                        subview: ShadowSubview::Directional {
-                            camera,
-                            cascade: cache.cascade(),
-                        },
+                        subview: ShadowSubview::Directional { camera, cascade },
                     },
                     render_light,
                 )

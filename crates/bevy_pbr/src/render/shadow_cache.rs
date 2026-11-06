@@ -1771,6 +1771,11 @@ pub(crate) fn acknowledge_shadow_caches(
     live.clear();
     live.extend(caches.views.keys().copied());
     reported.retain(|id| !live.contains(id));
+    if let Ok(mut counts) = feedback.1.lock() {
+        for (id, status) in statuses.iter() {
+            counts.entry(*id).or_default().add(status.state);
+        }
+    }
     let Ok(mut map) = feedback.0.lock() else {
         return;
     };

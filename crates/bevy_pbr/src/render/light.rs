@@ -131,10 +131,10 @@ pub struct ExtractedDirectionalLight {
     pub occlusion_culling: bool,
     pub sun_disk_angular_size: f32,
     pub sun_disk_intensity: f32,
-    /// MPS: the cached far cascade's view of each camera (by the camera's
-    /// render entity), while the light is cached.
+    /// MPS: the cached stable cascades' views, by the camera's render entity
+    /// and the cascade, while the light is cached.
     #[doc(hidden)]
-    pub cached_views: EntityHashMap<ExtractedShadowView>,
+    pub cached_views: HashMap<(Entity, u32), ExtractedShadowView>,
 }
 
 // NOTE: These must match the bit flags in bevy_pbr/src/render/mesh_view_types.wesl!
@@ -836,7 +836,7 @@ pub fn extract_lights(
         let mut extracted_cascades = EntityHashMap::default();
         let mut extracted_frusta = EntityHashMap::default();
         // MPS: the cached far cascades, by the camera's render entity.
-        let mut cached_views = EntityHashMap::default();
+        let mut cached_views = HashMap::default();
         let shadow_cache = shadow_cache.filter(|cache| cache.is_cached());
 
         if directional_light.shadow_maps_enabled {
@@ -876,36 +876,35 @@ pub fn extract_lights(
             for (main_auxiliary_entity, visible_mesh_entities_list) in
                 visible_entities.entities.iter()
             {
-                // MPS: the camera's cached far cascade, if any: its movers and
-                // static views draw two lists (one, with every caster, while it
-                // has no usable static layer).
-                let cached_view = shadow_cache.and_then(|cache| {
-                    cache
-                        .view(*main_auxiliary_entity)
-                        .map(|view| (cache.cascade(), view))
-                });
-                if let Some((cascade, view)) = cached_view
-                    && let Ok(camera_render_entity) = mapper.get(*main_auxiliary_entity)
-                {
-                    cached_views.insert(
-                        **camera_render_entity,
-                        ExtractedShadowView::new(
-                            ShadowViewId {
-                                light: main_entity,
-                                subview: ShadowSubview::Directional {
-                                    camera: *main_auxiliary_entity,
-                                    cascade,
-                                },
-                            },
-                            view,
-                        ),
-                    );
-                }
                 for subview_index in 0..(cascade_config.bounds.len() as u32) {
                     let visible_mesh_entities = visible_mesh_entities_list
                         .get(subview_index as usize)
                         .map(|list| &list.entities[..]);
-                    let cached_here = cached_view.filter(|(cascade, _)| *cascade == subview_index);
+                    // MPS: the camera's cached stable cascade, if this is one:
+                    // its movers and static views draw two lists (one, with
+                    // every caster, while it has no usable static layer).
+                    let cached_here = shadow_cache.and_then(|cache| {
+                        cache
+                            .view(*main_auxiliary_entity, subview_index)
+                            .map(|view| (subview_index, view))
+                    });
+                    if let Some((cascade, view)) = cached_here
+                        && let Ok(camera_render_entity) = mapper.get(*main_auxiliary_entity)
+                    {
+                        cached_views.insert(
+                            (**camera_render_entity, cascade),
+                            ExtractedShadowView::new(
+                                ShadowViewId {
+                                    light: main_entity,
+                                    subview: ShadowSubview::Directional {
+                                        camera: *main_auxiliary_entity,
+                                        cascade,
+                                    },
+                                },
+                                view,
+                            ),
+                        );
+                    }
                     let lists = match cached_here {
                         Some((_, view)) if !view.single_view() => [
                             Some((ShadowViewRole::Movers, visible_mesh_entities)),
@@ -1964,6 +1963,8 @@ pub fn prepare_lights(
 
         let view_layers = maybe_layers.unwrap_or_default();
         let mut view_lights = Vec::new();
+        // MPS: a cached cascade's view slots, reused.
+        let mut slots: Vec<Entity> = Vec::with_capacity(3);
         let mut view_occlusion_culling_lights = Vec::new();
 
         let gpu_preprocessing_mode = gpu_preprocessing_support.min(if !no_indirect_drawing {
@@ -2164,30 +2165,44 @@ pub fn prepare_lights(
                 .zip(frusta)
                 .zip(&light.cascade_shadow_config.bounds);
 
-            // MPS: a view per cascade, then two slots for a cached far
-            // cascade's static and movers views (placeholders while unused).
+            // MPS: a view per cascade, then three slots per cascade for a
+            // cached stable cascade's static, movers and audit reference
+            // views (placeholders while unused).
+            const SLOTS: usize = 3;
             let cascade_count = iter.len();
             let light_view_entities = light_view_entities.entry(entity).or_insert_with(|| {
                 (0..cascade_count)
                     .map(|_| commands.spawn_empty().id())
-                    .chain([Entity::PLACEHOLDER; 2])
+                    .chain(core::iter::repeat_n(
+                        Entity::PLACEHOLDER,
+                        SLOTS * cascade_count,
+                    ))
                     .collect()
             });
-            // (Three cached slots while the audit draws a reference.)
-            if !(cascade_count + 2..=cascade_count + 3).contains(&light_view_entities.len()) {
+            if light_view_entities.len() != (1 + SLOTS) * cascade_count {
                 let entities = mem::take(light_view_entities);
                 despawn_entities(&mut commands, entities);
                 light_view_entities.extend(
                     (0..cascade_count)
                         .map(|_| commands.spawn_empty().id())
-                        .chain([Entity::PLACEHOLDER; 2]),
+                        .chain(core::iter::repeat_n(
+                            Entity::PLACEHOLDER,
+                            SLOTS * cascade_count,
+                        )),
                 );
             }
-            let cached_view = light.cached_views.get(&entity);
             let mut cached_slots = light_view_entities.split_off(cascade_count);
-            if cached_view.is_none() {
-                despawn_entities(&mut commands, mem::take(&mut cached_slots));
-                cached_slots = vec![Entity::PLACEHOLDER; 2];
+            // The slots of cascades not cached this frame go.
+            for (cascade_index, slots) in cached_slots.chunks_mut(SLOTS).enumerate() {
+                if !light
+                    .cached_views
+                    .contains_key(&(entity, cascade_index as u32))
+                {
+                    if slots.iter().any(|slot| *slot != Entity::PLACEHOLDER) {
+                        despawn_entities(&mut commands, slots.to_vec());
+                    }
+                    slots.fill(Entity::PLACEHOLDER);
+                }
             }
 
             for (cascade_index, (((cascade, frustum), bound), view_light_entity)) in
@@ -2240,9 +2255,7 @@ pub fn prepare_lights(
                 // MPS: a cached far cascade plans its frame and sets up its
                 // own views (static, then movers), drawn in this camera's
                 // shadow pass in that order.
-                if let Some(extracted) = cached_view
-                    .filter(|extracted| extracted.id.subview_index() == cascade_index as u32)
-                {
+                if let Some(extracted) = light.cached_views.get(&(entity, cascade_index as u32)) {
                     // The cascade's own view must not keep its key while the
                     // cached views draw (a single view takes the same key).
                     commands
@@ -2250,6 +2263,16 @@ pub fn prepare_lights(
                         .remove::<(ShadowView, ExtractedView, LightEntity)>();
                     let pass_name =
                         format!("shadow_directional_light_{light_index}_cascade_{cascade_index}");
+                    // The view's slots: two, or three with the audit's
+                    // reference.
+                    let stored = &mut cached_slots[SLOTS * cascade_index..][..SLOTS];
+                    let used = if extracted.reference { 3 } else { 2 };
+                    if used < SLOTS && stored[2] != Entity::PLACEHOLDER {
+                        despawn_entities(&mut commands, vec![stored[2]]);
+                        stored[2] = Entity::PLACEHOLDER;
+                    }
+                    slots.clear();
+                    slots.extend_from_slice(&stored[..used]);
                     spot_shadow_caches.prepare_view(
                         &mut commands,
                         CachedShadowView {
@@ -2280,7 +2303,7 @@ pub fn prepare_lights(
                                 }),
                             faults: shadow_cache_faults.as_deref().copied().unwrap_or_default(),
                         },
-                        &mut cached_slots,
+                        &mut slots,
                         &shadow_cache_settings,
                         (
                             &render_device,
@@ -2291,11 +2314,13 @@ pub fn prepare_lights(
                         &mut live_shadow_mapping_lights,
                     );
                     view_lights.extend(
-                        cached_slots
+                        slots
                             .iter()
                             .copied()
                             .filter(|entity| *entity != Entity::PLACEHOLDER),
                     );
+                    slots.resize(SLOTS, Entity::PLACEHOLDER);
+                    cached_slots[SLOTS * cascade_index..][..SLOTS].copy_from_slice(&slots);
                     continue;
                 }
                 spot_shadow_caches

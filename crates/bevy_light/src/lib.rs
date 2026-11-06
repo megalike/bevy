@@ -60,8 +60,8 @@ mod stable_cascade;
 pub use cascade::{CascadeShadowConfig, CascadeShadowConfigBuilder, Cascades};
 use stable_cascade::view_takes;
 pub use stable_cascade::{
-    update_shadow_scene_bounds, ShadowRepresentation, ShadowSceneBounds, StableFarCascade,
-    StableFarProjections,
+    update_shadow_scene_bounds, ShadowRepresentation, ShadowSceneBounds, StableCascadeProjections,
+    StableCascades,
 };
 mod point_light;
 pub use point_light::{
@@ -86,7 +86,7 @@ pub use shadow_cache::{
     ShadowCacheExempt, ShadowCacheFaults, ShadowCacheFeedback, ShadowCacheLoading,
     ShadowCacheSettings, ShadowCacheState, ShadowCacheViewStatus, ShadowCasterChange,
     ShadowCasterLive, ShadowCasterState, ShadowFootprint, ShadowSubview, ShadowTileMask,
-    ShadowViewCache, ShadowViewId, SpotLightShadowCache, StaticShadowCaster,
+    ShadowViewCache, ShadowViewFrameCounts, ShadowViewId, SpotLightShadowCache, StaticShadowCaster,
 };
 use shadow_cache::{
     DirectionalLightSettle, DirectionalShadowProjection, MoversGrid, ShadowViewProjection,
@@ -282,7 +282,7 @@ impl Plugin for LightPlugin {
                     // MPS: the scene's bounds, for the depth of stable far
                     // cascades, before the cascades are built.
                     update_shadow_scene_bounds
-                        .run_if(any_with_component::<StableFarCascade>)
+                        .run_if(any_with_component::<StableCascades>)
                         .after(VisibilitySystems::CalculateBounds)
                         .after(TransformSystems::Propagate)
                         .before(SimulationLightSystems::UpdateDirectionalLightCascades),
@@ -411,10 +411,11 @@ pub fn check_dir_light_mesh_visibility(
             &mut CascadesVisibleEntities,
             Option<&RenderLayers>,
             &ViewVisibility,
-            Option<&StableFarCascade>,
+            Option<&StableCascades>,
             (
                 Option<Mut<DirectionalLightShadowCache>>,
                 Has<ShadowCacheExempt>,
+                Option<&StableCascadeProjections>,
             ),
         ),
         Without<SpotLight>,
@@ -456,7 +457,7 @@ pub fn check_dir_light_mesh_visibility(
     mut defer_visible_entities_queue: Local<Parallel<Vec<Entity>>>,
     mut view_visible_entities_queue: Local<Parallel<Vec<Vec<Entity>>>>,
     (mut far_queue, mut frame, mut far_scratch): (
-        Local<Parallel<FarCascadeQueue>>,
+        Local<Parallel<Vec<FarCascadeQueue>>>,
         Local<u32>,
         Local<Vec<Entity>>,
     ),
@@ -472,9 +473,18 @@ pub fn check_dir_light_mesh_visibility(
     let stale_projection = faults
         .as_ref()
         .is_some_and(|faults| faults.stale_projection);
-    let wrong_cascade = faults.is_some_and(|faults| faults.wrong_cascade);
+    let wrong_cascade = faults.as_ref().is_some_and(|faults| faults.wrong_cascade);
+    let no_stagger = faults.as_ref().is_some_and(|faults| faults.no_stagger);
+    let early_view_settle = faults
+        .as_ref()
+        .is_some_and(|faults| faults.early_view_settle);
+    let middle_stand_in_routing = faults.is_some_and(|faults| faults.middle_stand_in_routing);
     let map_size = shadow_map.size as u32;
     let mut shadow_cache_status = None;
+    // MPS: the stable views drawn whole while they settle, for their frame
+    // counts.
+    let mut settling: SmallVec<[ShadowViewId; 4]> = SmallVec::new();
+    let mut stock: SmallVec<[ShadowViewId; 4]> = SmallVec::new();
 
     for (
         light_entity,
@@ -484,7 +494,7 @@ pub fn check_dir_light_mesh_visibility(
         maybe_view_mask,
         light_view_visibility,
         stable_far,
-        (mut light_cache, exempt),
+        (mut light_cache, exempt, stable_projections),
     ) in &mut directional_lights
     {
         let mut views_to_remove = Vec::new();
@@ -508,9 +518,14 @@ pub fn check_dir_light_mesh_visibility(
         }
 
         let view_mask = maybe_view_mask.unwrap_or_default();
+        if let Some(cache) = light_cache.as_mut() {
+            let cache = cache.bypass_change_detection();
+            cache.entered = 0;
+            cache.longest_wait = 0;
+        }
 
-        // MPS: whether the light is cached: the cache on, shadows on, a
-        // stable far cascade, and what projects its maps settled. A light
+        // MPS: whether the light is cached: the cache on, shadows on, stable
+        // cascades, and what projects its maps settled. A light
         // that turns is drawn whole every frame until it settles, with no
         // cache work.
         let cached = light_cache.as_mut().is_some_and(|cache| {
@@ -548,83 +563,197 @@ pub fn check_dir_light_mesh_visibility(
 
         if let Some(cache) = light_cache.as_mut().filter(|_| cached) {
             let cache = cache.bypass_change_detection();
-            cache
-                .views
-                .retain(|camera, _| frusta.frusta.contains_key(camera));
+            cache.views.retain(|(camera, cascade), _| {
+                frusta.frusta.get(camera).is_some_and(|view_frusta| {
+                    stable_far.is_some_and(|policy| {
+                        policy.is_stable(*cascade as usize, view_frusta.len())
+                    })
+                })
+            });
+
+            // MPS: every stable view settles on its projection; a settled
+            // view that isn't cached waits its turn: at most one starts being
+            // cached a frame, the one that waited longest, so no view waits
+            // for ever behind others that re-center often.
+            let policy = stable_far.unwrap();
+            let mut candidates: SmallVec<[((Entity, u32), u32); 4]> = SmallVec::new();
+            let mut waiting: SmallVec<[(Entity, u32); 4]> = SmallVec::new();
+            for (view, view_frusta) in &frusta.frusta {
+                let cascade_count = view_frusta.len();
+                for cascade in policy.stable(cascade_count) {
+                    let Some(stable_cascade) = cascades
+                        .cascades
+                        .get(view)
+                        .and_then(|view_cascades| view_cascades.get(cascade))
+                    else {
+                        continue;
+                    };
+                    let projection = DirectionalShadowProjection::new(
+                        &stable_cascade.clip_from_world,
+                        shadow_map.size,
+                        view_mask,
+                        cascade_selects(policy, cascade, cascade_count, middle_stand_in_routing),
+                    );
+                    let key = (*view, cascade as u32);
+                    let state = cache.views.entry(key).or_default();
+                    // Bevy's projection for now (the speed fallback): drawn
+                    // whole, at stock cost, no cache work.
+                    if stable_projections
+                        .is_some_and(|projections| projections.is_stock(key.0, key.1))
+                    {
+                        *state = Default::default();
+                        stock.push(ShadowViewId {
+                            light: light_entity,
+                            subview: ShadowSubview::Directional {
+                                camera: key.0,
+                                cascade: key.1,
+                            },
+                        });
+                        continue;
+                    }
+                    let settled = state.settlement.settle(
+                        &projection,
+                        frame,
+                        now,
+                        shadow_cache_settings.settle_time,
+                    );
+                    // (The faults keep a view whose projection changed: the
+                    // second also keeps its static layer as it was.)
+                    if !(settled || early_view_settle || stale_projection) {
+                        state.view = None;
+                        state.waiting_since = None;
+                        waiting.push(key);
+                        continue;
+                    }
+                    if state.view.is_some() {
+                        continue;
+                    }
+                    if no_stagger {
+                        state.view = Some(ShadowViewCache::default());
+                        cache.entered += 1;
+                        continue;
+                    }
+                    let since = *state.waiting_since.get_or_insert(frame);
+                    waiting.push(key);
+                    candidates.push((key, since));
+                }
+            }
+            if let Some(key) = shadow_cache::longest_waiting(candidates)
+                && let Some(state) = cache.views.get_mut(&key)
+            {
+                state.view = Some(ShadowViewCache::default());
+                state.waiting_since = None;
+                cache.entered += 1;
+            }
+            for key in waiting {
+                let Some(state) = cache.views.get(&key) else {
+                    continue;
+                };
+                if state.view.is_none() {
+                    cache.longest_wait = cache.longest_wait.max(
+                        state
+                            .waiting_since
+                            .map_or(0, |since| frame.wrapping_sub(since)),
+                    );
+                    settling.push(ShadowViewId {
+                        light: light_entity,
+                        subview: ShadowSubview::Directional {
+                            camera: key.0,
+                            cascade: key.1,
+                        },
+                    });
+                }
+            }
         }
 
         for (view, view_frusta) in &frusta.frusta {
             let cascade_count = view_frusta.len();
-            // MPS: the cascade that draws far stand-ins instead of their
-            // detail, if any (`ShadowRepresentation`).
-            let stand_ins = stable_far.is_some_and(|stable_far| stable_far.stand_ins);
-            let stand_ins_cascade = (stand_ins && cascade_count >= 2).then(|| cascade_count - 1);
+            // MPS: the stand-ins each cascade draws instead of the detail
+            // (`ShadowRepresentation`), whether or not it is cached. (The
+            // fault: the middle cascade takes the far one's.)
+            let selects: SmallVec<[Option<u32>; 4]> = (0..cascade_count)
+                .map(|index| {
+                    stable_far.and_then(|policy| {
+                        cascade_selects(policy, index, cascade_count, middle_stand_in_routing)
+                    })
+                })
+                .collect();
 
-            // MPS: the cached far cascade of this camera, and how it is
-            // walked.
-            let far = match light_cache.as_mut() {
-                Some(cache) if cached && cascade_count >= 2 => {
-                    let cascade = cascade_count - 1;
-                    let projection = cascades
+            // MPS: the cached stable cascades of this camera (admitted above),
+            // and how each is walked.
+            let mut walks: SmallVec<[FarWalk; 2]> = SmallVec::new();
+            if let (Some(cache), Some(policy)) = (light_cache.as_mut(), stable_far)
+                && cached
+            {
+                let cache = cache.bypass_change_detection();
+                for cascade in policy.stable(cascade_count) {
+                    let Some(stable_cascade) = cascades
                         .cascades
                         .get(view)
                         .and_then(|view_cascades| view_cascades.get(cascade))
-                        .map(|far_cascade| {
-                            DirectionalShadowProjection::new(
-                                &far_cascade.clip_from_world,
-                                shadow_map.size,
-                                view_mask,
-                                stand_ins,
-                            )
+                    else {
+                        continue;
+                    };
+                    let Some(view_cache) = cache
+                        .views
+                        .get_mut(&(*view, cascade as u32))
+                        .and_then(|state| state.view.as_mut())
+                    else {
+                        continue;
+                    };
+                    let projection = DirectionalShadowProjection::new(
+                        &stable_cascade.clip_from_world,
+                        shadow_map.size,
+                        view_mask,
+                        selects[cascade],
+                    );
+                    let id = ShadowViewId {
+                        light: light_entity,
+                        subview: ShadowSubview::Directional {
+                            camera: *view,
+                            cascade: cascade as u32,
+                        },
+                    };
+                    view_cache.begin();
+                    if !view_cache.projection.as_ref().is_some_and(|cached| {
+                        cached.is_directional(&projection) || stale_projection
+                    }) {
+                        view_cache.invalidated = true;
+                    }
+                    let invalidated = mem::take(&mut view_cache.invalidated);
+                    if invalidated {
+                        view_cache.static_revision += 1;
+                        view_cache.projection = Some(ShadowViewProjection::Directional(projection));
+                    }
+                    view_cache.lights_a_view = true;
+                    let statuses =
+                        shadow_cache_status.get_or_insert_with(|| shadow_cache_feedback.views());
+                    let status = view_cache.status(statuses, &id);
+                    view_cache.single_view = status.is_some_and(|status| status.fallback);
+                    let walk_statics = invalidated
+                        || status.is_none_or(|status| {
+                            let acknowledged = status.acknowledged_static_revision;
+                            acknowledged != Some(view_cache.static_revision)
+                                && !(stale_ack
+                                    && acknowledged == Some(view_cache.static_revision - 1))
                         });
-                    projection.map(|projection| {
-                        let cache = cache.bypass_change_detection();
-                        cache.cascade = cascade as u32;
-                        let view_cache = cache.views.entry(*view).or_default();
-                        view_cache.begin();
-                        if !view_cache.projection.as_ref().is_some_and(|cached| {
-                            cached.is_directional(&projection) || stale_projection
-                        }) {
-                            view_cache.invalidated = true;
-                        }
-                        let invalidated = mem::take(&mut view_cache.invalidated);
-                        if invalidated {
-                            view_cache.static_revision += 1;
-                            view_cache.projection =
-                                Some(ShadowViewProjection::Directional(projection));
-                        }
-                        view_cache.lights_a_view = true;
-                        let id = ShadowViewId {
-                            light: light_entity,
-                            subview: ShadowSubview::Directional {
-                                camera: *view,
-                                cascade: cascade as u32,
-                            },
-                        };
-                        let statuses = shadow_cache_status
-                            .get_or_insert_with(|| shadow_cache_feedback.views());
-                        let status = view_cache.status(statuses, &id);
-                        view_cache.single_view = status.is_some_and(|status| status.fallback);
-                        let walk_statics = invalidated
-                            || status.is_none_or(|status| {
-                                let acknowledged = status.acknowledged_static_revision;
-                                acknowledged != Some(view_cache.static_revision)
-                                    && !(stale_ack
-                                        && acknowledged == Some(view_cache.static_revision - 1))
-                            });
-                        FarWalk {
-                            cascade,
-                            clip_from_world: cascades.cascades[view]
-                                [cascade - usize::from(wrong_cascade)]
-                            .clip_from_world,
-                            single_view: view_cache.single_view,
-                            walk_statics,
-                            invalidated,
-                        }
-                    })
+                    walks.push(FarWalk {
+                        cascade,
+                        clip_from_world: cascades.cascades[view]
+                            [cascade - usize::from(wrong_cascade)]
+                        .clip_from_world,
+                        single_view: view_cache.single_view,
+                        walk_statics,
+                        invalidated,
+                    });
                 }
-                _ => None,
-            };
+            }
+
+            // Each cascade's walk, if it is cached.
+            let mut walk_slots: SmallVec<[Option<usize>; 4]> = smallvec![None; cascade_count];
+            for (slot, walk) in walks.iter().enumerate() {
+                walk_slots[walk.cascade] = Some(slot);
+            }
 
             // Resize any per-thread buffer left at a stale state from a prior frame.
             // Threads receiving no work this frame won't run the `init` closure from `par_iter`, and without this
@@ -646,7 +775,7 @@ pub fn check_dir_light_mesh_visibility(
                 |(
                     defer_visible_entities_local_queue,
                     view_visible_entities_local_queue,
-                    far_local,
+                    far_locals,
                 ),
                  (
                     entity,
@@ -680,13 +809,17 @@ pub fn check_dir_light_mesh_visibility(
 
                     let representation = representation.copied();
                     let mut visible = false;
+                    if far_locals.len() < walks.len() {
+                        far_locals.resize_with(walks.len(), Default::default);
+                    }
                     for (index, frustum_visible_entities) in
                         view_visible_entities_local_queue.iter_mut().enumerate()
                     {
-                        if !view_takes(stand_ins_cascade == Some(index), representation) {
+                        if !view_takes(selects[index], representation) {
                             continue;
                         }
-                        let far = far.as_ref().filter(|far| far.cascade == index);
+                        let slot = walk_slots[index];
+                        let far = slot.map(|slot| &walks[slot]);
                         // MPS: a settled caster of a cached far cascade is
                         // visited only while its static content is drawn (or
                         // for the audit's reference list).
@@ -708,10 +841,11 @@ pub fn check_dir_light_mesh_visibility(
                             continue;
                         }
                         visible = true;
-                        let Some(far) = far else {
+                        let (Some(far), Some(slot)) = (far, slot) else {
                             frustum_visible_entities.push(entity);
                             continue;
                         };
+                        let far_local = &mut far_locals[slot];
                         if !far_local.used {
                             far_local.used = true;
                             far_local.statics.clear();
@@ -790,70 +924,85 @@ pub fn check_dir_light_mesh_visibility(
                 view_dest.entities.sort_unstable();
             }
 
-            // MPS: the cached far cascade's view: its live casters' count and
-            // tiles, its settled casters' list (or print) and revision.
-            let Some(far) = far else {
-                continue;
-            };
-            let view_cache = light_cache
-                .as_mut()
-                .unwrap()
-                .bypass_change_detection()
-                .views
-                .get_mut(view)
-                .unwrap();
-            let statics = &mut *far_scratch;
-            statics.clear();
-            let mut tiles = mem::take(&mut view_cache.movers_tiles);
-            tiles.reset(map_size);
-            let mut print = StaticCastersPrint::default();
-            let mut live = 0;
-            let mut reference_entities = Vec::new();
-            for local in far_queue.iter_mut().filter(|local| local.used) {
-                local.used = false;
-                statics.append(&mut local.statics);
-                reference_entities.append(&mut local.reference);
-                tiles.union_with(&local.tiles);
-                print.merge(mem::take(&mut local.print));
-                live += local.live;
-            }
-            view_cache.live_casters = live;
-            view_cache.reference = reference.then(|| {
-                reference_entities.sort_unstable();
-                reference_entities
-            });
-            if far.single_view {
-                // Its settled casters count only for the revision, by an
-                // order-free print; its tiles are all set while a live caster
-                // is in it. The split views' list is found again (a new
-                // revision) when it has a usable layer again.
+            // MPS: each cached stable cascade's view: its live casters' count
+            // and tiles, its settled casters' list (or print) and revision.
+            for (slot, far) in walks.iter().enumerate() {
+                let view_cache = light_cache
+                    .as_mut()
+                    .unwrap()
+                    .bypass_change_detection()
+                    .views
+                    .get_mut(&(*view, far.cascade as u32))
+                    .and_then(|state| state.view.as_mut())
+                    .unwrap();
+                let statics = &mut *far_scratch;
+                statics.clear();
+                let mut tiles = mem::take(&mut view_cache.movers_tiles);
                 tiles.reset(map_size);
-                if live > 0 {
-                    tiles.fill();
+                let mut print = StaticCastersPrint::default();
+                let mut live = 0;
+                let mut reference_entities = Vec::new();
+                for local in far_queue
+                    .iter_mut()
+                    .filter_map(|locals| locals.get_mut(slot))
+                    .filter(|local| local.used)
+                {
+                    local.used = false;
+                    statics.append(&mut local.statics);
+                    reference_entities.append(&mut local.reference);
+                    tiles.union_with(&local.tiles);
+                    print.merge(mem::take(&mut local.print));
+                    live += local.live;
                 }
-                if view_cache.static_print != Some(print) {
-                    if !far.invalidated {
-                        view_cache.static_revision += 1;
+                view_cache.live_casters = live;
+                view_cache.reference = reference.then(|| {
+                    reference_entities.sort_unstable();
+                    reference_entities
+                });
+                if far.single_view {
+                    // Its settled casters count only for the revision, by an
+                    // order-free print; its tiles are all set while a live
+                    // caster is in it. The split views' list is found again (a
+                    // new revision) when it has a usable layer again.
+                    tiles.reset(map_size);
+                    if live > 0 {
+                        tiles.fill();
                     }
-                    view_cache.static_print = Some(print);
-                }
-                view_cache.static_entities.clear();
-                view_cache.statics_walked = false;
-            } else {
-                view_cache.static_print = None;
-                view_cache.statics_walked = far.walk_statics;
-                if far.walk_statics {
-                    statics.sort_unstable();
-                    if *statics != view_cache.static_entities {
-                        // A change that wasn't reported (or the first list).
+                    if view_cache.static_print != Some(print) {
                         if !far.invalidated {
                             view_cache.static_revision += 1;
                         }
-                        mem::swap(&mut view_cache.static_entities, statics);
+                        view_cache.static_print = Some(print);
+                    }
+                    view_cache.static_entities.clear();
+                    view_cache.statics_walked = false;
+                } else {
+                    view_cache.static_print = None;
+                    view_cache.statics_walked = far.walk_statics;
+                    if far.walk_statics {
+                        statics.sort_unstable();
+                        if *statics != view_cache.static_entities {
+                            // A change that wasn't reported (or the first list).
+                            if !far.invalidated {
+                                view_cache.static_revision += 1;
+                            }
+                            mem::swap(&mut view_cache.static_entities, statics);
+                        }
                     }
                 }
+                view_cache.movers_tiles = tiles;
             }
-            view_cache.movers_tiles = tiles;
+        }
+    }
+
+    if !(settling.is_empty() && stock.is_empty())
+        && let Ok(mut counts) = shadow_cache_feedback.1.lock()
+    {
+        for id in settling {
+            counts.entry(id).or_default().settling += 1;
+        }
+        for id in stock {
+            counts.entry(id).or_default().stock += 1;
         }
     }
 
@@ -871,8 +1020,22 @@ pub fn check_dir_light_mesh_visibility(
     });
 }
 
-/// MPS: how [`check_dir_light_mesh_visibility`] walks a camera's cached far
-/// cascade this frame.
+/// MPS: the stand-ins cascade `index` of `cascade_count` draws instead of the
+/// detail (the fault: the middle cascade takes the far one's).
+fn cascade_selects(
+    policy: &StableCascades,
+    index: usize,
+    cascade_count: usize,
+    middle_stand_in_routing: bool,
+) -> Option<u32> {
+    match policy.selects_stand_ins(index, cascade_count) {
+        Some(_) if middle_stand_in_routing && index + 2 == cascade_count => Some(index as u32 + 1),
+        selects => selects,
+    }
+}
+
+/// MPS: how [`check_dir_light_mesh_visibility`] walks a camera's cached
+/// stable cascade this frame.
 struct FarWalk {
     cascade: usize,
     clip_from_world: bevy_math::Mat4,
@@ -883,7 +1046,7 @@ struct FarWalk {
     invalidated: bool,
 }
 
-/// MPS: a thread's share of a cached far cascade's walk in
+/// MPS: a thread's share of a cached stable cascade's walk in
 /// [`check_dir_light_mesh_visibility`].
 #[derive(Default)]
 #[doc(hidden)]
@@ -1035,8 +1198,7 @@ pub fn check_point_light_mesh_visibility(
                         ) = item;
                         // MPS: a far cascade's stand-ins cast only into far
                         // cascades.
-                        if !inherited_visibility.get()
-                            || !view_takes(false, representation.copied())
+                        if !inherited_visibility.get() || !view_takes(None, representation.copied())
                         {
                             return;
                         }
@@ -1179,7 +1341,7 @@ pub fn check_point_light_mesh_visibility(
                     ) = item;
                     // MPS: a far cascade's stand-ins cast only into far
                     // cascades.
-                    if !inherited_visibility.get() || !view_takes(false, representation.copied()) {
+                    if !inherited_visibility.get() || !view_takes(None, representation.copied()) {
                         return false;
                     }
 

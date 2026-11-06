@@ -71,7 +71,7 @@ pub struct NoCpuCulling;
 /// MPS: cameras never draw this entity (nor mark it visible); shadow views
 /// still can, which makes it visible for extraction. For shadow-only casters,
 /// such as a far shadow cascade's stand-ins (`bevy_light`'s
-/// `FarCascadeStandIn` requires it).
+/// `CascadeStandIn` brings it).
 ///
 /// Only the CPU culling path honors it: an entity with [`NoCpuCulling`] is
 /// collected for every view on the GPU.
