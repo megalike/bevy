@@ -56,7 +56,9 @@ use bevy_camera::{
     primitives::{
         Aabb, CascadesFrusta, CubeMapFace, CubemapFrusta, Frustum, Sphere, CUBE_MAP_FACES,
     },
-    visibility::{InheritedVisibility, NoFrustumCulling, RenderLayers, VisibilityRange},
+    visibility::{
+        InheritedVisibility, NoCpuCulling, NoFrustumCulling, RenderLayers, VisibilityRange,
+    },
 };
 use bevy_ecs::{
     component::ComponentId,
@@ -421,6 +423,9 @@ pub(crate) struct CasterSignature {
     no_frustum_culling: bool,
     /// MPS: which shadow views it casts into besides its layers.
     representation: Option<ShadowRepresentation>,
+    /// Culled on the GPU only ([`NoCpuCulling`]): drawn wherever the view's
+    /// projection reaches, also beyond a light's range.
+    no_cpu_culling: bool,
 }
 
 fn same_bits(a: &[f32], b: &[f32]) -> bool {
@@ -445,6 +450,7 @@ impl CasterSignature {
         if !same_bits(&affine(self), &affine(other)) {
             Some(ShadowCasterChange::Transform)
         } else if self.no_frustum_culling != other.no_frustum_culling
+            || self.no_cpu_culling != other.no_cpu_culling
             || match (&self.aabb, &other.aabb) {
                 (Some(a), Some(b)) => !same_bits(&aabb(a), &aabb(b)),
                 (None, None) => false,
@@ -469,13 +475,19 @@ impl CasterSignature {
             && light.layers.intersects(&self.layers)
             && view_takes(light.stand_ins, self.representation)
             && match &self.aabb {
+                // A caster culled on the GPU only is drawn wherever the
+                // view's projection reaches (no range, no far plane).
                 Some(aabb) if !self.no_frustum_culling => {
-                    light
-                        .sphere
-                        .is_none_or(|sphere| sphere.intersects_obb(aabb, &self.world_from_local))
-                        && light
-                            .frustum
-                            .intersects_obb(aabb, &self.world_from_local, true, true)
+                    (self.no_cpu_culling
+                        || light.sphere.is_none_or(|sphere| {
+                            sphere.intersects_obb(aabb, &self.world_from_local)
+                        }))
+                        && light.frustum.intersects_obb(
+                            aabb,
+                            &self.world_from_local,
+                            true,
+                            !self.no_cpu_culling,
+                        )
                 }
                 _ => true,
             }
@@ -512,14 +524,19 @@ impl ShadowViewBounds {
         }
     }
 
-    /// A point light's face: the face's frustum (its far plane at the
-    /// light's range along the face's axis) and the layers that projected its
-    /// static layer. Not the range's sphere: a caster culled on the GPU is
-    /// drawn wherever it is in the frustum, also in its corners beyond the
-    /// sphere, and its shadow there is in the static layer too.
-    pub(crate) fn point(frustum: &Frustum, layers: RenderLayers) -> ShadowViewBounds {
+    /// A point light's face: its range, the face's frustum and the layers
+    /// that projected its static layer.
+    pub(crate) fn point(
+        point_light: &PointLight,
+        transform: &GlobalTransform,
+        frustum: &Frustum,
+        layers: RenderLayers,
+    ) -> ShadowViewBounds {
         ShadowViewBounds {
-            sphere: None,
+            sphere: Some(Sphere {
+                center: transform.translation_vec3a(),
+                radius: point_light.range,
+            }),
             frustum: *frustum,
             layers,
             stand_ins: false,
@@ -1683,7 +1700,10 @@ type CasterQuery<'w, 's, F> = Query<
         Option<Ref<'static, RenderLayers>>,
         Option<Ref<'static, NoFrustumCulling>>,
         Option<Ref<'static, MeshTag>>,
-        Option<Ref<'static, ShadowRepresentation>>,
+        (
+            Option<Ref<'static, ShadowRepresentation>>,
+            Has<NoCpuCulling>,
+        ),
     ),
     (
         Without<NotShadowCaster>,
@@ -1711,6 +1731,7 @@ type WrittenSettled = (
         Changed<MeshTag>,
         Changed<ShadowCasterState>,
         Changed<ShadowRepresentation>,
+        Added<NoCpuCulling>,
     )>,
 );
 
@@ -1724,6 +1745,7 @@ fn signature_of(
     no_frustum_culling: bool,
     tag: u32,
     representation: Option<&ShadowRepresentation>,
+    no_cpu_culling: bool,
 ) -> CasterSignature {
     CasterSignature {
         world_from_local: transform.affine(),
@@ -1734,6 +1756,7 @@ fn signature_of(
         layers: layers.cloned().unwrap_or_default(),
         no_frustum_culling,
         representation: representation.copied(),
+        no_cpu_culling,
     }
 }
 
@@ -1778,7 +1801,7 @@ type CasterItem<'w> = (
     Option<Ref<'w, RenderLayers>>,
     Option<Ref<'w, NoFrustumCulling>>,
     Option<Ref<'w, MeshTag>>,
-    Option<Ref<'w, ShadowRepresentation>>,
+    (Option<Ref<'w, ShadowRepresentation>>, bool),
 );
 
 /// What [`classify_shadow_casters`] keeps between frames.
@@ -1827,12 +1850,14 @@ pub fn classify_shadow_casters(
         mut removed_aabbs,
         mut removed_tags,
         mut removed_representations,
+        mut removed_no_cpu_culling,
     ): (
         RemovedComponents<RenderLayers>,
         RemovedComponents<NoFrustumCulling>,
         RemovedComponents<Aabb>,
         RemovedComponents<MeshTag>,
         RemovedComponents<ShadowRepresentation>,
+        RemovedComponents<NoCpuCulling>,
     ),
     (mut live_casters, mut settled_casters): (
         CasterQuery<Without<StaticShadowCaster>>,
@@ -1854,7 +1879,12 @@ pub fn classify_shadow_casters(
             &Frustum,
             &SpotLightShadowCache,
         )>,
-        Query<(&CubemapFrusta, &PointLightShadowCache)>,
+        Query<(
+            &PointLight,
+            &GlobalTransform,
+            &CubemapFrusta,
+            &PointLightShadowCache,
+        )>,
     ),
     faults: Option<Res<ShadowCacheFaults>>,
     mut local: Local<ClassifyState>,
@@ -1904,7 +1934,8 @@ pub fn classify_shadow_casters(
             .chain(removed_no_culling.read())
             .chain(removed_aabbs.read())
             .chain(removed_tags.read())
-            .chain(removed_representations.read()),
+            .chain(removed_representations.read())
+            .chain(removed_no_cpu_culling.read()),
     );
     modified_meshes.clear();
     // A mesh changed in place, or replaced under the same id (removed and
@@ -1968,7 +1999,7 @@ pub fn classify_shadow_casters(
         layers,
         no_frustum_culling,
         tag,
-        representation,
+        (representation, no_cpu_culling),
     ) in &mut settled_casters.p0()
     {
         let state = state.bypass_change_detection();
@@ -1982,6 +2013,7 @@ pub fn classify_shadow_casters(
             no_frustum_culling.is_some(),
             tag_of(tag.as_deref()),
             representation.as_deref(),
+            no_cpu_culling,
         );
         let change = state
             .signature
@@ -2010,7 +2042,7 @@ pub fn classify_shadow_casters(
                 layers,
                 no_frustum_culling,
                 tag,
-                representation,
+                (representation, no_cpu_culling),
             ) = item;
             let flagged = if reported.contains(&entity) {
                 Some(ShadowCasterChange::Reported)
@@ -2031,6 +2063,7 @@ pub fn classify_shadow_casters(
                 no_frustum_culling.is_some(),
                 tag_of(tag.as_deref()),
                 representation.as_deref(),
+                no_cpu_culling,
             );
             let state = state.bypass_change_detection();
             let change = flagged.or_else(|| {
@@ -2078,7 +2111,7 @@ pub fn classify_shadow_casters(
         layers,
         no_frustum_culling,
         tag,
-        representation,
+        (representation, no_cpu_culling),
     ) in &mut live_casters
     {
         let moved_tick = transform.is_changed();
@@ -2103,6 +2136,7 @@ pub fn classify_shadow_casters(
                 no_frustum_culling.is_some(),
                 tag_of(tag.as_deref()),
                 representation.as_deref(),
+                no_cpu_culling,
             )
         };
         let state = state.bypass_change_detection();
@@ -2201,13 +2235,15 @@ pub fn classify_shadow_casters(
         },
     ));
     // Each face of a cached point light is a view of its own.
-    for (frusta, cache) in &point_lights {
+    for (point_light, transform, frusta, cache) in &point_lights {
         if !cache.cached {
             continue;
         }
         for (face, frustum) in cache.faces.iter().zip(frusta.iter()) {
             if let Some(projection) = &face.projection {
                 cached_views.push(ShadowViewBounds::point(
+                    point_light,
+                    transform,
                     frustum,
                     projection.render_layers().clone(),
                 ));
@@ -2286,7 +2322,13 @@ pub fn invalidate_shadow_caches(
         &Frustum,
     )>,
     mut directional_lights: Query<(Entity, Mut<DirectionalLightShadowCache>, &CascadesFrusta)>,
-    mut point_lights: Query<(Entity, Mut<PointLightShadowCache>, &CubemapFrusta)>,
+    mut point_lights: Query<(
+        Entity,
+        Mut<PointLightShadowCache>,
+        &PointLight,
+        &GlobalTransform,
+        &CubemapFrusta,
+    )>,
     mut redraw_key: Local<Option<(u64, usize, usize)>>,
     faults: Option<Res<ShadowCacheFaults>>,
 ) {
@@ -2404,7 +2446,7 @@ pub fn invalidate_shadow_caches(
     let first_face_only = faults
         .as_ref()
         .is_some_and(|faults| faults.miss_face_invalidation);
-    for (light_entity, mut cache, frusta) in &mut point_lights {
+    for (light_entity, mut cache, point_light, transform, frusta) in &mut point_lights {
         if !cache.cached {
             continue;
         }
@@ -2413,6 +2455,8 @@ pub fn invalidate_shadow_caches(
         let bounds: [Option<ShadowViewBounds>; 6] = core::array::from_fn(|face| {
             let projection = cache.faces[face].projection.as_ref()?;
             Some(ShadowViewBounds::point(
+                point_light,
+                transform,
                 &frusta.frusta[face],
                 projection.render_layers().clone(),
             ))
@@ -3375,27 +3419,27 @@ mod tests {
     }
 
     #[test]
-    fn each_point_face_ends_at_the_range_along_its_axis() {
-        let (mut app, light) = point_app();
-        step(&mut app, 0.016);
-        let frusta = app.world().get::<CubemapFrusta>(light).unwrap().clone();
-        let aabb = Aabb {
-            center: Vec3A::ZERO,
-            half_extents: Vec3A::splat(0.5),
-        };
-        for (face, CubeMapFace { target, .. }) in CUBE_MAP_FACES.iter().enumerate() {
-            let at = |distance: f32| Affine3A::from_translation(*target * distance);
-            let frustum = &frusta.frusta[face];
-            assert!(
-                frustum.intersects_obb(&aabb, &at(10.0), true, true),
-                "face {face}"
-            );
-            // Beyond the range of 20 along the face's axis: outside, so that
-            // GPU culling stays within the range as the face bounds do.
-            assert!(
-                !frustum.intersects_obb(&aabb, &at(30.0), true, true),
-                "face {face}"
-            );
+    fn a_caster_culled_on_the_gpu_redraws_faces_beyond_the_range() {
+        // A caster culled on the GPU only is drawn wherever a face's
+        // projection reaches, beyond the light's range too: its leaving
+        // redraws that face; a CPU-culled one there was never drawn.
+        for gpu in [false, true] {
+            let (mut app, light) = point_app();
+            let far = caster(&mut app, Vec3::new(-40.0, 0.0, 0.0), Vec3::splat(0.5));
+            if gpu {
+                app.world_mut().entity_mut(far).insert(NoCpuCulling);
+            }
+            step(&mut app, 0.016);
+            step(&mut app, 0.016);
+            step(&mut app, 0.016);
+            assert!(app.world().entity(far).contains::<StaticShadowCaster>());
+            acknowledge(&app, light);
+            step(&mut app, 0.016);
+            let before = point_cache(&app, light).face(1).static_revision();
+            app.world_mut().despawn(far);
+            step(&mut app, 0.016);
+            let after = point_cache(&app, light).face(1).static_revision();
+            assert_eq!(after > before, gpu, "gpu culled: {gpu}");
         }
     }
 }
