@@ -2,11 +2,10 @@
 //! `shadow_cache` module: [`ShadowCacheSettings`]).
 //!
 //! The cache keeps its state by shadow view ([`ShadowViewId`]): a spot
-//! light's shadow map, and, reserved for later, a directional light's cascade
-//! for a camera or a point light's cube face. Each light type's adapter
-//! describes its cached views ([`CachedShadowView`]: projection, frustum,
-//! destination); today only spot lights are cached
-//! ([`ShadowViewCaches::prepare_spot_light`]).
+//! light's shadow map, a point light's cube face, a directional light's far
+//! cascade for a camera. Each light type's adapter describes its cached views
+//! ([`CachedShadowView`]: projection, frustum, destination) to one planner
+//! ([`ShadowViewCaches::prepare_view`]).
 //!
 //! Each cached view that fits in the budget gets a static layer of its own,
 //! a depth texture that holds the shadow of its settled casters. Each frame

@@ -15,9 +15,10 @@
 //! [`ShadowCacheFeedback`].
 //!
 //! The cache keeps its state by shadow view ([`ShadowViewId`]): one for a
-//! spot light ([`SpotLightShadowCache`]); directional cascades and point
-//! light faces are reserved for later. A light keeps only what settles it
-//! (what projects its maps); everything else is per view.
+//! spot light ([`SpotLightShadowCache`]), one per cube face for a point light
+//! ([`PointLightShadowCache`]), one per camera for a directional light's far
+//! cascade ([`DirectionalLightShadowCache`]). A light keeps only what settles
+//! it (what projects its maps); everything else is per view.
 //!
 //! # The rule
 //!
