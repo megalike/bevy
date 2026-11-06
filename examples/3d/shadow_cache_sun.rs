@@ -13,6 +13,11 @@
 //! never reach the camera or the near cascades. `SHADOW_CACHE_FAULT=NAME`
 //! injects a fault the oracle must catch; `SUN_ORACLE_CACHE=0` runs with the
 //! cache off, `SUN_ORACLE_STAND_INS=0` without stand-ins.
+//!
+//! For look reviews: `SUN_STABLE=0` uses Bevy's fitted far cascade instead of
+//! the stable one, `SUN_CAPTURE=DIR` saves the main view at fixed frames of
+//! the oracle's script (stills, and a strip of consecutive walk frames), and
+//! `SUN_RESOLUTION=WxH` sets the window's size.
 
 use std::f32::consts::*;
 
@@ -34,6 +39,7 @@ use bevy::{
     },
     platform::collections::HashMap,
     prelude::*,
+    render::view::screenshot::{save_to_disk, Screenshot},
     time::TimeUpdateStrategy,
     window::{PresentMode, WindowResolution},
 };
@@ -79,7 +85,7 @@ fn main() -> AppExit {
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "shadow cache: sun".into(),
-            resolution: WindowResolution::new(640, 360),
+            resolution: resolution(),
             present_mode: PresentMode::AutoVsync,
             ..default()
         }),
@@ -100,6 +106,16 @@ fn main() -> AppExit {
         app.add_systems(Update, free_camera);
     }
     app.run()
+}
+
+/// The window's size: `SUN_RESOLUTION=WxH`, or 640x360.
+fn resolution() -> WindowResolution {
+    let size = std::env::var("SUN_RESOLUTION").ok().and_then(|value| {
+        let (w, h) = value.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?))
+    });
+    let (w, h) = size.unwrap_or((640, 360));
+    WindowResolution::new(w, h)
 }
 
 fn env<T: std::str::FromStr>(name: &str) -> Option<T> {
@@ -286,26 +302,30 @@ fn setup(
     }
 
     // The sun: three cascades to 200 m, the last one stable and cached.
-    commands.spawn((
-        DirectionalLight {
-            illuminance: light_consts::lux::AMBIENT_DAYLIGHT,
-            shadow_maps_enabled: true,
-            ..default()
-        },
-        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.7, -0.6, 0.0)),
-        CascadeShadowConfigBuilder {
-            num_cascades: 3,
-            minimum_distance: 0.1,
-            first_cascade_far_bound: 10.0,
-            maximum_distance: 200.0,
-            overlap_proportion: 0.2,
-        }
-        .build(),
-        StableFarCascade {
+    let sun = commands
+        .spawn((
+            DirectionalLight {
+                illuminance: light_consts::lux::AMBIENT_DAYLIGHT,
+                shadow_maps_enabled: true,
+                ..default()
+            },
+            Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.7, -0.6, 0.0)),
+            CascadeShadowConfigBuilder {
+                num_cascades: 3,
+                minimum_distance: 0.1,
+                first_cascade_far_bound: 10.0,
+                maximum_distance: 200.0,
+                overlap_proportion: 0.2,
+            }
+            .build(),
+        ))
+        .id();
+    if env("SUN_STABLE").unwrap_or(1) != 0 {
+        commands.entity(sun).insert(StableFarCascade {
             stand_ins: stand_ins(),
             ..default()
-        },
-    ));
+        });
+    }
 
     // The main camera and a second, smaller one elsewhere: both draw their
     // cascades into the same layers.
@@ -529,13 +549,16 @@ mod oracle {
         mut camera: Query<&mut Transform, With<MainCamera>>,
         mut second: Query<&mut Camera, With<SecondCamera>>,
         mut fast: Query<(Entity, &FastMover, &mut Mover)>,
-        mut sun_light: Query<(&mut Transform, &mut StableFarCascade), Without<MainCamera>>,
+        mut sun_light: Query<
+            (&mut Transform, Option<&mut StableFarCascade>),
+            (With<DirectionalLight>, Without<MainCamera>),
+        >,
         mut casters: Query<
             &mut Transform,
             (
                 With<Scripted>,
                 Without<MainCamera>,
-                Without<StableFarCascade>,
+                Without<DirectionalLight>,
             ),
         >,
         mut meshes: ResMut<Assets<Mesh>>,
@@ -555,7 +578,10 @@ mod oracle {
             if transform.rotation != rotation {
                 transform.rotation = rotation;
             }
-            if f == STAND_INS_OFF && stable_far.stand_ins {
+            if f == STAND_INS_OFF
+                && let Some(stable_far) = stable_far.as_mut()
+                && stable_far.stand_ins
+            {
                 stable_far.stand_ins = false;
             }
         }
@@ -603,6 +629,17 @@ mod oracle {
             && let Some(entity) = scripted(4)
         {
             commands.entity(entity).despawn();
+        }
+        // Look reviews: the main view at fixed frames.
+        if let Ok(dir) = std::env::var("SUN_CAPTURE") {
+            let still = [110, 170, 300, 400, 860].contains(&f);
+            let strip = (WALK + 60..WALK + 72).contains(&f) || (FLY + 20..FLY + 32).contains(&f);
+            if still || strip {
+                let kind = if still { "still" } else { "strip" };
+                commands
+                    .spawn(Screenshot::primary_window())
+                    .observe(save_to_disk(format!("{dir}/{kind}-{f:04}.png")));
+            }
         }
         if f >= EXIT_AT {
             report(&oracle, &counters, &mut exit);
