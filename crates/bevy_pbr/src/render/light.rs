@@ -26,9 +26,8 @@ use bevy_light::{
     spot_light_clip_from_view, spot_light_world_from_view, AmbientLight, CascadeShadowConfig,
     Cascades, DirectionalLight, DirectionalLightShadowCache, DirectionalLightShadowMap,
     GlobalAmbientLight, PointLight, PointLightShadowCache, PointLightShadowMap, RectLight,
-    ShadowCacheFaults,
-    ShadowCacheSettings, ShadowFilteringMethod, ShadowSubview, ShadowViewId, SpotLight,
-    SpotLightShadowCache, VolumetricLight,
+    ShadowCacheFaults, ShadowCacheSettings, ShadowFilteringMethod, ShadowSubview, ShadowViewId,
+    SpotLight, SpotLightShadowCache, VolumetricLight,
 };
 use bevy_log::warn_once;
 use bevy_material::{
@@ -1859,6 +1858,7 @@ pub fn prepare_lights(
             );
             // Rotation and scale ignored, as for an uncached light.
             let view_translation = GlobalTransform::from_translation(light.transform.translation());
+            let faults_now = shadow_cache_faults.as_deref().copied().unwrap_or_default();
             for (face_index, extracted) in extracted_shadow_cache.0.iter().enumerate() {
                 let mut slots = views[face_index * 2..face_index * 2 + 2].to_vec();
                 let pass_name = format!(
@@ -1883,16 +1883,19 @@ pub fn prepare_lights(
                         frustum: point_light_frusta.map(|frusta| &frusta.frusta[face_index]),
                         pass_name: &pass_name,
                         shadow_map: &point_light_depth_texture,
-                        layer: (light_index * 6 + face_index) as u32,
+                        layer: (light_index * 6
+                            + match face_index {
+                                // The fault: +X and -X swapped.
+                                0 | 1 if faults_now.swap_destination => 1 - face_index,
+                                _ => face_index,
+                            }) as u32,
                         map_size: point_light_shadow_map.size as u32,
                         gpu_preprocessing_mode: gpu_preprocessing_support.max_supported_mode,
                         visible_entities,
                         stale_meshes,
                         static_gpu_culled: gpu_culled_entities
                             .as_deref()
-                            .map_or(&no_stale_meshes, |entities| {
-                                &entities.static_shadow_casters
-                            }),
+                            .map_or(&no_stale_meshes, |entities| &entities.static_shadow_casters),
                         faults: shadow_cache_faults.as_deref().copied().unwrap_or_default(),
                     },
                     &mut slots,

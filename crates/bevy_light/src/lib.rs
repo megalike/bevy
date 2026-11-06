@@ -81,11 +81,11 @@ mod rect_light;
 pub use rect_light::RectLight;
 mod shadow_cache;
 pub use shadow_cache::{
-    classify_shadow_casters, invalidate_shadow_caches, DirectionalLightShadowCache,
-    InvalidateShadowCache, LiveShadowMaterial, LiveShadowMaterials, ShadowCacheCounters,
-    ShadowCacheExempt, ShadowCacheFaults, ShadowCacheFeedback, ShadowCacheLoading,
-    ShadowCacheSettings, ShadowCacheState, ShadowCacheViewStatus, ShadowCasterChange,
-    point_light_face_clip_from_world, PointLightShadowCache, ShadowCasterLive, ShadowCasterState,
+    classify_shadow_casters, invalidate_shadow_caches, point_light_face_clip_from_world,
+    DirectionalLightShadowCache, InvalidateShadowCache, LiveShadowMaterial, LiveShadowMaterials,
+    PointLightShadowCache, ShadowCacheCounters, ShadowCacheExempt, ShadowCacheFaults,
+    ShadowCacheFeedback, ShadowCacheLoading, ShadowCacheSettings, ShadowCacheState,
+    ShadowCacheViewStatus, ShadowCasterChange, ShadowCasterLive, ShadowCasterState,
     ShadowFootprint, ShadowSubview, ShadowTileMask, ShadowViewCache, ShadowViewId,
     SpotLightShadowCache, StaticShadowCaster,
 };
@@ -984,7 +984,6 @@ pub fn check_point_light_mesh_visibility(
     let now = time.map_or(core::time::Duration::ZERO, |time| time.elapsed());
     let fault = |pick: fn(&ShadowCacheFaults) -> bool| faults.as_deref().is_some_and(pick);
     let stale_ack = fault(|faults| faults.stale_ack);
-    let stale_projection = fault(|faults| faults.stale_projection);
     let wrong_face = fault(|faults| faults.wrong_face);
     let miss_face_edge = fault(|faults| faults.miss_face_edge);
     // The movers grid, built at the first cached spot light of a frame that
@@ -1057,9 +1056,9 @@ pub fn check_point_light_mesh_visibility(
                     for face in cache.faces.iter_mut() {
                         face.live_casters = 0;
                         // Drawn again from scratch once it is cached again
-                        // (the fault keeps what the static layers were drawn
-                        // with).
-                        if !cached && !stale_projection {
+                        // (the render world forgets an uncached light's
+                        // faces too: a moved light always rebuilds).
+                        if !cached {
                             face.projection = None;
                         }
                     }
@@ -1185,7 +1184,7 @@ pub fn check_point_light_mesh_visibility(
                     if !view
                         .projection
                         .as_ref()
-                        .is_some_and(|cached| cached.is_point(&projection) || stale_projection)
+                        .is_some_and(|cached| cached.is_point(&projection))
                     {
                         view.invalidated = true;
                     }
@@ -1204,8 +1203,7 @@ pub fn check_point_light_mesh_visibility(
                     view.lights_a_view = lights_a_view;
                 }
                 if !lights_a_view {
-                    for (view, list) in faces.iter_mut().zip(cubemap_visible_entities.iter_mut())
-                    {
+                    for (view, list) in faces.iter_mut().zip(cubemap_visible_entities.iter_mut()) {
                         view.live_casters = 0;
                         view.movers_tiles.reset(map_size);
                         view.statics_walked = false;
@@ -1261,46 +1259,46 @@ pub fn check_point_light_mesh_visibility(
                 }
                 let walk_all = !use_grid || mover_candidates.len() * 4 >= movers_grid.len();
                 found_sparse |= !walk_all;
-                let visit_mover = |queue: &mut PointFacesQueue,
-                                   mut item: PointLightShadowCasterItem| {
-                    let Some(reach) = caster_reach(&item) else {
-                        return;
+                let visit_mover =
+                    |queue: &mut PointFacesQueue, mut item: PointLightShadowCasterItem| {
+                        let Some(reach) = caster_reach(&item) else {
+                            return;
+                        };
+                        queue.begin(map_size);
+                        // Bounds that may not hold the mesh this frame (skinned
+                        // without updated bounds, morphed) or none cover the
+                        // whole map.
+                        let (skinned, dynamic_skinned_bounds, mesh_morphed, morphed, ..) = item.8;
+                        let bounds_hold = !(mesh_morphed || morphed)
+                            && (!skinned
+                                || (dynamic_skinned_bounds
+                                    && item.4.as_ref().is_some_and(Ref::is_changed)));
+                        for face in 0..6 {
+                            if !in_face(&reach, face) {
+                                continue;
+                            }
+                            item.2.set_visible();
+                            queue.lists[face].push(item.0);
+                            queue.live[face] += 1;
+                            if !single_view[face] {
+                                let footprint = match &reach {
+                                    Some((aabb, model_to_world)) if bounds_hold => {
+                                        ShadowFootprint::of_box(
+                                            &clip_from_world[face],
+                                            near_z,
+                                            aabb,
+                                            model_to_world,
+                                        )
+                                    }
+                                    _ => ShadowFootprint::Whole,
+                                };
+                                queue.tiles[face].insert(footprint);
+                            }
+                            if miss_face_edge {
+                                break;
+                            }
+                        }
                     };
-                    queue.begin(map_size);
-                    // Bounds that may not hold the mesh this frame (skinned
-                    // without updated bounds, morphed) or none cover the
-                    // whole map.
-                    let (skinned, dynamic_skinned_bounds, mesh_morphed, morphed, ..) = item.8;
-                    let bounds_hold = !(mesh_morphed || morphed)
-                        && (!skinned
-                            || (dynamic_skinned_bounds
-                                && item.4.as_ref().is_some_and(Ref::is_changed)));
-                    for face in 0..6 {
-                        if !in_face(&reach, face) {
-                            continue;
-                        }
-                        item.2.set_visible();
-                        queue.lists[face].push(item.0);
-                        queue.live[face] += 1;
-                        if !single_view[face] {
-                            let footprint = match &reach {
-                                Some((aabb, model_to_world)) if bounds_hold => {
-                                    ShadowFootprint::of_box(
-                                        &clip_from_world[face],
-                                        near_z,
-                                        aabb,
-                                        model_to_world,
-                                    )
-                                }
-                                _ => ShadowFootprint::Whole,
-                            };
-                            queue.tiles[face].insert(footprint);
-                        }
-                        if miss_face_edge {
-                            break;
-                        }
-                    }
-                };
                 if walk_all && !few_movers {
                     movable_casters.par_iter_mut().for_each_init(
                         || point_faces_queue.borrow_local_mut(),
@@ -1322,8 +1320,7 @@ pub fn check_point_light_mesh_visibility(
                 // Settled casters: into the list of a face without a usable
                 // static layer (counted by a print), into the static list of
                 // a face whose settled casters are walked.
-                if single_view.iter().any(|single| *single)
-                    || walk_statics.iter().any(|walk| *walk)
+                if single_view.iter().any(|single| *single) || walk_statics.iter().any(|walk| *walk)
                 {
                     static_casters.par_iter_mut().for_each_init(
                         || point_faces_queue.borrow_local_mut(),

@@ -1423,6 +1423,17 @@ category = "3D Rendering"
 wasm = false
 
 [[example]]
+name = "shadow_cache_point"
+path = "examples/3d/shadow_cache_point.rs"
+doc-scrape-examples = true
+
+[package.metadata.example.shadow_cache_point]
+name = "Shadow Cache: Point Lights"
+description = "Point lights whose cube shadow maps are cached face by face, with an oracle"
+category = "3D Rendering"
+wasm = false
+
+[[example]]
 name = "bloom_3d"
 path = "examples/3d/bloom_3d.rs"
 doc-scrape-examples = true

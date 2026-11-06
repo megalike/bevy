@@ -27,8 +27,9 @@ use bevy_transform::TransformSystems;
 use bevy_utils::default;
 
 use crate::{
-    acknowledge_shadow_caches, ExtractedPointLight, PointAndSpotLightViewEntities, ShadowCachePlan,
-    ShadowViewCaches, ShadowViewKey, ViewShadowBindings, CORE_3D_SHADOW_MAP_FORMAT,
+    acknowledge_shadow_caches, ExtractedPointLight, GlobalClusterableObjectMeta,
+    PointAndSpotLightViewEntities, ShadowCachePlan, ShadowViewCaches, ShadowViewKey,
+    ViewShadowBindings, CORE_3D_SHADOW_MAP_FORMAT,
 };
 
 /// Checks every cached spot light's shadow map and every cached point light's
@@ -793,6 +794,7 @@ fn audit_shadow_caches(
     )>,
     keys: Query<&ShadowViewKey>,
     bindings: Query<&ViewShadowBindings>,
+    cluster_meta: Res<GlobalClusterableObjectMeta>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     results: Res<ShadowCacheAuditResults>,
@@ -813,8 +815,7 @@ fn audit_shadow_caches(
             if bound.any(|other| {
                 other.directional_light_depth_texture.id()
                     != first.directional_light_depth_texture.id()
-                    || other.point_light_depth_texture.id()
-                        != first.point_light_depth_texture.id()
+                    || other.point_light_depth_texture.id() != first.point_light_depth_texture.id()
             }) =>
         {
             Err("the views bind different shadow map textures")
@@ -846,18 +847,23 @@ fn audit_shadow_caches(
             .iter()
             .map(|&(light, render_light, twin)| (ShadowViewId::spot(light), render_light, twin))
             // Point lights: each face with the twin's.
-            .chain(pairs.points.iter().flat_map(|&(light, render_light, twin)| {
-                (0..6u8).map(move |face| {
-                    (
-                        ShadowViewId {
-                            light,
-                            subview: ShadowSubview::PointFace(face),
-                        },
-                        render_light,
-                        twin,
-                    )
-                })
-            }))
+            .chain(
+                pairs
+                    .points
+                    .iter()
+                    .flat_map(|&(light, render_light, twin)| {
+                        (0..6u8).map(move |face| {
+                            (
+                                ShadowViewId {
+                                    light,
+                                    subview: ShadowSubview::PointFace(face),
+                                },
+                                render_light,
+                                twin,
+                            )
+                        })
+                    }),
+            )
             // Cached directional cascades: compared with their references
             // (not hashed).
             .chain(
@@ -918,6 +924,16 @@ fn audit_shadow_caches(
             .map(|info| (info.texture, info.layer))
             .or_else(|| drawn_target(&lights, &keys, render_light, view.subview));
         let twin_target = twin.and_then(|twin| drawn_target(&lights, &keys, twin, view.subview));
+        // The layer lighting reads a point light's face from: its index among
+        // the clustered lights (the cube array is indexed by it) times six,
+        // plus the face; found apart from where the cache says it drew.
+        let read_layer = |light: Entity| match view.subview {
+            ShadowSubview::PointFace(face) => cluster_meta
+                .entity_to_index
+                .get(&light)
+                .map(|index| (*index * 6 + face as usize) as u32),
+            _ => None,
+        };
         let read = binding.map(|binding| {
             if point {
                 binding.point_light_depth_texture.id()
@@ -964,6 +980,20 @@ fn audit_shadow_caches(
                 (Ok(read), _, Some((texture, _))) if settings.fresh_redraws && texture != read => {
                     ShadowCacheAuditStatus::Missing(
                         "the twin drew into another texture than lighting reads",
+                    )
+                }
+                (_, Some((_, layer)), _) if point && read_layer(render_light) != Some(layer) => {
+                    ShadowCacheAuditStatus::Missing(
+                        "the light drew into another layer than lighting reads",
+                    )
+                }
+                (_, _, Some((_, layer)))
+                    if point
+                        && settings.fresh_redraws
+                        && read_layer(twin.unwrap()) != Some(layer) =>
+                {
+                    ShadowCacheAuditStatus::Missing(
+                        "the twin drew into another layer than lighting reads",
                     )
                 }
                 _ => ShadowCacheAuditStatus::Compared,

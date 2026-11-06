@@ -250,16 +250,19 @@ pub fn update_point_light_frusta(
         // by applying those as a view transform to shadow map rendering of objects
         // and ignore rotation because we want the shadow map projections to align with the axes
         let view_translation = Transform::from_translation(transform.translation());
-        let view_backward = transform.back();
 
         for (view_rotation, frustum) in view_rotations.iter().zip(cubemap_frusta.iter_mut()) {
             let world_from_view = view_translation * *view_rotation;
             let clip_from_world = clip_from_view * world_from_view.compute_affine().inverse();
 
+            // MPS: each face's far plane at the range along the face's own
+            // axis (the light's rotation set it for every face before, which
+            // left five faces unbounded: GPU culling drew casters out of
+            // range, and the shadow cache's face bounds couldn't hold them).
             *frustum = Frustum(ViewFrustum::from_clip_from_world_custom_far(
                 &clip_from_world,
                 &transform.translation(),
-                &view_backward,
+                &world_from_view.back(),
                 point_light.range,
             ));
         }

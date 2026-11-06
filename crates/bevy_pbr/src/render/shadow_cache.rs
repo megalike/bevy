@@ -973,7 +973,9 @@ impl ShadowViewCaches {
         let working_valid = owned
             && (state.working == Some((destination, revision))
                 || (args.faults.miss_index_change
-                    && state.working.is_some_and(|(_, working)| working == revision)));
+                    && state
+                        .working
+                        .is_some_and(|(_, working)| working == revision)));
         // A view whose light lights no camera's view draws nothing until it
         // lights one again; the fault forgets in that frame what was written
         // before.
