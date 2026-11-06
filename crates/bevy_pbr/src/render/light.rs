@@ -24,9 +24,10 @@ use bevy_light::cluster::assign::{calculate_cluster_factors, ClusterableObjectTy
 use bevy_light::SunDisk;
 use bevy_light::{
     spot_light_clip_from_view, spot_light_world_from_view, AmbientLight, CascadeShadowConfig,
-    Cascades, DirectionalLight, DirectionalLightShadowMap, GlobalAmbientLight, PointLight,
-    PointLightShadowMap, RectLight, ShadowCacheFaults, ShadowCacheSettings, ShadowFilteringMethod,
-    ShadowViewId, SpotLight, SpotLightShadowCache, VolumetricLight,
+    Cascades, DirectionalLight, DirectionalLightShadowCache, DirectionalLightShadowMap,
+    GlobalAmbientLight, PointLight, PointLightShadowMap, RectLight, ShadowCacheFaults,
+    ShadowCacheSettings, ShadowFilteringMethod, ShadowSubview, ShadowViewId, SpotLight,
+    SpotLightShadowCache, VolumetricLight,
 };
 use bevy_log::warn_once;
 use bevy_material::{
@@ -130,6 +131,10 @@ pub struct ExtractedDirectionalLight {
     pub occlusion_culling: bool,
     pub sun_disk_angular_size: f32,
     pub sun_disk_intensity: f32,
+    /// MPS: the cached far cascade's view of each camera (by the camera's
+    /// render entity), while the light is cached.
+    #[doc(hidden)]
+    pub cached_views: EntityHashMap<ExtractedShadowView>,
 }
 
 // NOTE: These must match the bit flags in bevy_pbr/src/render/mesh_view_types.wesl!
@@ -401,10 +406,12 @@ pub fn extract_lights(
                 Option<&VolumetricLight>,
                 Has<OcclusionCulling>,
                 Option<&SunDisk>,
+                Option<&DirectionalLightShadowCache>,
             ),
             (
                 Without<SpotLight>,
                 Or<(
+                    Changed<DirectionalLightShadowCache>,
                     Changed<DirectionalLight>,
                     Changed<CascadesVisibleEntities>,
                     Changed<Cascades>,
@@ -811,6 +818,7 @@ pub fn extract_lights(
         volumetric_light,
         occlusion_culling,
         sun_disk,
+        shadow_cache,
     ) in &directional_lights
     {
         if !view_visibility.get() {
@@ -827,6 +835,9 @@ pub fn extract_lights(
         // TODO: update in place instead of reinserting.
         let mut extracted_cascades = EntityHashMap::default();
         let mut extracted_frusta = EntityHashMap::default();
+        // MPS: the cached far cascades, by the camera's render entity.
+        let mut cached_views = EntityHashMap::default();
+        let shadow_cache = shadow_cache.filter(|cache| cache.is_cached());
 
         if directional_light.shadow_maps_enabled {
             // Fetch or create the visible entities set for each cascade.
@@ -865,44 +876,99 @@ pub fn extract_lights(
             for (main_auxiliary_entity, visible_mesh_entities_list) in
                 visible_entities.entities.iter()
             {
+                // MPS: the camera's cached far cascade, if any: its movers and
+                // static views draw two lists (one, with every caster, while it
+                // has no usable static layer).
+                let cached_view = shadow_cache.and_then(|cache| {
+                    cache
+                        .view(*main_auxiliary_entity)
+                        .map(|view| (cache.cascade(), view))
+                });
+                if let Some((cascade, view)) = cached_view
+                    && let Ok(camera_render_entity) = mapper.get(*main_auxiliary_entity)
+                {
+                    cached_views.insert(
+                        **camera_render_entity,
+                        ExtractedShadowView::new(
+                            ShadowViewId {
+                                light: main_entity,
+                                subview: ShadowSubview::Directional {
+                                    camera: *main_auxiliary_entity,
+                                    cascade,
+                                },
+                            },
+                            view,
+                        ),
+                    );
+                }
                 for subview_index in 0..(cascade_config.bounds.len() as u32) {
-                    let retained_view_entity = RetainedViewEntity {
-                        main_entity: MainEntity::from(main_entity),
-                        auxiliary_entity: (*main_auxiliary_entity != Entity::PLACEHOLDER)
-                            .then_some(MainEntity::from(*main_auxiliary_entity)),
-                        subview_index,
+                    let visible_mesh_entities = visible_mesh_entities_list
+                        .get(subview_index as usize)
+                        .map(|list| &list.entities[..]);
+                    let cached_here = cached_view.filter(|(cascade, _)| *cascade == subview_index);
+                    let lists = match cached_here {
+                        Some((_, view)) if !view.single_view() => [
+                            Some((ShadowViewRole::Movers, visible_mesh_entities)),
+                            Some((
+                                ShadowViewRole::Static,
+                                view.statics_walked().then(|| view.static_entities()),
+                            )),
+                            view.reference_entities()
+                                .map(|entities| (ShadowViewRole::Reference, Some(entities))),
+                        ],
+                        Some((_, view)) => [
+                            Some((ShadowViewRole::Full, visible_mesh_entities)),
+                            None,
+                            view.reference_entities()
+                                .map(|entities| (ShadowViewRole::Reference, Some(entities))),
+                        ],
+                        None => [
+                            Some((ShadowViewRole::Full, visible_mesh_entities)),
+                            None,
+                            None,
+                        ],
                     };
-                    all_cascades_seen.insert(retained_view_entity);
+                    for (role, entities) in lists.into_iter().flatten() {
+                        let retained_view_entity = RetainedViewEntity {
+                            main_entity: MainEntity::from(main_entity),
+                            auxiliary_entity: (*main_auxiliary_entity != Entity::PLACEHOLDER)
+                                .then_some(MainEntity::from(*main_auxiliary_entity)),
+                            subview_index: role.subview_index(subview_index),
+                        };
+                        all_cascades_seen.insert(retained_view_entity);
 
-                    existing_shadow_map_visible_entities
-                        .subviews
-                        .entry(retained_view_entity)
-                        .or_insert_with(|| (system_change_tick.this_run(), Default::default()));
+                        existing_shadow_map_visible_entities
+                            .subviews
+                            .entry(retained_view_entity)
+                            .or_insert_with(|| (system_change_tick.this_run(), Default::default()));
 
-                    // Extract the visible CPU culled entities to the list.
-                    let extracted_entities = &mut existing_extracted_shadow_map_visible_entities
-                        .subviews
-                        .entry(retained_view_entity)
-                        .or_default()
-                        .classes
-                        .entry(TypeId::of::<Mesh3d>())
-                        .or_default()
-                        .entities;
-                    extracted_entities.clear();
-                    let Some(visible_mesh_entities) =
-                        visible_mesh_entities_list.get(subview_index as usize)
-                    else {
-                        continue;
-                    };
-                    extracted_entities.extend(visible_mesh_entities.entities.iter().map(
-                        |main_entity| {
+                        // Extract the visible CPU culled entities to the list.
+                        // MPS: a cached view's static list only when it was
+                        // found again.
+                        let extracted_entities =
+                            &mut existing_extracted_shadow_map_visible_entities
+                                .subviews
+                                .entry(retained_view_entity)
+                                .or_default()
+                                .classes
+                                .entry(TypeId::of::<Mesh3d>())
+                                .or_default()
+                                .entities;
+                        if role != ShadowViewRole::Static {
+                            extracted_entities.clear();
+                        }
+                        let Some(entities) = entities else {
+                            continue;
+                        };
+                        extracted_entities.clear();
+                        extracted_entities.extend(entities.iter().map(|main_entity| {
                             let render_entity = match mapper.get(*main_entity) {
                                 Ok(render_entity) => **render_entity,
                                 Err(_) => Entity::PLACEHOLDER,
                             };
                             (render_entity, MainEntity::from(*main_entity))
-                        },
-                    ));
+                        }));
+                    }
                 }
             }
 
@@ -943,6 +1009,7 @@ pub fn extract_lights(
             occlusion_culling,
             sun_disk_angular_size: sun_disk.unwrap_or_default().angular_size,
             sun_disk_intensity: sun_disk.unwrap_or_default().intensity,
+            cached_views,
         };
 
         let mut entity_commands = commands
@@ -1022,7 +1089,9 @@ pub(crate) fn remove_light_view_entities(
 ) {
     if let Ok(entities) = query.get(remove.entity) {
         for v in entities.0.values() {
-            for e in v.iter().copied() {
+            // MPS: a cached far cascade's views are placeholders while it
+            // doesn't draw.
+            for e in v.iter().copied().filter(|e| *e != Entity::PLACEHOLDER) {
                 if let Ok(mut v) = commands.get_entity(e) {
                     v.despawn();
                 }
@@ -1176,6 +1245,7 @@ pub fn prepare_lights(
             &MainEntity,
             &ExtractedDirectionalLight,
             &RenderLayers,
+            Option<&RenderShadowMapVisibleEntities>,
         )>,
         Query<(Entity, &MainEntity, &ExtractedRectLight, &RenderLayers)>,
         Query<&mut DirectionalLightViewEntities>,
@@ -1243,7 +1313,7 @@ pub fn prepare_lights(
         .collect::<Vec<_>>();
     let mut directional_light_entities: Vec<_> = directional_lights
         .iter()
-        .map(|(entity, _, _, _)| entity)
+        .map(|(entity, ..)| entity)
         .collect::<Vec<_>>();
     let rect_light_entities: Vec<_> = rect_lights
         .iter()
@@ -1298,7 +1368,7 @@ pub fn prepare_lights(
     }
 
     if !*max_cascades_per_light_warning_emitted
-        && directional_lights.iter().any(|(_, _, light, _)| {
+        && directional_lights.iter().any(|(_, _, light, ..)| {
             light.cascade_shadow_config.bounds.len() > MAX_CASCADES_PER_LIGHT
         })
     {
@@ -1329,14 +1399,14 @@ pub fn prepare_lights(
     let directional_volumetric_enabled_count = directional_lights
         .iter()
         .take(MAX_DIRECTIONAL_LIGHTS)
-        .filter(|(_, _, light, _)| light.volumetric)
+        .filter(|(_, _, light, ..)| light.volumetric)
         .count()
         .min(max_texture_array_layers / MAX_CASCADES_PER_LIGHT);
 
     let directional_shadow_enabled_count = directional_lights
         .iter()
         .take(MAX_DIRECTIONAL_LIGHTS)
-        .filter(|(_, _, light, _)| light.shadow_maps_enabled)
+        .filter(|(_, _, light, ..)| light.shadow_maps_enabled)
         .count()
         .min(max_texture_array_layers / MAX_CASCADES_PER_LIGHT);
 
@@ -1550,7 +1620,8 @@ pub fn prepare_lights(
         let render_layers = maybe_layers.unwrap_or_default();
 
         for light_entity in directional_light_entities.iter() {
-            let (_, _, light, light_render_layers) = directional_lights.get(*light_entity).unwrap();
+            let (_, _, light, light_render_layers, _) =
+                directional_lights.get(*light_entity).unwrap();
             if light.shadow_maps_enabled && light_render_layers.intersects(render_layers) {
                 num_directional_cascades_for_this_view += light
                     .cascade_shadow_config
@@ -1623,6 +1694,9 @@ pub fn prepare_lights(
                 array_layer_count: None,
             });
 
+    let audit_copies = directional_lights
+        .iter()
+        .any(|(_, _, light, ..)| light.cached_views.values().any(|view| view.reference));
     let directional_light_depth_texture = texture_cache.get(
         &render_device,
         TextureDescriptor {
@@ -1640,7 +1714,14 @@ pub fn prepare_lights(
             dimension: TextureDimension::D2,
             format: CORE_3D_SHADOW_MAP_FORMAT,
             label: Some("directional_light_shadow_map_texture"),
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            // MPS: the shadow cache audit copies cached cascades out of it.
+            usage: TextureUsages::RENDER_ATTACHMENT
+                | TextureUsages::TEXTURE_BINDING
+                | if audit_copies {
+                    TextureUsages::COPY_SRC
+                } else {
+                    TextureUsages::empty()
+                },
             view_formats: &[],
         },
     );
@@ -1668,7 +1749,11 @@ pub fn prepare_lights(
             });
 
     spot_shadow_caches.prepare_for_new_frame(
-        cached_spot_lights.iter().map(|cache| &cache.0),
+        cached_spot_lights.iter().map(|cache| &cache.0).chain(
+            directional_lights
+                .iter()
+                .flat_map(|(_, _, light, ..)| light.cached_views.values()),
+        ),
         &shadow_cache_settings,
     );
 
@@ -1861,8 +1946,6 @@ pub fn prepare_lights(
         live_shadow_mapping_lights.insert(retained_view_entity);
     }
 
-    spot_shadow_caches.finish_frame(&render_device, &render_queue);
-
     // set up light data for each view
     for (
         entity,
@@ -2045,7 +2128,7 @@ pub fn prepare_lights(
             .enumerate()
             .take(MAX_DIRECTIONAL_LIGHTS)
         {
-            let (_, light_main_entity, light, light_render_layers) =
+            let (_, light_main_entity, light, light_render_layers, light_visible_entities) =
                 directional_lights.get(*light_entity).unwrap();
 
             let Ok(mut light_view_entities) =
@@ -2081,15 +2164,30 @@ pub fn prepare_lights(
                 .zip(frusta)
                 .zip(&light.cascade_shadow_config.bounds);
 
+            // MPS: a view per cascade, then two slots for a cached far
+            // cascade's static and movers views (placeholders while unused).
+            let cascade_count = iter.len();
             let light_view_entities = light_view_entities.entry(entity).or_insert_with(|| {
-                (0..iter.len())
+                (0..cascade_count)
                     .map(|_| commands.spawn_empty().id())
+                    .chain([Entity::PLACEHOLDER; 2])
                     .collect()
             });
-            if light_view_entities.len() != iter.len() {
+            // (Three cached slots while the audit draws a reference.)
+            if !(cascade_count + 2..=cascade_count + 3).contains(&light_view_entities.len()) {
                 let entities = mem::take(light_view_entities);
                 despawn_entities(&mut commands, entities);
-                light_view_entities.extend((0..iter.len()).map(|_| commands.spawn_empty().id()));
+                light_view_entities.extend(
+                    (0..cascade_count)
+                        .map(|_| commands.spawn_empty().id())
+                        .chain([Entity::PLACEHOLDER; 2]),
+                );
+            }
+            let cached_view = light.cached_views.get(&entity);
+            let mut cached_slots = light_view_entities.split_off(cascade_count);
+            if cached_view.is_none() {
+                despawn_entities(&mut commands, mem::take(&mut cached_slots));
+                cached_slots = vec![Entity::PLACEHOLDER; 2];
             }
 
             for (cascade_index, (((cascade, frustum), bound), view_light_entity)) in
@@ -2128,6 +2226,7 @@ pub fn prepare_lights(
                     None,
                 );
 
+                let layer = directional_depth_texture_array_index;
                 directional_depth_texture_array_index += 1;
 
                 let mut frustum = *frustum;
@@ -2137,6 +2236,70 @@ pub fn prepare_lights(
                         .normal()
                         .extend(f32::INFINITY),
                 );
+
+                // MPS: a cached far cascade plans its frame and sets up its
+                // own views (static, then movers), drawn in this camera's
+                // shadow pass in that order.
+                if let Some(extracted) = cached_view
+                    .filter(|extracted| extracted.id.subview_index() == cascade_index as u32)
+                {
+                    // The cascade's own view must not keep its key while the
+                    // cached views draw (a single view takes the same key).
+                    commands
+                        .entity(view_light_entity)
+                        .remove::<(ShadowView, ExtractedView, LightEntity)>();
+                    let pass_name =
+                        format!("shadow_directional_light_{light_index}_cascade_{cascade_index}");
+                    spot_shadow_caches.prepare_view(
+                        &mut commands,
+                        CachedShadowView {
+                            root: false,
+                            shared_destination: true,
+                            clip_from_world: Some(cascade.clip_from_world),
+                            extracted,
+                            light_entity: *light_entity,
+                            light_kind: LightEntity::Directional {
+                                light_entity: *light_entity,
+                                cascade_index,
+                            },
+                            render_layers: light_render_layers,
+                            world_from_view: GlobalTransform::from(cascade.world_from_cascade),
+                            clip_from_view: cascade.clip_from_cascade,
+                            frustum: Some(&frustum),
+                            pass_name: &pass_name,
+                            shadow_map: &directional_light_depth_texture,
+                            layer,
+                            map_size: directional_light_shadow_map.size as u32,
+                            gpu_preprocessing_mode,
+                            visible_entities: light_visible_entities,
+                            stale_meshes,
+                            static_gpu_culled: gpu_culled_entities
+                                .as_deref()
+                                .map_or(&no_stale_meshes, |entities| {
+                                    &entities.static_shadow_casters
+                                }),
+                            faults: shadow_cache_faults.as_deref().copied().unwrap_or_default(),
+                        },
+                        &mut cached_slots,
+                        &shadow_cache_settings,
+                        (
+                            &render_device,
+                            shadow_restore_pipeline.as_deref(),
+                            &pipeline_cache,
+                        ),
+                        &mut shadow_render_phases,
+                        &mut live_shadow_mapping_lights,
+                    );
+                    view_lights.extend(
+                        cached_slots
+                            .iter()
+                            .copied()
+                            .filter(|entity| *entity != Entity::PLACEHOLDER),
+                    );
+                    continue;
+                }
+                spot_shadow_caches
+                    .note_shared_draw(directional_light_depth_texture.texture.id(), layer);
 
                 let retained_view_entity = RetainedViewEntity::new(
                     *light_main_entity,
@@ -2199,6 +2362,7 @@ pub fn prepare_lights(
                     .prepare_for_new_frame(retained_view_entity, gpu_preprocessing_mode);
                 live_shadow_mapping_lights.insert(retained_view_entity);
             }
+            light_view_entities.extend(cached_slots);
         }
 
         // Make a link from the camera to all shadow cascades with occlusion
@@ -2252,6 +2416,9 @@ pub fn prepare_lights(
             },
         ));
     }
+
+    // MPS: after the cameras' cached far cascades were planned too.
+    spot_shadow_caches.finish_frame(&render_device, &render_queue);
 
     // Mark the existing shadow maps as unused this frame so that the first
     // drawcall to them will clear them.
@@ -2504,7 +2671,12 @@ fn despawn_entities(commands: &mut Commands, entities: Vec<Entity>) {
         return;
     }
     commands.queue(move |world: &mut World| {
-        for entity in entities {
+        // MPS: a cached far cascade keeps placeholders for views it doesn't
+        // draw.
+        for entity in entities
+            .into_iter()
+            .filter(|entity| *entity != Entity::PLACEHOLDER)
+        {
             world.despawn(entity);
         }
     });
@@ -3157,6 +3329,11 @@ pub fn per_view_shadow_pass<const IS_LATE: bool>(
         Has<PreprocessBindGroups>,
         Has<SkipGpuPreprocess>,
         Has<NoIndirectDrawing>,
+        (
+            Option<&ShadowRestore>,
+            Option<&ShadowPassRecord>,
+            Option<&ShadowAuditCopy>,
+        ),
     )>,
     shadow_render_phases: Res<ViewBinnedRenderPhases<Shadow>>,
     preprocess_pipelines: Option<Res<PreprocessPipelines>>,
@@ -3180,6 +3357,7 @@ pub fn per_view_shadow_pass<const IS_LATE: bool>(
             has_preprocess_bind_groups,
             has_skip_gpu_preprocess,
             has_no_indirect_drawing,
+            (restore, record, audit_copy),
         )) = view_light_query.get(view_light_entity)
         else {
             continue;
@@ -3214,8 +3392,17 @@ pub fn per_view_shadow_pass<const IS_LATE: bool>(
             );
         }
 
+        // MPS: a cached far cascade's movers view first restores its static
+        // layer into the cascade's layer, once, before its early pass.
+        if !IS_LATE
+            && let Some(restore) = restore
+            && shadow_render_phases.contains_key(&extracted_light_view.retained_view_entity)
+        {
+            restore_shadow_map(world, restore, &mut ctx);
+        }
+
         // Draw the shadow map.
-        view_shadow_pass::<IS_LATE>(
+        let rendered = view_shadow_pass::<IS_LATE>(
             view_light_entity,
             view_light,
             extracted_light_view,
@@ -3224,6 +3411,20 @@ pub fn per_view_shadow_pass<const IS_LATE: bool>(
             &shadow_render_phases,
             &mut ctx,
         );
+        if !IS_LATE
+            && rendered
+            && let Some(record) = record
+        {
+            record.record();
+        }
+        // MPS: the audit's copy of a cached cascade's map, before another
+        // camera's cascades draw over it.
+        if !IS_LATE
+            && let Some(copy) = audit_copy
+            && shadow_render_phases.contains_key(&extracted_light_view.retained_view_entity)
+        {
+            copy_for_audit(copy, &mut ctx);
+        }
     }
 
     time_span.end(ctx.command_encoder());

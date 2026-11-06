@@ -68,6 +68,17 @@ use bevy_mesh::{mark_3d_meshes_as_changed_if_their_assets_changed, Mesh, Mesh2d,
 #[derive(Component, Default)]
 pub struct NoCpuCulling;
 
+/// MPS: cameras never draw this entity (nor mark it visible); shadow views
+/// still can, which makes it visible for extraction. For shadow-only casters,
+/// such as a far shadow cascade's stand-ins (`bevy_light`'s
+/// `FarCascadeStandIn` requires it).
+///
+/// Only the CPU culling path honors it: an entity with [`NoCpuCulling`] is
+/// collected for every view on the GPU.
+#[derive(Component, Clone, Copy, Debug, Default, Reflect)]
+#[reflect(Component, Default, Debug, Clone)]
+pub struct NotCameraVisible;
+
 /// User indication of whether an entity is visible. Propagates down the entity hierarchy.
 ///
 /// If an entity is hidden in this way, all [`Children`] (and all of their children and so on) who
@@ -768,7 +779,8 @@ pub fn check_visibility_cpu_culling(
             Has<NoFrustumCulling>,
             Has<VisibilityRange>,
         ),
-        Without<NoCpuCulling>,
+        // MPS: never in a camera's view.
+        (Without<NoCpuCulling>, Without<NotCameraVisible>),
     >,
     visible_entity_ranges: Option<Res<VisibleEntityRanges>>,
 ) {

@@ -53,7 +53,7 @@ use std::sync::Mutex;
 
 use bevy_asset::{AssetEvent, AssetId, UntypedAssetId};
 use bevy_camera::{
-    primitives::{Aabb, Frustum, Sphere},
+    primitives::{Aabb, CascadesFrusta, Frustum, Sphere},
     visibility::{InheritedVisibility, NoFrustumCulling, RenderLayers, VisibilityRange},
 };
 use bevy_ecs::{
@@ -74,12 +74,13 @@ use bevy_platform::{
     sync::atomic::{AtomicU64, Ordering},
 };
 use bevy_reflect::prelude::*;
+use bevy_shape::{HalfSpace, ViewFrustum};
 use bevy_time::Time;
 use bevy_transform::components::GlobalTransform;
 
 use crate::{
-    spot_light_clip_from_view, spot_light_world_from_view, DirectionalLightShadowMap,
-    NotShadowCaster, SpotLight,
+    spot_light_clip_from_view, spot_light_world_from_view, stable_cascade::view_takes,
+    DirectionalLightShadowMap, NotShadowCaster, ShadowRepresentation, SpotLight,
 };
 
 /// The marker Bevy keeps on a mesh whose shadow is settled: it is drawn into
@@ -237,6 +238,22 @@ pub struct ShadowCacheFaults {
     /// casters touch now, not those they were drawn into before it lit no
     /// view.
     pub skip_reentry_restore: bool,
+    /// Take a cached directional cascade's map for current although another
+    /// camera drew its own cascade into the same layer since.
+    pub miss_ownership: bool,
+    /// Keep a cached directional cascade's static layer when its projection
+    /// changes (a re-center, a new depth interval).
+    pub stale_projection: bool,
+    /// Find where a cached far cascade's live casters fall with the cascade
+    /// before it.
+    pub wrong_cascade: bool,
+    /// Never re-center a stable far cascade (a projection fault: its coverage
+    /// expires; caught by the coverage check, not by the maps).
+    pub miss_recenter: bool,
+    /// Not a fault: each cached directional cascade also lists every caster
+    /// it draws, found anew each frame, for the audit's reference view
+    /// (`bevy_pbr`'s `ShadowCacheAuditPlugin` sets it).
+    pub directional_reference: bool,
     /// Not a fault: treat the blit that restores static layers as not
     /// compiled, so every cached light falls back to full redraws, as in the
     /// first frames. The shadow maps must stay correct.
@@ -383,6 +400,8 @@ pub(crate) struct CasterSignature {
     visible: bool,
     layers: RenderLayers,
     no_frustum_culling: bool,
+    /// MPS: which shadow views it casts into besides its layers.
+    representation: Option<ShadowRepresentation>,
 }
 
 fn same_bits(a: &[f32], b: &[f32]) -> bool {
@@ -418,7 +437,7 @@ impl CasterSignature {
             Some(ShadowCasterChange::Mesh)
         } else if self.visible != other.visible {
             Some(ShadowCasterChange::Visibility)
-        } else if self.layers != other.layers {
+        } else if self.layers != other.layers || self.representation != other.representation {
             Some(ShadowCasterChange::Layers)
         } else {
             None
@@ -429,9 +448,12 @@ impl CasterSignature {
     fn touches(&self, light: &ShadowViewBounds) -> bool {
         self.visible
             && light.layers.intersects(&self.layers)
+            && view_takes(light.stand_ins, self.representation)
             && match &self.aabb {
                 Some(aabb) if !self.no_frustum_culling => {
-                    light.sphere.intersects_obb(aabb, &self.world_from_local)
+                    light
+                        .sphere
+                        .is_none_or(|sphere| sphere.intersects_obb(aabb, &self.world_from_local))
                         && light
                             .frustum
                             .intersects_obb(aabb, &self.world_from_local, true, true)
@@ -443,9 +465,12 @@ impl CasterSignature {
 
 /// Where a cached shadow view can draw a caster.
 pub(crate) struct ShadowViewBounds {
-    sphere: Sphere,
+    /// Its range (a directional view has none).
+    sphere: Option<Sphere>,
     frustum: Frustum,
     layers: RenderLayers,
+    /// It draws far cascade stand-ins instead of their detail.
+    stand_ins: bool,
 }
 
 impl ShadowViewBounds {
@@ -458,12 +483,35 @@ impl ShadowViewBounds {
         layers: RenderLayers,
     ) -> ShadowViewBounds {
         ShadowViewBounds {
-            sphere: Sphere {
+            sphere: Some(Sphere {
                 center: transform.translation_vec3a(),
                 radius: spot_light.range,
-            },
+            }),
             frustum: *frustum,
             layers,
+            stand_ins: false,
+        }
+    }
+
+    /// A directional light's cascade: its frustum without its near plane (a
+    /// caster before it is drawn, clamped) and the layers that projected its
+    /// static layer.
+    pub(crate) fn directional(
+        frustum: &Frustum,
+        layers: RenderLayers,
+        stand_ins: bool,
+    ) -> ShadowViewBounds {
+        let mut frustum = *frustum;
+        frustum.half_spaces[ViewFrustum::NEAR_PLANE_IDX] = HalfSpace::new(
+            frustum.half_spaces[ViewFrustum::NEAR_PLANE_IDX]
+                .normal()
+                .extend(f32::INFINITY),
+        );
+        ShadowViewBounds {
+            sphere: None,
+            frustum,
+            layers,
+            stand_ins,
         }
     }
 }
@@ -675,6 +723,33 @@ impl ShadowFootprint {
         }
         let min = min.max(Vec2::ZERO);
         let max = max.min(Vec2::ONE);
+        if min.x > max.x || min.y > max.y {
+            return ShadowFootprint::Empty;
+        }
+        ShadowFootprint::Rect { min, max }
+    }
+
+    /// The footprint of an oriented box in an orthographic shadow map (a
+    /// directional light's cascade). Its depth doesn't matter: a caster
+    /// closer to the light than the near plane is drawn clamped onto it,
+    /// where its box projects.
+    pub fn of_box_orthographic(
+        clip_from_world: &Mat4,
+        aabb: &Aabb,
+        world_from_local: &Affine3A,
+    ) -> ShadowFootprint {
+        let clip_from_local = *clip_from_world * Mat4::from(*world_from_local);
+        let center = clip_from_local * aabb.center.extend(1.0);
+        let reach = (clip_from_local.x_axis * aabb.half_extents.x).abs()
+            + (clip_from_local.y_axis * aabb.half_extents.y).abs()
+            + (clip_from_local.z_axis * aabb.half_extents.z).abs();
+        if !(center.is_finite() && reach.is_finite()) {
+            return ShadowFootprint::Whole;
+        }
+        let (low, high) = (center.xy() - reach.xy(), center.xy() + reach.xy());
+        // v runs down the map.
+        let min = Vec2::new(low.x * 0.5 + 0.5, 0.5 - high.y * 0.5).max(Vec2::ZERO);
+        let max = Vec2::new(high.x * 0.5 + 0.5, 0.5 - low.y * 0.5).min(Vec2::ONE);
         if min.x > max.x || min.y > max.y {
             return ShadowFootprint::Empty;
         }
@@ -1015,12 +1090,58 @@ impl MoversGrid {
     }
 }
 
+/// What decides a cached directional cascade's static layer besides its
+/// casters: its exact projection (a stable far cascade keeps it bit for bit
+/// while the camera only turns), the map size, the layers and whether it
+/// draws far stand-ins.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DirectionalShadowProjection {
+    clip_from_world: [u32; 16],
+    map_size: usize,
+    render_layers: RenderLayers,
+    stand_ins: bool,
+}
+
+impl DirectionalShadowProjection {
+    pub(crate) fn new(
+        clip_from_world: &Mat4,
+        map_size: usize,
+        render_layers: &RenderLayers,
+        stand_ins: bool,
+    ) -> Self {
+        Self {
+            clip_from_world: clip_from_world.to_cols_array().map(f32::to_bits),
+            map_size,
+            render_layers: render_layers.clone(),
+            stand_ins,
+        }
+    }
+
+    /// Whether the view draws far stand-ins instead of their detail.
+    pub(crate) fn stand_ins(&self) -> bool {
+        self.stand_ins
+    }
+}
+
+/// What a directional light's cached views settle on: what projects every
+/// cascade of every camera (its direction, the map size and its layers). A
+/// camera's far projection moving (a re-center) redraws that view but doesn't
+/// restart the light's settling.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DirectionalLightSettle {
+    pub(crate) rotation: [u32; 4],
+    pub(crate) map_size: usize,
+    pub(crate) render_layers: RenderLayers,
+}
+
 /// What projected a shadow view's static layer: when it changes, the layer
 /// is drawn again. Each light type's adapter fills in its own.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ShadowViewProjection {
     /// A spot light's.
     Spot(SpotShadowProjection),
+    /// A directional light's cascade for a camera.
+    Directional(DirectionalShadowProjection),
 }
 
 impl ShadowViewProjection {
@@ -1028,6 +1149,7 @@ impl ShadowViewProjection {
     pub(crate) fn render_layers(&self) -> &RenderLayers {
         match self {
             ShadowViewProjection::Spot(projection) => &projection.render_layers,
+            ShadowViewProjection::Directional(projection) => &projection.render_layers,
         }
     }
 
@@ -1035,6 +1157,15 @@ impl ShadowViewProjection {
     pub(crate) fn is_spot(&self, spot: &SpotShadowProjection) -> bool {
         match self {
             ShadowViewProjection::Spot(projection) => projection == spot,
+            ShadowViewProjection::Directional(_) => false,
+        }
+    }
+
+    /// Whether it is this directional cascade projection.
+    pub(crate) fn is_directional(&self, directional: &DirectionalShadowProjection) -> bool {
+        match self {
+            ShadowViewProjection::Directional(projection) => projection == directional,
+            ShadowViewProjection::Spot(_) => false,
         }
     }
 }
@@ -1059,6 +1190,10 @@ pub struct ShadowViewCache {
     pub(crate) live_casters: u32,
     pub(crate) lights_a_view: bool,
     pub(crate) single_view: bool,
+    /// For the audit: every caster the view draws, found anew this frame
+    /// (directional cascades, with
+    /// [`ShadowCacheFaults::directional_reference`]).
+    pub(crate) reference: Option<Vec<Entity>>,
 }
 
 impl ShadowViewCache {
@@ -1127,6 +1262,13 @@ impl ShadowViewCache {
     /// frame.
     pub fn lights_a_view(&self) -> bool {
         self.lights_a_view
+    }
+
+    /// For the audit: every caster the view draws, found anew this frame,
+    /// when [`ShadowCacheFaults::directional_reference`] asks for it.
+    #[doc(hidden)]
+    pub fn reference_entities(&self) -> Option<&[Entity]> {
+        self.reference.as_deref()
     }
 
     /// Whether the view has no static layer it can use (the render world
@@ -1243,6 +1385,46 @@ impl SpotLightShadowCache {
     /// See [`ShadowViewCache::single_view`].
     pub fn single_view(&self) -> bool {
         self.view.single_view()
+    }
+}
+
+/// What the main world keeps for a directional light: whether it is cached
+/// (the cache on, the light settled, and a stable far cascade,
+/// [`StableFarCascade`](crate::StableFarCascade)), and the shadow view of its
+/// far cascade for each camera ([`ShadowSubview::Directional`]). Its other
+/// cascades are drawn whole every frame. Bevy adds and updates it on every
+/// [`DirectionalLight`](crate::DirectionalLight).
+#[derive(Component, Clone, Debug, Default)]
+pub struct DirectionalLightShadowCache {
+    /// Whether the light is cached this frame.
+    pub(crate) cached: bool,
+    pub(crate) settlement: LightSettlement<DirectionalLightSettle>,
+    /// The cached cascade's index (the last one).
+    pub(crate) cascade: u32,
+    /// The cached far cascade's view, by camera.
+    pub(crate) views: EntityHashMap<ShadowViewCache>,
+}
+
+impl DirectionalLightShadowCache {
+    /// Whether the light is cached: shadows on, the cache on, a stable far
+    /// cascade, and the light settled.
+    pub fn is_cached(&self) -> bool {
+        self.cached
+    }
+
+    /// The index of the cascade that is cached (the far one).
+    pub fn cascade(&self) -> u32 {
+        self.cascade
+    }
+
+    /// The far cascade's view for a camera, while the light is cached.
+    pub fn view(&self, camera: Entity) -> Option<&ShadowViewCache> {
+        self.views.get(&camera)
+    }
+
+    /// The cached views: (camera, view).
+    pub fn views(&self) -> impl Iterator<Item = (Entity, &ShadowViewCache)> {
+        self.views.iter().map(|(camera, view)| (*camera, view))
     }
 }
 
@@ -1363,6 +1545,7 @@ type CasterQuery<'w, 's, F> = Query<
         Option<Ref<'static, RenderLayers>>,
         Option<Ref<'static, NoFrustumCulling>>,
         Option<Ref<'static, MeshTag>>,
+        Option<Ref<'static, ShadowRepresentation>>,
     ),
     (
         Without<NotShadowCaster>,
@@ -1389,6 +1572,7 @@ type WrittenSettled = (
         Changed<NoFrustumCulling>,
         Changed<MeshTag>,
         Changed<ShadowCasterState>,
+        Changed<ShadowRepresentation>,
     )>,
 );
 
@@ -1401,6 +1585,7 @@ fn signature_of(
     layers: Option<&RenderLayers>,
     no_frustum_culling: bool,
     tag: u32,
+    representation: Option<&ShadowRepresentation>,
 ) -> CasterSignature {
     CasterSignature {
         world_from_local: transform.affine(),
@@ -1410,6 +1595,7 @@ fn signature_of(
         visible: visibility.get(),
         layers: layers.cloned().unwrap_or_default(),
         no_frustum_culling,
+        representation: representation.copied(),
     }
 }
 
@@ -1454,6 +1640,7 @@ type CasterItem<'w> = (
     Option<Ref<'w, RenderLayers>>,
     Option<Ref<'w, NoFrustumCulling>>,
     Option<Ref<'w, MeshTag>>,
+    Option<Ref<'w, ShadowRepresentation>>,
 );
 
 /// What [`classify_shadow_casters`] keeps between frames.
@@ -1496,11 +1683,18 @@ pub fn classify_shadow_casters(
         MessageReader<InvalidateShadowCache>,
         MessageReader<AssetEvent<Mesh>>,
     ),
-    (mut removed_layers, mut removed_no_culling, mut removed_aabbs, mut removed_tags): (
+    (
+        mut removed_layers,
+        mut removed_no_culling,
+        mut removed_aabbs,
+        mut removed_tags,
+        mut removed_representations,
+    ): (
         RemovedComponents<RenderLayers>,
         RemovedComponents<NoFrustumCulling>,
         RemovedComponents<Aabb>,
         RemovedComponents<MeshTag>,
+        RemovedComponents<ShadowRepresentation>,
     ),
     (mut live_casters, mut settled_casters): (
         CasterQuery<Without<StaticShadowCaster>>,
@@ -1568,7 +1762,8 @@ pub fn classify_shadow_casters(
             .read()
             .chain(removed_no_culling.read())
             .chain(removed_aabbs.read())
-            .chain(removed_tags.read()),
+            .chain(removed_tags.read())
+            .chain(removed_representations.read()),
     );
     modified_meshes.clear();
     // A mesh changed in place, or replaced under the same id (removed and
@@ -1622,8 +1817,18 @@ pub fn classify_shadow_casters(
         state.moved = true;
         mark(commands, entity, false);
     };
-    for (entity, mut state, transform, aabb, mesh, visibility, layers, no_frustum_culling, tag) in
-        &mut settled_casters.p0()
+    for (
+        entity,
+        mut state,
+        transform,
+        aabb,
+        mesh,
+        visibility,
+        layers,
+        no_frustum_culling,
+        tag,
+        representation,
+    ) in &mut settled_casters.p0()
     {
         let state = state.bypass_change_detection();
         let pending = state.pending.take();
@@ -1635,6 +1840,7 @@ pub fn classify_shadow_casters(
             layers.as_deref(),
             no_frustum_culling.is_some(),
             tag_of(tag.as_deref()),
+            representation.as_deref(),
         );
         let change = state
             .signature
@@ -1663,6 +1869,7 @@ pub fn classify_shadow_casters(
                 layers,
                 no_frustum_culling,
                 tag,
+                representation,
             ) = item;
             let flagged = if reported.contains(&entity) {
                 Some(ShadowCasterChange::Reported)
@@ -1682,6 +1889,7 @@ pub fn classify_shadow_casters(
                 layers.as_deref(),
                 no_frustum_culling.is_some(),
                 tag_of(tag.as_deref()),
+                representation.as_deref(),
             );
             let state = state.bypass_change_detection();
             let change = flagged.or_else(|| {
@@ -1719,8 +1927,18 @@ pub fn classify_shadow_casters(
 
     // Live casters, every frame: their changes, and when they settle.
     waiting.clear();
-    for (entity, mut state, transform, aabb, mesh, visibility, layers, no_frustum_culling, tag) in
-        &mut live_casters
+    for (
+        entity,
+        mut state,
+        transform,
+        aabb,
+        mesh,
+        visibility,
+        layers,
+        no_frustum_culling,
+        tag,
+        representation,
+    ) in &mut live_casters
     {
         let moved_tick = transform.is_changed();
         let other_ticks = aabb.as_ref().is_some_and(Ref::is_changed)
@@ -1729,6 +1947,7 @@ pub fn classify_shadow_casters(
             || layers.as_ref().is_some_and(Ref::is_changed)
             || no_frustum_culling.as_ref().is_some_and(Ref::is_changed)
             || tag.as_ref().is_some_and(Ref::is_changed)
+            || representation.as_ref().is_some_and(Ref::is_changed)
             || state.is_changed()
             || (!candidates.is_empty() && candidates.contains(&entity))
             || (!modified_meshes.is_empty() && modified_meshes.contains(&mesh.id()));
@@ -1742,6 +1961,7 @@ pub fn classify_shadow_casters(
                 layers.as_deref(),
                 no_frustum_culling.is_some(),
                 tag_of(tag.as_deref()),
+                representation.as_deref(),
             )
         };
         let state = state.bypass_change_detection();
@@ -1910,6 +2130,7 @@ pub fn invalidate_shadow_caches(
         &GlobalTransform,
         &Frustum,
     )>,
+    mut directional_lights: Query<(Entity, Mut<DirectionalLightShadowCache>, &CascadesFrusta)>,
     mut redraw_key: Local<Option<(u64, usize)>>,
     faults: Option<Res<ShadowCacheFaults>>,
 ) {
@@ -1970,6 +2191,52 @@ pub fn invalidate_shadow_caches(
         if touched {
             cache.view.invalidated = true;
             counters.rebuild_requests += 1;
+        }
+    }
+    // A directional light's cached far cascades: their frusta without a near
+    // plane, by camera.
+    for (light_entity, mut cache, frusta) in &mut directional_lights {
+        if !cache.cached {
+            continue;
+        }
+        let cascade = cache.cascade as usize;
+        let light_invalidated = all || invalidated_lights.contains(&light_entity);
+        for (camera, view) in cache.bypass_change_detection().views.iter_mut() {
+            if view.invalidated {
+                continue;
+            }
+            let touched = light_invalidated
+                || view.projection.as_ref().is_none_or(|projection| {
+                    let Some(frustum) = frusta
+                        .frusta
+                        .get(camera)
+                        .and_then(|frusta| frusta.get(cascade))
+                    else {
+                        return true;
+                    };
+                    let stand_ins = match projection {
+                        ShadowViewProjection::Directional(projection) => projection.stand_ins(),
+                        ShadowViewProjection::Spot(_) => false,
+                    };
+                    let bounds = ShadowViewBounds::directional(
+                        frustum,
+                        projection.render_layers().clone(),
+                        stand_ins,
+                    );
+                    transitions
+                        .settled
+                        .iter()
+                        .chain(&transitions.left)
+                        .any(|signature| {
+                            signature
+                                .as_ref()
+                                .is_none_or(|signature| signature.touches(&bounds))
+                        })
+                });
+            if touched {
+                view.invalidated = true;
+                counters.rebuild_requests += 1;
+            }
         }
     }
     transitions.settled.clear();

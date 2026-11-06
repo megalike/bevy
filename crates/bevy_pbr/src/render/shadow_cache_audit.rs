@@ -1,7 +1,7 @@
 //! A debug check of the shadow cache (`bevy_light`'s `ShadowCacheSettings`)
 //! against full redraws, texel by texel, view by view:
-//! [`ShadowCacheAuditPlugin`]. Today it checks spot lights, the light type
-//! the cache caches.
+//! [`ShadowCacheAuditPlugin`]. It checks spot lights (with twins) and cached
+//! directional cascades (with reference views of their exact projection).
 
 use alloc::{borrow::Cow, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +11,10 @@ use bevy_app::{App, Plugin, PostUpdate};
 use bevy_camera::visibility::{NoFrustumCulling, RenderLayers, ViewVisibility};
 use bevy_diagnostic::FrameCount;
 use bevy_ecs::prelude::*;
-use bevy_light::{ShadowCacheExempt, ShadowViewId, SpotLight};
+use bevy_light::{
+    DirectionalLightShadowCache, ShadowCacheExempt, ShadowCacheFaults, ShadowSubview, ShadowViewId,
+    SpotLight,
+};
 use bevy_math::UVec2;
 use bevy_render::{
     render_resource::*,
@@ -50,6 +53,14 @@ use crate::{
 /// hashes the shadow map of every shadowed spot light, cached or not, for a
 /// comparison with another run (one with the cache off draws every map from
 /// scratch). While it's off it does nothing (twins already spawned stay).
+///
+/// A cached directional cascade (a camera's far cascade) has no twin: its
+/// reference is a render-only view with the cascade's exact projection that
+/// draws every caster the cascade draws, found anew each frame
+/// (`ShadowCacheFaults::directional_reference`, which the plugin sets), into a
+/// texture of its own; right after the camera's shadow passes, the cascade's
+/// map is copied beside it, before another camera's cascades draw into the
+/// same layer. The compare reads the two.
 pub struct ShadowCacheAuditPlugin;
 
 /// What [`ShadowCacheAuditPlugin`] does, changed at run time.
@@ -82,11 +93,14 @@ impl Plugin for ShadowCacheAuditPlugin {
             .init_resource::<ShadowCacheAuditSettings>()
             .add_systems(
                 PostUpdate,
-                add_audit_twins
-                    .run_if(|settings: Res<ShadowCacheAuditSettings>| {
-                        settings.enabled && settings.fresh_redraws
-                    })
-                    .before(TransformSystems::Propagate),
+                (
+                    add_audit_twins
+                        .run_if(|settings: Res<ShadowCacheAuditSettings>| {
+                            settings.enabled && settings.fresh_redraws
+                        })
+                        .before(TransformSystems::Propagate),
+                    request_directional_references.before(TransformSystems::Propagate),
+                ),
             );
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -289,6 +303,28 @@ fn add_audit_twins(
     }
 }
 
+/// Asks the cached directional cascades for their reference lists while the
+/// audit compares with full redraws.
+fn request_directional_references(
+    settings: Res<ShadowCacheAuditSettings>,
+    faults: Option<ResMut<ShadowCacheFaults>>,
+    mut commands: Commands,
+) {
+    let wanted = settings.enabled && settings.fresh_redraws;
+    match faults {
+        Some(mut faults) => {
+            if faults.directional_reference != wanted {
+                faults.directional_reference = wanted;
+            }
+        }
+        None if wanted => commands.insert_resource(ShadowCacheFaults {
+            directional_reference: true,
+            ..default()
+        }),
+        None => {}
+    }
+}
+
 /// The lights the audit expects this frame, from the main world.
 #[derive(Resource, Default)]
 struct AuditPairs {
@@ -298,6 +334,9 @@ struct AuditPairs {
     /// (light, its render entity, its twin's render entity, if it has one):
     /// every shadowed spot light that is extracted (visible), twins aside.
     pairs: Vec<(Entity, Entity, Option<Entity>)>,
+    /// (view, its light's render entity): every cached directional cascade
+    /// the main world extracted.
+    directional: Vec<(ShadowViewId, Entity)>,
 }
 
 fn extract_audit_pairs(
@@ -317,6 +356,7 @@ fn extract_audit_pairs(
         >,
     >,
     twins: Extract<Query<RenderEntity, With<ShadowCacheAuditTwin>>>,
+    directional_lights: Extract<Query<(Entity, RenderEntity, &DirectionalLightShadowCache)>>,
 ) {
     pairs.settings = Some(**settings);
     pairs.frame = frame.as_deref().map_or(0, |frame| frame.0);
@@ -334,6 +374,26 @@ fn extract_audit_pairs(
         .collect();
     expected.sort_unstable_by_key(|(light, ..)| *light);
     pairs.pairs = expected;
+    let mut directional: Vec<_> = directional_lights
+        .iter()
+        .filter(|(_, _, cache)| cache.is_cached())
+        .flat_map(|(light, render_light, cache)| {
+            cache.views().map(move |(camera, _)| {
+                (
+                    ShadowViewId {
+                        light,
+                        subview: ShadowSubview::Directional {
+                            camera,
+                            cascade: cache.cascade(),
+                        },
+                    },
+                    render_light,
+                )
+            })
+        })
+        .collect();
+    directional.sort_unstable_by_key(|(view, _)| *view);
+    pairs.directional = directional;
 }
 
 /// One pair's slice of the results buffer, in `u32` words; its first words
@@ -670,6 +730,15 @@ fn audit_shadow_caches(
             .pairs
             .iter()
             .map(|&(light, render_light, twin)| (ShadowViewId::spot(light), render_light, twin))
+            // Cached directional cascades: compared with their references
+            // (not hashed).
+            .chain(
+                pairs
+                    .directional
+                    .iter()
+                    .filter(|_| settings.fresh_redraws)
+                    .map(|&(view, render_light)| (view, render_light, None)),
+            )
             .collect()
     } else {
         let mut cached: Vec<_> = caches
@@ -684,6 +753,7 @@ fn audit_shadow_caches(
     let mut skipped = Vec::new();
     for (view, render_light, twin) in expected {
         let info = caches.audit(&view);
+        let directional = matches!(view.subview, ShadowSubview::Directional { .. });
         let mut record = ShadowCacheAuditRecord {
             frame: pairs.frame,
             expected: count,
@@ -720,7 +790,24 @@ fn audit_shadow_caches(
             .or_else(|| drawn_target(&lights, &keys, render_light));
         let twin_target = twin.and_then(|twin| drawn_target(&lights, &keys, twin));
         let read = binding.map(|binding| binding.directional_light_depth_texture.id());
-        let status = if record.plan == ShadowCachePlan::Dormant {
+        // A directional cascade's map and reference, copied and drawn into a
+        // texture of the audit's during the camera's passes.
+        let reference = directional
+            .then(|| caches.reference(&view))
+            .flatten()
+            .filter(|_| settings.fresh_redraws);
+        let status = if directional {
+            match (&info, &reference) {
+                (None, _) => ShadowCacheAuditStatus::Missing("the cascade wasn't planned"),
+                (_, None) if settings.fresh_redraws => {
+                    ShadowCacheAuditStatus::Missing("the cascade has no reference")
+                }
+                (_, Some((_, _, false))) => {
+                    ShadowCacheAuditStatus::Missing("the reference view drew nothing")
+                }
+                _ => ShadowCacheAuditStatus::Compared,
+            }
+        } else if record.plan == ShadowCachePlan::Dormant {
             // It drew nothing: its map isn't current, and nothing reads it.
             ShadowCacheAuditStatus::Dormant
         } else {
@@ -755,6 +842,10 @@ fn audit_shadow_caches(
                 .filter(|_| settings.fresh_redraws)
                 .map_or(layer, |(_, layer)| layer),
         );
+        if reference.is_some() {
+            // Layer 0 the cascade's map, layer 1 its reference.
+            record.layers = (0, 1);
+        }
         if status != ShadowCacheAuditStatus::Compared {
             skipped.push(record);
             continue;
@@ -763,10 +854,11 @@ fn audit_shadow_caches(
         audited.push((
             PendingPair {
                 has_static: static_layer.is_some(),
-                hash: hashes,
+                hash: hashes && !directional,
                 record,
             },
             static_layer,
+            reference.map(|(maps, size, _)| (maps, size)),
         ));
     }
     if !skipped.is_empty()
@@ -798,22 +890,26 @@ impl AuditGpu {
         device: &RenderDevice,
         queue: &RenderQueue,
         binding: &ViewShadowBindings,
-        audited: Vec<(PendingPair, Option<TextureView>)>,
+        audited: Vec<(PendingPair, Option<TextureView>, Option<(TextureView, u32)>)>,
         results: &ShadowCacheAuditResults,
     ) {
         let Some(slot) = self.slots.iter_mut().find(|slot| slot.pending.is_none()) else {
             if let Ok(mut records) = results.0.lock() {
-                records.extend(audited.into_iter().map(|(pair, _)| ShadowCacheAuditRecord {
-                    status: ShadowCacheAuditStatus::Missing("no free read-back slot"),
-                    ..pair.record
-                }));
+                records.extend(
+                    audited
+                        .into_iter()
+                        .map(|(pair, ..)| ShadowCacheAuditRecord {
+                            status: ShadowCacheAuditStatus::Missing("no free read-back slot"),
+                            ..pair.record
+                        }),
+                );
             }
             return;
         };
         // Each record starts with its parameters, the counts at 0, the first
         // texels at the largest value.
         let mut init = vec![0u32; audited.len() * RECORD_WORDS];
-        for (index, (pair, _)) in audited.iter().enumerate() {
+        for (index, (pair, ..)) in audited.iter().enumerate() {
             let record = &mut init[index * RECORD_WORDS..][..RECORD_WORDS];
             record[0] = pair.record.layers.0;
             record[1] = pair.record.layers.1;
@@ -836,16 +932,20 @@ impl AuditGpu {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            for (index, (_, static_layer)) in audited.iter().enumerate() {
+            for (index, (_, static_layer, maps)) in audited.iter().enumerate() {
+                // A directional cascade's own texture (its map and reference),
+                // or the shadow map texture lighting reads.
+                let (maps_view, size) = match maps {
+                    Some((view, size)) => (view, *size),
+                    None => (&binding.directional_light_depth_texture_view, size),
+                };
                 let bind_group = device.create_bind_group(
                     "shadow_cache_audit",
                     &self.layout,
                     &[
                         BindGroupEntry {
                             binding: 0,
-                            resource: BindingResource::TextureView(
-                                &binding.directional_light_depth_texture_view,
-                            ),
+                            resource: BindingResource::TextureView(maps_view),
                         },
                         BindGroupEntry {
                             binding: 1,
@@ -879,6 +979,6 @@ impl AuditGpu {
                     flag.store(true, Ordering::Release);
                 }
             });
-        slot.pending = Some((audited.into_iter().map(|(pair, _)| pair).collect(), mapped));
+        slot.pending = Some((audited.into_iter().map(|(pair, ..)| pair).collect(), mapped));
     }
 }

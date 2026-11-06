@@ -508,6 +508,7 @@ fn fragment() -> @location(0) vec4<f32> {
             skip_reentry_restore: fault == "skip_reentry_restore",
             restore_not_ready: false,
             readiness_delay_frames: 0,
+            ..default()
         };
         if !fault.is_empty() {
             assert_ne!(

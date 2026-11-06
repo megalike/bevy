@@ -126,6 +126,10 @@ pub(crate) enum ShadowViewRole {
     Static,
     /// The movable casters of a cached light, over its shadow map.
     Movers,
+    /// For the audit: every caster of a cached view, found anew, into a
+    /// texture of the audit's (`ShadowCacheAuditPlugin`), with the view's
+    /// exact projection.
+    Reference,
 }
 
 impl ShadowViewRole {
@@ -140,6 +144,7 @@ impl ShadowViewRole {
             ShadowViewRole::Full => 0,
             ShadowViewRole::Static => 1,
             ShadowViewRole::Movers => 2,
+            ShadowViewRole::Reference => 3,
         };
         subview | (role << Self::SHIFT)
     }
@@ -149,6 +154,7 @@ impl ShadowViewRole {
         match subview_index >> Self::SHIFT {
             1 => ShadowViewRole::Static,
             2 => ShadowViewRole::Movers,
+            3 => ShadowViewRole::Reference,
             _ => ShadowViewRole::Full,
         }
     }
@@ -157,7 +163,7 @@ impl ShadowViewRole {
     /// static.
     pub fn takes(self, static_shadow_caster: bool) -> bool {
         match self {
-            ShadowViewRole::Full => true,
+            ShadowViewRole::Full | ShadowViewRole::Reference => true,
             ShadowViewRole::Static => static_shadow_caster,
             ShadowViewRole::Movers => !static_shadow_caster,
         }
@@ -168,7 +174,7 @@ impl ShadowViewRole {
     fn order(self) -> RootNonCameraViewOrder {
         RootNonCameraViewOrder(match self {
             ShadowViewRole::Static => -1,
-            ShadowViewRole::Full => 0,
+            ShadowViewRole::Full | ShadowViewRole::Reference => 0,
             ShadowViewRole::Movers => 1,
         })
     }
@@ -275,6 +281,9 @@ pub struct ExtractedShadowView {
     /// drawn by one render view ([`ShadowViewRole::Full`]), and its movers
     /// tiles are all set while a live caster is in its frustum.
     pub(crate) single_view: bool,
+    /// The audit draws a reference of the view ([`ShadowViewRole::Reference`])
+    /// and copies its map before another view can draw over it.
+    pub(crate) reference: bool,
 }
 
 impl ExtractedShadowView {
@@ -286,8 +295,32 @@ impl ExtractedShadowView {
             movers_tiles: cache.movers_tiles().clone(),
             lights_a_view: cache.lights_a_view(),
             single_view: cache.single_view(),
+            reference: cache.reference_entities().is_some(),
         }
     }
+}
+
+/// On a cached view's reference view ([`ShadowViewRole::Reference`]): after
+/// it drew, the camera's shadow pass copies the view's map (its layer of the
+/// shadow map texture) into the reference texture's layer 0, before another
+/// view can draw over it.
+#[derive(Component, Clone)]
+#[doc(hidden)]
+pub struct ShadowAuditCopy {
+    pub(crate) source: Texture,
+    pub(crate) source_layer: u32,
+    pub(crate) destination: Texture,
+}
+
+/// A cached view's reference texture for the audit: layer 0 holds a copy of
+/// its map, layer 1 its reference redraw.
+struct ReferenceTarget {
+    texture: Texture,
+    /// Both layers, for the audit's compare.
+    array_view: TextureView,
+    /// Layer 1, the reference view's attachment.
+    reference_view: TextureView,
+    size: u32,
 }
 
 /// Extracted on a cached spot light's render entity: its one shadow view.
@@ -382,7 +415,7 @@ struct StaticShadowLayer {
 }
 
 /// Where a view's shadow map is drawn: the shadow map texture and layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct WorkingDestination {
     texture: TextureId,
     layer: u32,
@@ -423,6 +456,8 @@ struct FramePlan {
     movers_now: ShadowTileMask,
     static_view: Option<(Entity, ShadowPassRecord)>,
     movers_view: Option<ShadowPassRecord>,
+    /// The audit's reference view.
+    reference_view: Option<ShadowPassRecord>,
     restored_texels: u64,
 }
 
@@ -455,6 +490,8 @@ struct ShadowViewCacheState {
     seen: bool,
     /// The last frame planned it dormant.
     dormant: bool,
+    /// For the audit (`ExtractedShadowView::reference`).
+    reference: Option<ReferenceTarget>,
 }
 
 /// Static layers a view gave up, kept (and counted in the budget) until the
@@ -516,6 +553,11 @@ pub struct ShadowViewCaches {
     /// The rectangles every restore of the frame draws, an instance each, in
     /// normalized device coordinates (min x, min y, max x, max y).
     restore_quads: RawBufferVec<[f32; 4]>,
+    /// The view that last drew into each destination shared between views
+    /// (the directional cascades' layers, which every camera draws its own
+    /// cascades into in turn), as planned in render order; `None`: a view
+    /// that isn't cached.
+    owners: HashMap<WorkingDestination, Option<ShadowViewId>>,
 }
 
 impl Default for ShadowViewCaches {
@@ -526,6 +568,7 @@ impl Default for ShadowViewCaches {
             allocated_bytes: 0,
             retiring: default(),
             restore_quads: RawBufferVec::new(BufferUsages::VERTEX),
+            owners: default(),
         }
     }
 }
@@ -555,6 +598,16 @@ pub(crate) struct PrepareCachedSpotLight<'a> {
 /// [`ShadowViewCaches::prepare_view`]: what the main world found for it, its
 /// projection and culling, the light it belongs to and where it is drawn.
 pub(crate) struct CachedShadowView<'a> {
+    /// Its render views run on their own, before the cameras (spot lights),
+    /// or in a camera's shadow pass, in the order of the camera's view
+    /// lights (directional cascades).
+    pub root: bool,
+    /// Its destination is shared with other views (a directional cascade's
+    /// layer): its map is current only if no other view drew there since.
+    pub shared_destination: bool,
+    /// The view's exact clip-from-world, if it has one of its own (Bevy's
+    /// cascades); else it is derived from the two matrices below.
+    pub clip_from_world: Option<Mat4>,
     /// What the main world found for the view.
     pub extracted: &'a ExtractedShadowView,
     /// The light's render entity.
@@ -679,6 +732,23 @@ impl ShadowViewCaches {
         })
     }
 
+    /// The audit's reference of a view planned this frame: its texture's
+    /// layers (0: the view's map, 1: the reference), its size, and whether
+    /// the reference view recorded its pass.
+    pub(crate) fn reference(&self, view: &ShadowViewId) -> Option<(TextureView, u32, bool)> {
+        let state = self.views.get(view)?;
+        let frame = state.frame.as_ref()?;
+        let target = state.reference.as_ref()?;
+        Some((
+            target.array_view.clone(),
+            target.size,
+            frame
+                .reference_view
+                .as_ref()
+                .is_some_and(ShadowPassRecord::recorded),
+        ))
+    }
+
     /// The spot light adapter: describes a cached spot light's one shadow
     /// view by its projection and plans it ([`Self::prepare_view`]).
     pub(crate) fn prepare_spot_light(
@@ -706,6 +776,9 @@ impl ShadowViewCaches {
         self.prepare_view(
             commands,
             CachedShadowView {
+                root: true,
+                shared_destination: false,
+                clip_from_world: None,
                 extracted: &args.extracted.0,
                 light_entity: args.light_entity,
                 light_kind: LightEntity::Spot {
@@ -766,6 +839,7 @@ impl ShadowViewCaches {
                 frame: None,
                 seen: false,
                 dormant: false,
+                reference: None,
             });
         state.seen = true;
         state.render_light = args.light_entity;
@@ -873,7 +947,12 @@ impl ShadowViewCaches {
         };
         let revision = args.extracted.static_revision;
         let static_valid = has_layer && state.static_content == Some(revision);
-        let working_valid = state.working == Some((destination, revision));
+        // A shared destination: another view may have drawn there since (a
+        // camera drawing its own cascades into the same layer).
+        let owned = !args.shared_destination
+            || (!args.faults.miss_ownership && self.owners.get(&destination) == Some(&Some(id)))
+            || (args.faults.miss_ownership && state.working.is_some());
+        let working_valid = owned && state.working == Some((destination, revision));
         // A view whose light lights no camera's view draws nothing until it
         // lights one again; the fault forgets in that frame what was written
         // before.
@@ -895,11 +974,16 @@ impl ShadowViewCaches {
             )
         };
         state.destination = Some(destination);
+        if args.shared_destination {
+            self.owners.insert(destination, Some(id));
+        }
 
-        // The render views this plan draws; the others go.
-        if view_entities.len() != 2 {
+        // The render views this plan draws; the others go. (A third for the
+        // audit's reference.)
+        let slots = if args.extracted.reference { 3 } else { 2 };
+        if view_entities.len() != slots {
             despawn_view_entities(commands, core::mem::take(view_entities));
-            *view_entities = vec![Entity::PLACEHOLDER; 2];
+            *view_entities = vec![Entity::PLACEHOLDER; slots];
         }
         let draws_static = plan.draws_static();
         let draws_movers = match plan {
@@ -923,7 +1007,7 @@ impl ShadowViewCaches {
             }
             _ => {
                 let view = args.shadow_map.texture.create_view(&TextureViewDescriptor {
-                    label: Some("spot_light_shadow_map_texture_view"),
+                    label: Some("cached_shadow_map_texture_view"),
                     format: None,
                     dimension: Some(TextureViewDimension::D2),
                     usage: None,
@@ -953,6 +1037,7 @@ impl ShadowViewCaches {
             movers_now: ShadowTileMask::default(),
             static_view: None,
             movers_view: None,
+            reference_view: None,
             restored_texels: 0,
         };
 
@@ -968,6 +1053,7 @@ impl ShadowViewCaches {
                 ShadowViewRole::Full => "",
                 ShadowViewRole::Static => "_static",
                 ShadowViewRole::Movers => "_movers",
+                ShadowViewRole::Reference => "_reference",
             };
             commands.entity(entity).insert((
                 ShadowView {
@@ -984,7 +1070,7 @@ impl ShadowViewCaches {
                     ),
                     world_from_view: args.world_from_view,
                     clip_from_view: args.clip_from_view,
-                    clip_from_world: None,
+                    clip_from_world: args.clip_from_world,
                     target_format: CORE_3D_SHADOW_MAP_FORMAT,
                     color_grading: Default::default(),
                     invert_culling: false,
@@ -992,11 +1078,14 @@ impl ShadowViewCaches {
                 *args.frustum.unwrap(),
                 args.light_kind,
                 args.render_layers.clone(),
-                RootNonCameraView(Core3d.intern()),
-                role.order(),
                 key,
                 record.clone(),
             ));
+            if args.root {
+                commands
+                    .entity(entity)
+                    .insert((RootNonCameraView(Core3d.intern()), role.order()));
+            }
             if !matches!(args.gpu_preprocessing_mode, GpuPreprocessingMode::Culling) {
                 commands.entity(entity).insert(NoIndirectDrawing);
             }
@@ -1131,8 +1220,93 @@ impl ShadowViewCaches {
                 }
             }
         }
+        // The audit's reference: every caster, with the same projection,
+        // into a texture of its own; then the view's map is copied beside it.
+        if args.extracted.reference {
+            if state
+                .reference
+                .as_ref()
+                .is_none_or(|target| target.size != size)
+            {
+                let texture = render_device.create_texture(&TextureDescriptor {
+                    label: Some("shadow_cache_audit_reference"),
+                    size: Extent3d {
+                        width: size,
+                        height: size,
+                        depth_or_array_layers: 2,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: CORE_3D_SHADOW_MAP_FORMAT,
+                    usage: TextureUsages::RENDER_ATTACHMENT
+                        | TextureUsages::TEXTURE_BINDING
+                        | TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let array_view = texture.create_view(&TextureViewDescriptor {
+                    label: Some("shadow_cache_audit_reference_array"),
+                    dimension: Some(TextureViewDimension::D2Array),
+                    aspect: TextureAspect::DepthOnly,
+                    ..default()
+                });
+                let reference_view = texture.create_view(&TextureViewDescriptor {
+                    label: Some("shadow_cache_audit_reference_layer"),
+                    dimension: Some(TextureViewDimension::D2),
+                    base_array_layer: 1,
+                    array_layer_count: Some(1),
+                    ..default()
+                });
+                state.reference = Some(ReferenceTarget {
+                    texture,
+                    array_view,
+                    reference_view,
+                    size,
+                });
+            }
+            let target = state.reference.as_ref().unwrap();
+            let entity = &mut view_entities[2];
+            if *entity == Entity::PLACEHOLDER {
+                *entity = commands.spawn_empty().id();
+            }
+            let entity = *entity;
+            let attachment = DepthStencilViewAttachment::new(
+                DepthStencilViews::DepthOnly {
+                    depth_view: target.reference_view.clone(),
+                },
+                Some(0.0),
+                None,
+            );
+            let reference_region = ShadowMapRegion {
+                texture: target.texture.id(),
+                layer: 1,
+                ..region
+            };
+            frame.reference_view = Some(spawn_view(
+                commands,
+                entity,
+                ShadowViewRole::Reference,
+                reference_region,
+                attachment,
+            ));
+            commands.entity(entity).insert(ShadowAuditCopy {
+                source: args.shadow_map.texture.clone(),
+                source_layer: args.layer,
+                destination: target.texture.clone(),
+            });
+        } else {
+            state.reference = None;
+        }
         frame.movers_now = movers_now;
         state.frame = Some(frame);
+    }
+
+    /// Notes that a view that isn't cached draws into a shared destination
+    /// (a directional cascade's layer) this frame, after the views planned so
+    /// far: a cached view's map there is no longer current.
+    pub(crate) fn note_shared_draw(&mut self, texture: TextureId, layer: u32) {
+        self.owners
+            .insert(WorkingDestination { texture, layer }, None);
     }
 
     /// Ends planning: a view that wasn't planned this frame (its light
@@ -1316,6 +1490,34 @@ pub(crate) fn restore_shadow_map(world: &World, restore: &ShadowRestore, ctx: &m
     render_pass.set_vertex_buffer(0, quads.slice(..));
     render_pass.draw(0..restore.vertices, restore.quads.clone());
     pass_span.end(&mut render_pass);
+}
+
+/// For the audit: copies a cached view's map beside its reference
+/// ([`ShadowAuditCopy`]).
+pub(crate) fn copy_for_audit(copy: &ShadowAuditCopy, ctx: &mut RenderContext) {
+    ctx.command_encoder().copy_texture_to_texture(
+        TexelCopyTextureInfo {
+            texture: &copy.source,
+            mip_level: 0,
+            origin: Origin3d {
+                x: 0,
+                y: 0,
+                z: copy.source_layer,
+            },
+            aspect: TextureAspect::All,
+        },
+        TexelCopyTextureInfo {
+            texture: &copy.destination,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        Extent3d {
+            width: copy.destination.width(),
+            height: copy.destination.height(),
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 /// What [`acknowledge_shadow_caches`] checks a static view's casters
