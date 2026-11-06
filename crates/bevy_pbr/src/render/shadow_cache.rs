@@ -2,11 +2,10 @@
 //! `shadow_cache` module: [`ShadowCacheSettings`]).
 //!
 //! The cache keeps its state by shadow view ([`ShadowViewId`]): a spot
-//! light's shadow map, and, reserved for later, a directional light's cascade
-//! for a camera or a point light's cube face. Each light type's adapter
-//! describes its cached views ([`CachedShadowView`]: projection, frustum,
-//! destination); today only spot lights are cached
-//! ([`ShadowViewCaches::prepare_spot_light`]).
+//! light's shadow map, a point light's cube face, a directional light's far
+//! cascade for a camera. Each light type's adapter describes its cached views
+//! ([`CachedShadowView`]: projection, frustum, destination) to one planner
+//! ([`ShadowViewCaches::prepare_view`]).
 //!
 //! Each cached view that fits in the budget gets a static layer of its own,
 //! a depth texture that holds the shadow of its settled casters. Each frame
@@ -327,6 +326,12 @@ struct ReferenceTarget {
 #[derive(Component, Clone, Debug)]
 #[doc(hidden)]
 pub struct ExtractedSpotShadowCache(pub(crate) ExtractedShadowView);
+
+/// Extracted on a cached point light's render entity: its six faces' shadow
+/// views, in the order of `CUBE_MAP_FACES`.
+#[derive(Component, Clone, Debug)]
+#[doc(hidden)]
+pub struct ExtractedPointShadowCache(pub(crate) [ExtractedShadowView; 6]);
 
 /// What a frame does for a cached shadow view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -946,13 +951,30 @@ impl ShadowViewCaches {
             layer: args.layer,
         };
         let revision = args.extracted.static_revision;
+        // A view drawn into another place now (a point light whose index
+        // changed, a resized shadow map array) no longer has its map there,
+        // even if it comes back to its old place later (another view may
+        // have drawn there since): checked every frame, dormant ones too.
+        // The fault takes the old map for current.
+        if state
+            .working
+            .is_some_and(|(working, _)| working != destination)
+            && !args.faults.miss_index_change
+        {
+            state.working = None;
+        }
         let static_valid = has_layer && state.static_content == Some(revision);
         // A shared destination: another view may have drawn there since (a
         // camera drawing its own cascades into the same layer).
         let owned = !args.shared_destination
             || (!args.faults.miss_ownership && self.owners.get(&destination) == Some(&Some(id)))
             || (args.faults.miss_ownership && state.working.is_some());
-        let working_valid = owned && state.working == Some((destination, revision));
+        let working_valid = owned
+            && (state.working == Some((destination, revision))
+                || (args.faults.miss_index_change
+                    && state
+                        .working
+                        .is_some_and(|(_, working)| working == revision)));
         // A view whose light lights no camera's view draws nothing until it
         // lights one again; the fault forgets in that frame what was written
         // before.

@@ -25,9 +25,9 @@ use bevy_light::SunDisk;
 use bevy_light::{
     spot_light_clip_from_view, spot_light_world_from_view, AmbientLight, CascadeShadowConfig,
     Cascades, DirectionalLight, DirectionalLightShadowCache, DirectionalLightShadowMap,
-    GlobalAmbientLight, PointLight, PointLightShadowMap, RectLight, ShadowCacheFaults,
-    ShadowCacheSettings, ShadowFilteringMethod, ShadowSubview, ShadowViewId, SpotLight,
-    SpotLightShadowCache, VolumetricLight,
+    GlobalAmbientLight, PointLight, PointLightShadowCache, PointLightShadowMap, RectLight,
+    ShadowCacheFaults, ShadowCacheSettings, ShadowFilteringMethod, ShadowSubview, ShadowViewId,
+    SpotLight, SpotLightShadowCache, VolumetricLight,
 };
 use bevy_log::warn_once;
 use bevy_material::{
@@ -352,6 +352,7 @@ pub fn extract_lights(
                 &CubemapFrusta,
                 Option<&RenderLayers>,
                 Option<&VolumetricLight>,
+                Option<&PointLightShadowCache>,
             ),
             Or<(
                 Changed<PointLight>,
@@ -361,6 +362,7 @@ pub fn extract_lights(
                 Changed<RenderLayers>,
                 Changed<CubemapFrusta>,
                 Changed<VolumetricLight>,
+                Changed<PointLightShadowCache>,
             )>,
         >,
     >,
@@ -487,6 +489,7 @@ pub fn extract_lights(
         frusta,
         maybe_render_layers,
         volumetric_light,
+        shadow_cache,
     ) in point_lights.iter()
     {
         if !view_visibility.get() {
@@ -495,6 +498,11 @@ pub fn extract_lights(
             }
             continue;
         }
+
+        // MPS: a cached light's faces each draw their static and movable
+        // casters by two views, from two lists (one list, with every caster,
+        // for a face without a usable static layer).
+        let shadow_cache = shadow_cache.filter(|shadow_cache| shadow_cache.is_cached());
 
         if point_light.shadow_maps_enabled {
             // Fetch or create the visible entities for each cubemap face.
@@ -518,55 +526,72 @@ pub fn extract_lights(
 
             all_lights_found.insert(render_entity);
 
-            for face_index in 0..6 {
-                let retained_view_entity = RetainedViewEntity {
-                    main_entity: MainEntity::from(main_entity),
-                    auxiliary_entity: None,
-                    subview_index: face_index,
+            // MPS: the lists each face's views draw: the full view's of an
+            // uncached light or of a face without a usable static layer, the
+            // movers and static views' of a cached face (its static list only
+            // when it was found again).
+            let mut live_subviews = HashSet::<RetainedViewEntity>::default();
+            for face_index in 0..6u32 {
+                let visible_mesh_entities =
+                    &cubemap_visible_entities.get(face_index as usize).entities[..];
+                let face = shadow_cache.map(|cache| cache.face(face_index as usize));
+                let lists = match face {
+                    Some(view) if !view.single_view() => [
+                        Some((ShadowViewRole::Movers, Some(visible_mesh_entities))),
+                        Some((
+                            ShadowViewRole::Static,
+                            view.statics_walked().then(|| view.static_entities()),
+                        )),
+                    ],
+                    _ => [
+                        Some((ShadowViewRole::Full, Some(visible_mesh_entities))),
+                        None,
+                    ],
                 };
-                render_shadow_map_visible_entities
-                    .subviews
-                    .entry(retained_view_entity)
-                    .or_insert_with(|| (system_change_tick.this_run(), Default::default()));
+                for (role, entities) in lists.into_iter().flatten() {
+                    let retained_view_entity = RetainedViewEntity {
+                        main_entity: MainEntity::from(main_entity),
+                        auxiliary_entity: None,
+                        subview_index: role.subview_index(face_index),
+                    };
+                    live_subviews.insert(retained_view_entity);
+                    render_shadow_map_visible_entities
+                        .subviews
+                        .entry(retained_view_entity)
+                        .or_insert_with(|| (system_change_tick.this_run(), Default::default()));
 
-                // Extract the visible entities to the list for this face.
-                let extracted_entities = &mut render_extracted_shadow_map_visible_entities
-                    .subviews
-                    .entry(retained_view_entity)
-                    .or_default()
-                    .classes
-                    .entry(TypeId::of::<Mesh3d>())
-                    .or_default()
-                    .entities;
-                extracted_entities.clear();
-                let visible_mesh_entities = cubemap_visible_entities.get(face_index as usize);
-                extracted_entities.extend(visible_mesh_entities.entities.iter().map(
-                    |main_entity| {
+                    // Extract the visible entities to the list for this face.
+                    let extracted_entities = &mut render_extracted_shadow_map_visible_entities
+                        .subviews
+                        .entry(retained_view_entity)
+                        .or_default()
+                        .classes
+                        .entry(TypeId::of::<Mesh3d>())
+                        .or_default()
+                        .entities;
+                    let Some(entities) = entities else {
+                        continue;
+                    };
+                    extracted_entities.clear();
+                    extracted_entities.extend(entities.iter().map(|main_entity| {
                         let render_entity = match mapper.get(*main_entity) {
                             Ok(render_entity) => **render_entity,
                             Err(_) => Entity::PLACEHOLDER,
                         };
                         (render_entity, MainEntity::from(*main_entity))
-                    },
-                ));
+                    }));
+                }
             }
 
             // Clear out visible entity lists corresponding to subviews that no
-            // longer exist.
+            // longer exist. (MPS: the role is in the subview index's high
+            // bits; a bound on the index would drop the cached faces' lists.)
             render_extracted_shadow_map_visible_entities
                 .subviews
-                .retain(|view_entity, _| {
-                    view_entity.main_entity.entity() == main_entity
-                        && view_entity.auxiliary_entity.is_none()
-                        && view_entity.subview_index < 6
-                });
+                .retain(|view_entity, _| live_subviews.contains(view_entity));
             render_shadow_map_visible_entities
                 .subviews
-                .retain(|view_entity, _| {
-                    view_entity.main_entity.entity() == main_entity
-                        && view_entity.auxiliary_entity.is_none()
-                        && view_entity.subview_index < 6
-                });
+                .retain(|view_entity, _| live_subviews.contains(view_entity));
 
             let mut entity_commands = commands.entity(render_entity);
             entity_commands.insert((
@@ -607,6 +632,22 @@ pub fn extract_lights(
             MainEntity::from(main_entity),
             maybe_render_layers.unwrap_or_default().clone(),
         ));
+        match shadow_cache {
+            Some(shadow_cache) => {
+                entity_commands.insert(ExtractedPointShadowCache(core::array::from_fn(|face| {
+                    ExtractedShadowView::new(
+                        ShadowViewId {
+                            light: main_entity,
+                            subview: ShadowSubview::PointFace(face as u8),
+                        },
+                        shadow_cache.face(face),
+                    )
+                })));
+            }
+            None => {
+                entity_commands.remove::<ExtractedPointShadowCache>();
+            }
+        }
     }
 
     for (
@@ -1270,6 +1311,7 @@ pub fn prepare_lights(
         meshes_to_reextract_next_frame,
         shadow_cache_faults,
         gpu_culled_entities,
+        cached_point_light_data,
     ): (
         ResMut<ShadowViewCaches>,
         Res<ShadowCacheSettings>,
@@ -1283,6 +1325,10 @@ pub fn prepare_lights(
         Option<Res<MeshesToReextractNextFrame>>,
         Option<Res<ShadowCacheFaults>>,
         Option<Res<RenderGpuCulledEntities>>,
+        Query<(
+            &ExtractedPointShadowCache,
+            Option<&RenderShadowMapVisibleEntities>,
+        )>,
     ),
 ) {
     let no_stale_meshes = MainEntityHashSet::default();
@@ -1749,11 +1795,19 @@ pub fn prepare_lights(
             });
 
     spot_shadow_caches.prepare_for_new_frame(
-        cached_spot_lights.iter().map(|cache| &cache.0).chain(
-            directional_lights
-                .iter()
-                .flat_map(|(_, _, light, ..)| light.cached_views.values()),
-        ),
+        cached_spot_lights
+            .iter()
+            .map(|cache| &cache.0)
+            .chain(
+                directional_lights
+                    .iter()
+                    .flat_map(|(_, _, light, ..)| light.cached_views.values()),
+            )
+            .chain(
+                cached_point_light_data
+                    .iter()
+                    .flat_map(|(cache, _)| cache.0.iter()),
+            ),
         &shadow_cache_settings,
     );
 
@@ -1780,6 +1834,93 @@ pub fn prepare_lights(
                 mem::take(&mut point_and_spot_light_view_entities.0),
             );
             continue;
+        }
+
+        // MPS: a cached light plans each face and sets up its views (two
+        // slots a face: static, movers), drawn into its layers of the cube
+        // array, `light_index * 6 + face`.
+        if let Ok((extracted_shadow_cache, visible_entities)) =
+            cached_point_light_data.get(*light_entity)
+        {
+            let light_index = *global_clusterable_object_meta
+                .entity_to_index
+                .get(light_entity)
+                .unwrap();
+            let views = &mut point_and_spot_light_view_entities.0;
+            if views.len() != 12 {
+                despawn_entities(&mut commands, mem::take(views));
+                *views = vec![Entity::PLACEHOLDER; 12];
+            }
+            let cube_face_projection = proj::perspective_infinite_reverse(
+                core::f32::consts::FRAC_PI_2,
+                1.0,
+                light.shadow_map_near_z,
+            );
+            // Rotation and scale ignored, as for an uncached light.
+            let view_translation = GlobalTransform::from_translation(light.transform.translation());
+            let faults_now = shadow_cache_faults.as_deref().copied().unwrap_or_default();
+            for (face_index, extracted) in extracted_shadow_cache.0.iter().enumerate() {
+                let mut slots = views[face_index * 2..face_index * 2 + 2].to_vec();
+                let pass_name = format!(
+                    "shadow_point_light_{light_index}_{}",
+                    face_index_to_name(face_index)
+                );
+                spot_shadow_caches.prepare_view(
+                    &mut commands,
+                    CachedShadowView {
+                        root: true,
+                        shared_destination: false,
+                        clip_from_world: None,
+                        extracted,
+                        light_entity: *light_entity,
+                        light_kind: LightEntity::Point {
+                            light_entity: *light_entity,
+                            face_index,
+                        },
+                        render_layers: light_render_layers,
+                        world_from_view: view_translation * cube_face_rotations[face_index],
+                        clip_from_view: cube_face_projection,
+                        frustum: point_light_frusta.map(|frusta| &frusta.frusta[face_index]),
+                        pass_name: &pass_name,
+                        shadow_map: &point_light_depth_texture,
+                        layer: (light_index * 6
+                            + match face_index {
+                                // The fault: +X and -X swapped.
+                                0 | 1 if faults_now.swap_destination => 1 - face_index,
+                                _ => face_index,
+                            }) as u32,
+                        map_size: point_light_shadow_map.size as u32,
+                        gpu_preprocessing_mode: gpu_preprocessing_support.max_supported_mode,
+                        visible_entities,
+                        stale_meshes,
+                        static_gpu_culled: gpu_culled_entities
+                            .as_deref()
+                            .map_or(&no_stale_meshes, |entities| &entities.static_shadow_casters),
+                        faults: shadow_cache_faults.as_deref().copied().unwrap_or_default(),
+                    },
+                    &mut slots,
+                    &shadow_cache_settings,
+                    (
+                        &render_device,
+                        shadow_restore_pipeline.as_deref(),
+                        &pipeline_cache,
+                    ),
+                    &mut shadow_render_phases,
+                    &mut live_shadow_mapping_lights,
+                );
+                debug_assert_eq!(slots.len(), 2);
+                views.splice(face_index * 2..face_index * 2 + 2, slots);
+            }
+            continue;
+        }
+        // A light that was cached had two views a face.
+        if !point_and_spot_light_view_entities.0.is_empty()
+            && point_and_spot_light_view_entities.0.len() != 6
+        {
+            despawn_entities(
+                &mut commands,
+                mem::take(&mut point_and_spot_light_view_entities.0),
+            );
         }
 
         if point_and_spot_light_view_entities.0.is_empty() {
@@ -2552,6 +2693,20 @@ fn create_point_shadow_maps(
             },
             (*light_render_layers).clone(),
             RootNonCameraView(Core3d.intern()),
+            // MPS: the logical key, with the layer this view draws into.
+            ShadowViewKey {
+                id: ShadowViewId {
+                    light: light_main_entity.id(),
+                    subview: ShadowSubview::PointFace(face_index as u8),
+                },
+                role: ShadowViewRole::Full,
+                region: ShadowMapRegion {
+                    texture: point_light_depth_texture.texture.id(),
+                    layer: base_array_layer,
+                    origin: UVec2::ZERO,
+                    size: UVec2::splat(point_light_shadow_map_size),
+                },
+            },
         ));
 
         if !matches!(
