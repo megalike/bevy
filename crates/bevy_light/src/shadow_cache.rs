@@ -268,6 +268,10 @@ pub struct ShadowCacheFaults {
     /// Take a cached view's shadow map for current although it is now drawn
     /// into another layer (a point light whose index changed).
     pub miss_index_change: bool,
+    /// Plan every cached point light dormant in every 40th frame although
+    /// it lights a view (the audit skips a dormant face: the oracle must
+    /// check dormancy on its own).
+    pub false_dormant: bool,
     /// Draw a cached point light's faces +X and -X each into the other's
     /// layer (the audit must check the layer lighting reads, not the one
     /// the cache drew into).

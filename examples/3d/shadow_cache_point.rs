@@ -411,6 +411,12 @@ mod oracle {
     use super::*;
     use std::io::Write;
 
+    /// Whether every light lights no view in a frame, by the script alone:
+    /// the camera looks away (every light's range is behind it).
+    fn all_dormant(frame: u32) -> bool {
+        (AWAY..BACK).contains(&frame) || (AWAY2..BACK2).contains(&frame)
+    }
+
     /// What the oracle collects.
     #[derive(Resource, Default)]
     struct Oracle {
@@ -425,6 +431,10 @@ mod oracle {
         edge_frames: u32,
         /// The lights' names by entity (kept after a light goes).
         names: HashMap<Entity, &'static str>,
+        /// Face-frames whose dormancy disagrees with the script: dormant
+        /// while the camera sees the light, or a cached face drawn while it
+        /// looks away.
+        wrong_dormancy: Vec<(u32, ShadowViewId, String)>,
     }
 
     fn hashes_file() -> Option<String> {
@@ -454,6 +464,7 @@ mod oracle {
             miss_face_invalidation: fault == "miss_face_invalidation",
             miss_index_change: fault == "miss_index_change",
             swap_destination: fault == "swap_destination",
+            false_dormant: fault == "false_dormant",
             ..default()
         };
         if !fault.is_empty() {
@@ -735,6 +746,18 @@ mod oracle {
                 continue;
             }
             let plan = format!("{:?}", record.plan);
+            // Dormancy checked apart from the cache: a dormant face is never
+            // compared, so the cache must not call one dormant that a view
+            // can see.
+            let dormant = record.status == ShadowCacheAuditStatus::Dormant;
+            // (A record's frame is the frame count extracted after the
+            // frame's `Last`: one more than the script saw in that frame.)
+            let away = all_dormant(record.frame.wrapping_sub(1));
+            if dormant != (away && record.cached && cache_on()) {
+                oracle
+                    .wrong_dormancy
+                    .push((record.frame, record.view, plan.clone()));
+            }
             if hashes {
                 let hash = match (record.status, record.hash) {
                     (ShadowCacheAuditStatus::Compared, Some(hash)) => format!("{hash:016x}"),
@@ -793,6 +816,11 @@ mod oracle {
                 .unwrap();
             }
             let cached = hashes.iter().filter(|hash| hash.4).count();
+            for (frame, view, plan) in oracle.wrong_dormancy.iter().take(10) {
+                warn!(
+                    "oracle: frame {frame}: {view:?} dormancy disagrees with the script ({plan})"
+                );
+            }
             info!(
                 "oracle: HASHES: {} face-frames ({cached} cached) written to {path}; {} of {} state checks failed; {:?}",
                 hashes.len(),
@@ -803,11 +831,13 @@ mod oracle {
             for (frame, what) in oracle.failed.iter().take(20) {
                 warn!("oracle: frame {frame}: {what}");
             }
-            exit.write(if oracle.failed.is_empty() {
-                AppExit::Success
-            } else {
-                AppExit::error()
-            });
+            exit.write(
+                if oracle.failed.is_empty() && oracle.wrong_dormancy.is_empty() {
+                    AppExit::Success
+                } else {
+                    AppExit::error()
+                },
+            );
             return;
         }
         let mut per_frame: HashMap<u32, (u32, u32)> = HashMap::default();
@@ -858,7 +888,10 @@ mod oracle {
                 incomplete.len()
             );
         }
-        let mut failed_checks = oracle.failed.len();
+        let mut failed_checks = oracle.failed.len() + oracle.wrong_dormancy.len();
+        for (frame, view, plan) in oracle.wrong_dormancy.iter().take(10) {
+            warn!("oracle: frame {frame}: {view:?} dormancy disagrees with the script ({plan})");
+        }
         // (Meshes culled on the GPU only aren't in the CPU's lists.)
         if oracle.edge_frames == 0 && env("POINT_ORACLE_NO_CPU_CULLING").unwrap_or(0) == 0 {
             warn!("oracle: the circling mover never crossed a face edge");

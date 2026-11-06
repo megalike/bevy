@@ -986,6 +986,7 @@ pub fn check_point_light_mesh_visibility(
     let stale_ack = fault(|faults| faults.stale_ack);
     let wrong_face = fault(|faults| faults.wrong_face);
     let miss_face_edge = fault(|faults| faults.miss_face_edge);
+    let false_dormant = fault(|faults| faults.false_dormant) && frame.is_multiple_of(40);
     // The movers grid, built at the first cached spot light of a frame that
     // uses it: while a light had few movers near it when it was last built,
     // and every 32 frames to see whether one has.
@@ -1198,7 +1199,8 @@ pub fn check_point_light_mesh_visibility(
                 // A light that reaches into no view shades nothing: no face
                 // finds casters, and the render world draws none (as a spot
                 // light). Its faces keep what they hold.
-                let lights_a_view = light_views.lights_a_view(light_entity, &light_sphere);
+                let lights_a_view =
+                    light_views.lights_a_view(light_entity, &light_sphere) && !false_dormant;
                 for view in faces.iter_mut() {
                     view.lights_a_view = lights_a_view;
                 }
