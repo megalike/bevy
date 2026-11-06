@@ -26,8 +26,8 @@
 //!   next one if nothing about it changed: loaded content settles as fast as
 //!   if it were marked static. A caster that appears later (a drop, a building
 //!   piece, a short-lived spawn) waits the settle time like one that moved.
-//! - A settled caster whose shadow changes (its transform, bounds, mesh,
-//!   material, visibility or render layers, compared by value after transform
+//! - A settled caster whose shadow changes (its transform, bounds, mesh, mesh
+//!   tag, material, visibility or render layers, compared by value after transform
 //!   propagation and bounds; or an [`InvalidateShadowCache::Caster`]) is live
 //!   again in the same frame, and the lights its old footprint touched redraw
 //!   their static layer.
@@ -67,7 +67,7 @@ use bevy_math::{Affine3A, Mat4, URect, Vec2, Vec3A, Vec4Swizzles};
 use bevy_mesh::{
     morph::{MeshMorphWeights, MorphWeights},
     skinning::SkinnedMesh,
-    Mesh, Mesh3d,
+    Mesh, Mesh3d, MeshTag,
 };
 use bevy_platform::{
     collections::{HashMap, HashSet},
@@ -220,6 +220,8 @@ pub struct ShadowCacheFaults {
     pub miss_static_invalidation: bool,
     /// Don't redraw the lights a caster that settled is in.
     pub miss_settle_invalidation: bool,
+    /// Don't see a change of a caster's [`MeshTag`].
+    pub miss_tag_change: bool,
     /// Insert and remove [`StaticShadowCaster`] a frame after the lights were
     /// redrawn for it.
     pub late_marker: bool,
@@ -338,7 +340,8 @@ pub enum ShadowCasterChange {
     Transform,
     /// Its bounds ([`Aabb`] or [`NoFrustumCulling`]).
     Bounds,
-    /// Its mesh, or its mesh asset.
+    /// Its mesh, its mesh asset, or its [`MeshTag`] (which a shader may read
+    /// to place its vertices).
     Mesh,
     /// Its material, or its material asset.
     Material,
@@ -375,6 +378,8 @@ pub(crate) struct CasterSignature {
     world_from_local: Affine3A,
     aabb: Option<Aabb>,
     mesh: AssetId<Mesh>,
+    /// Its [`MeshTag`]'s value (0 without one, as the shaders see it).
+    tag: u32,
     visible: bool,
     layers: RenderLayers,
     no_frustum_culling: bool,
@@ -409,7 +414,7 @@ impl CasterSignature {
             }
         {
             Some(ShadowCasterChange::Bounds)
-        } else if self.mesh != other.mesh {
+        } else if self.mesh != other.mesh || self.tag != other.tag {
             Some(ShadowCasterChange::Mesh)
         } else if self.visible != other.visible {
             Some(ShadowCasterChange::Visibility)
@@ -1357,6 +1362,7 @@ type CasterQuery<'w, 's, F> = Query<
         Ref<'static, InheritedVisibility>,
         Option<Ref<'static, RenderLayers>>,
         Option<Ref<'static, NoFrustumCulling>>,
+        Option<Ref<'static, MeshTag>>,
     ),
     (
         Without<NotShadowCaster>,
@@ -1381,6 +1387,7 @@ type WrittenSettled = (
         Changed<InheritedVisibility>,
         Changed<RenderLayers>,
         Changed<NoFrustumCulling>,
+        Changed<MeshTag>,
         Changed<ShadowCasterState>,
     )>,
 );
@@ -1393,11 +1400,13 @@ fn signature_of(
     visibility: &InheritedVisibility,
     layers: Option<&RenderLayers>,
     no_frustum_culling: bool,
+    tag: u32,
 ) -> CasterSignature {
     CasterSignature {
         world_from_local: transform.affine(),
         aabb: aabb.copied(),
         mesh: mesh.id(),
+        tag,
         visible: visibility.get(),
         layers: layers.cloned().unwrap_or_default(),
         no_frustum_culling,
@@ -1444,6 +1453,7 @@ type CasterItem<'w> = (
     Ref<'w, InheritedVisibility>,
     Option<Ref<'w, RenderLayers>>,
     Option<Ref<'w, NoFrustumCulling>>,
+    Option<Ref<'w, MeshTag>>,
 );
 
 /// What [`classify_shadow_casters`] keeps between frames.
@@ -1486,10 +1496,11 @@ pub fn classify_shadow_casters(
         MessageReader<InvalidateShadowCache>,
         MessageReader<AssetEvent<Mesh>>,
     ),
-    (mut removed_layers, mut removed_no_culling, mut removed_aabbs): (
+    (mut removed_layers, mut removed_no_culling, mut removed_aabbs, mut removed_tags): (
         RemovedComponents<RenderLayers>,
         RemovedComponents<NoFrustumCulling>,
         RemovedComponents<Aabb>,
+        RemovedComponents<MeshTag>,
     ),
     (mut live_casters, mut settled_casters): (
         CasterQuery<Without<StaticShadowCaster>>,
@@ -1531,6 +1542,15 @@ pub fn classify_shadow_casters(
     // One write for the whole frame's counts.
     let counters = counters.into_inner();
     let late_marker = faults.as_ref().is_some_and(|faults| faults.late_marker);
+    // The value a shader reads; the fault doesn't see it.
+    let miss_tag_change = faults.as_ref().is_some_and(|faults| faults.miss_tag_change);
+    let tag_of = |tag: Option<&MeshTag>| {
+        if miss_tag_change {
+            0
+        } else {
+            tag.map_or(0, |tag| tag.value)
+        }
+    };
     let loading = loading.is_none_or(|loading| loading.0);
     for (entity, settle) in late.drain(..) {
         set_settled(&mut commands, entity, settle);
@@ -1547,7 +1567,8 @@ pub fn classify_shadow_casters(
         removed_layers
             .read()
             .chain(removed_no_culling.read())
-            .chain(removed_aabbs.read()),
+            .chain(removed_aabbs.read())
+            .chain(removed_tags.read()),
     );
     modified_meshes.clear();
     // A mesh changed in place, or replaced under the same id (removed and
@@ -1601,7 +1622,7 @@ pub fn classify_shadow_casters(
         state.moved = true;
         mark(commands, entity, false);
     };
-    for (entity, mut state, transform, aabb, mesh, visibility, layers, no_frustum_culling) in
+    for (entity, mut state, transform, aabb, mesh, visibility, layers, no_frustum_culling, tag) in
         &mut settled_casters.p0()
     {
         let state = state.bypass_change_detection();
@@ -1613,6 +1634,7 @@ pub fn classify_shadow_casters(
             &visibility,
             layers.as_deref(),
             no_frustum_culling.is_some(),
+            tag_of(tag.as_deref()),
         );
         let change = state
             .signature
@@ -1631,8 +1653,17 @@ pub fn classify_shadow_casters(
     if !candidates.is_empty() || !modified_meshes.is_empty() {
         let mut all = settled_casters.p1();
         let mut check = |commands: &mut Commands, item: CasterItem<'_>| {
-            let (entity, mut state, transform, aabb, mesh, visibility, layers, no_frustum_culling) =
-                item;
+            let (
+                entity,
+                mut state,
+                transform,
+                aabb,
+                mesh,
+                visibility,
+                layers,
+                no_frustum_culling,
+                tag,
+            ) = item;
             let flagged = if reported.contains(&entity) {
                 Some(ShadowCasterChange::Reported)
             } else if modified_meshes.contains(&mesh.id()) {
@@ -1650,6 +1681,7 @@ pub fn classify_shadow_casters(
                 &visibility,
                 layers.as_deref(),
                 no_frustum_culling.is_some(),
+                tag_of(tag.as_deref()),
             );
             let state = state.bypass_change_detection();
             let change = flagged.or_else(|| {
@@ -1687,7 +1719,7 @@ pub fn classify_shadow_casters(
 
     // Live casters, every frame: their changes, and when they settle.
     waiting.clear();
-    for (entity, mut state, transform, aabb, mesh, visibility, layers, no_frustum_culling) in
+    for (entity, mut state, transform, aabb, mesh, visibility, layers, no_frustum_culling, tag) in
         &mut live_casters
     {
         let moved_tick = transform.is_changed();
@@ -1696,6 +1728,7 @@ pub fn classify_shadow_casters(
             || visibility.is_changed()
             || layers.as_ref().is_some_and(Ref::is_changed)
             || no_frustum_culling.as_ref().is_some_and(Ref::is_changed)
+            || tag.as_ref().is_some_and(Ref::is_changed)
             || state.is_changed()
             || (!candidates.is_empty() && candidates.contains(&entity))
             || (!modified_meshes.is_empty() && modified_meshes.contains(&mesh.id()));
@@ -1708,6 +1741,7 @@ pub fn classify_shadow_casters(
                 &visibility,
                 layers.as_deref(),
                 no_frustum_culling.is_some(),
+                tag_of(tag.as_deref()),
             )
         };
         let state = state.bypass_change_detection();
@@ -2428,6 +2462,72 @@ mod tests {
             .enabled = false;
         step(&mut app, 0.016);
         assert!(!settled(&app));
+    }
+
+    #[test]
+    fn a_mesh_tag_change_makes_a_settled_caster_live() {
+        let mut app = classify_app();
+        let caster = app
+            .world_mut()
+            .spawn((
+                Mesh3d::default(),
+                GlobalTransform::IDENTITY,
+                Aabb::from_min_max(Vec3::ZERO, Vec3::ONE),
+                InheritedVisibility::VISIBLE,
+                MeshTag::new(1),
+            ))
+            .id();
+        let settled =
+            |app: &bevy_app::App| app.world().entity(caster).contains::<StaticShadowCaster>();
+        let promotions =
+            |app: &bevy_app::App| app.world().resource::<ShadowCacheCounters>().promotions;
+        step(&mut app, 0.016);
+        step(&mut app, 0.016);
+        assert!(settled(&app));
+
+        // The same tag written again changes nothing.
+        *app.world_mut().get_mut::<MeshTag>(caster).unwrap() = MeshTag::new(1);
+        step(&mut app, 0.016);
+        assert!(settled(&app));
+        assert_eq!(promotions(&app), 0);
+
+        // Another tag (a shader may place the vertices by it) is live in the
+        // same frame, as a mesh change.
+        *app.world_mut().get_mut::<MeshTag>(caster).unwrap() = MeshTag::new(2);
+        step(&mut app, 0.016);
+        assert!(!settled(&app));
+        assert_eq!(promotions(&app), 1);
+        assert_eq!(
+            app.world()
+                .get::<ShadowCasterState>(caster)
+                .unwrap()
+                .reason(),
+            ShadowCasterChange::Mesh
+        );
+        // Settled before: it settles again the settle time after its first
+        // frame live (which takes in the new signature).
+        step(&mut app, 0.016);
+        step(&mut app, 1.1);
+        assert!(settled(&app));
+
+        // Removed: the shaders read 0.
+        app.world_mut().entity_mut(caster).remove::<MeshTag>();
+        step(&mut app, 0.016);
+        assert!(!settled(&app));
+        assert_eq!(promotions(&app), 2);
+        step(&mut app, 0.016);
+        step(&mut app, 1.1);
+        assert!(settled(&app));
+
+        // The fault doesn't see it.
+        app.insert_resource(ShadowCacheFaults {
+            miss_tag_change: true,
+            ..Default::default()
+        });
+        app.world_mut().entity_mut(caster).insert(MeshTag::new(3));
+        step(&mut app, 0.016);
+        assert!(settled(&app));
+        assert_eq!(promotions(&app), 2);
     }
 
     #[test]
