@@ -26,7 +26,7 @@ use bevy_light::{
     spot_light_clip_from_view, spot_light_world_from_view, AmbientLight, CascadeShadowConfig,
     Cascades, DirectionalLight, DirectionalLightShadowMap, GlobalAmbientLight, PointLight,
     PointLightShadowMap, RectLight, ShadowCacheFaults, ShadowCacheSettings, ShadowFilteringMethod,
-    SpotLight, SpotLightShadowCache, VolumetricLight,
+    ShadowViewId, SpotLight, SpotLightShadowCache, VolumetricLight,
 };
 use bevy_log::warn_once;
 use bevy_material::{
@@ -786,12 +786,10 @@ pub fn extract_lights(
         ));
         match shadow_cache {
             Some(shadow_cache) => {
-                entity_commands.insert(ExtractedSpotShadowCache {
-                    static_revision: shadow_cache.static_revision(),
-                    movers_tiles: shadow_cache.movers_tiles().clone(),
-                    lights_a_view: shadow_cache.lights_a_view(),
-                    single_view: shadow_cache.single_view(),
-                });
+                entity_commands.insert(ExtractedSpotShadowCache(ExtractedShadowView::new(
+                    ShadowViewId::spot(main_entity),
+                    shadow_cache.view(),
+                )));
             }
             None => {
                 entity_commands.remove::<ExtractedSpotShadowCache>();
@@ -1101,7 +1099,7 @@ pub struct LightMeta {
     pub view_gpu_lights: DynamicUniformBuffer<GpuLights>,
 }
 
-#[derive(Component)]
+#[derive(Component, Clone, Copy)]
 pub enum LightEntity {
     Directional {
         light_entity: Entity,
@@ -1203,9 +1201,9 @@ pub fn prepare_lights(
         shadow_cache_faults,
         gpu_culled_entities,
     ): (
-        ResMut<SpotShadowCaches>,
+        ResMut<ShadowViewCaches>,
         Res<ShadowCacheSettings>,
-        Query<(), With<ExtractedSpotShadowCache>>,
+        Query<&ExtractedSpotShadowCache>,
         Query<(
             &ExtractedSpotShadowCache,
             Option<&RenderShadowMapVisibleEntities>,
@@ -1669,7 +1667,10 @@ pub fn prepare_lights(
                 array_layer_count: None,
             });
 
-    spot_shadow_caches.prepare_for_new_frame(&cached_spot_lights, &shadow_cache_settings);
+    spot_shadow_caches.prepare_for_new_frame(
+        cached_spot_lights.iter().map(|cache| &cache.0),
+        &shadow_cache_settings,
+    );
 
     let mut live_views = EntityHashSet::with_capacity(views_count);
 
@@ -1775,11 +1776,10 @@ pub fn prepare_lights(
         if let Ok((extracted_shadow_cache, visible_entities)) =
             cached_spot_light_data.get(*light_entity)
         {
-            spot_shadow_caches.prepare_light(
+            spot_shadow_caches.prepare_spot_light(
                 &mut commands,
                 PrepareCachedSpotLight {
                     light_entity: *light_entity,
-                    light_main_entity: *light_main_entity,
                     light,
                     light_render_layers,
                     spot_light_frustum,
@@ -2480,9 +2480,7 @@ fn create_spot_shadow_map(
         RootNonCameraView(Core3d.intern()),
         // MPS: the logical key, with the layer this view draws into.
         ShadowViewKey {
-            light: *light_main_entity,
-            camera: None,
-            subview: 0,
+            id: ShadowViewId::spot(light_main_entity.id()),
             role: ShadowViewRole::Full,
             region: ShadowMapRegion {
                 texture: directional_light_depth_texture.texture.id(),
@@ -3299,6 +3297,33 @@ fn point_or_spot_light_to_clusterable(point_light: &ExtractedPointLight) -> Clus
     }
 }
 
+/// MPS: where a shadow view's visible entities are: the light's render entity
+/// and the key of its [`RenderShadowMapVisibleEntities`] table. The key keeps
+/// the view's subview index whole, with its role in the high bits
+/// ([`ShadowViewRole`]).
+pub(crate) fn shadow_map_visible_entities_key(
+    light_entity: &LightEntity,
+    extracted_view_light: &ExtractedView,
+) -> (Entity, RetainedViewEntity) {
+    match light_entity {
+        LightEntity::Directional { light_entity, .. } => {
+            (*light_entity, extracted_view_light.retained_view_entity)
+        }
+        // We replace the auxiliary entity with `None`
+        // because all cubemap views for a single point light
+        // currently share the same set of visible entities,
+        // and so do all shadow maps for a single spot light.
+        LightEntity::Point { light_entity, .. } | LightEntity::Spot { light_entity } => (
+            *light_entity,
+            RetainedViewEntity {
+                main_entity: extracted_view_light.retained_view_entity.main_entity,
+                auxiliary_entity: None,
+                subview_index: extracted_view_light.retained_view_entity.subview_index,
+            },
+        ),
+    }
+}
+
 /// Returns the [`RenderShadowMapVisibleEntities`] table corresponding to the
 /// given [`LightEntity`].
 fn get_shadow_map_visible_entities<'w, 's: 'w>(
@@ -3306,57 +3331,22 @@ fn get_shadow_map_visible_entities<'w, 's: 'w>(
     light_entity: &'_ LightEntity,
     extracted_view_light: &'_ ExtractedView,
 ) -> &'w RenderVisibleEntities {
-    match light_entity {
-        LightEntity::Directional { light_entity, .. } => {
-            let retained_view_entity = extracted_view_light.retained_view_entity;
-            &shadow_map_visible_entities_query
-                .get(*light_entity)
-                .expect("Failed to get directional light visible entities")
-                .subviews
-                .get(&retained_view_entity)
-                .expect("Failed to get directional light visible entities for cascade")
-                .1
-        }
-        LightEntity::Point {
-            light_entity,
-            face_index,
-        } => {
-            // We replace the auxiliary entity with `None`
-            // because all cubemap views for a single point light
-            // currently share the same set of visible entities.
-            let retained_view_entity = RetainedViewEntity {
-                main_entity: extracted_view_light.retained_view_entity.main_entity,
-                auxiliary_entity: None,
-                subview_index: *face_index as u32,
-            };
-            &shadow_map_visible_entities_query
-                .get(*light_entity)
-                .expect("Failed to get point light visible entities")
-                .subviews
-                .get(&retained_view_entity)
-                .expect("Failed to get point light visible entity for face")
-                .1
-        }
-        LightEntity::Spot { light_entity } => {
-            // We replace the auxiliary entity with `None`
-            // because all shadow maps for a single spot light
-            // currently share the same set of visible entities.
-            // MPS: the subview index holds the view's role, see
-            // `ShadowViewRole`.
-            let retained_view_entity = RetainedViewEntity {
-                main_entity: extracted_view_light.retained_view_entity.main_entity,
-                auxiliary_entity: None,
-                subview_index: extracted_view_light.retained_view_entity.subview_index,
-            };
-            &shadow_map_visible_entities_query
-                .get(*light_entity)
-                .expect("Failed to get spot light visible entities")
-                .subviews
-                .get(&retained_view_entity)
-                .expect("Failed to get spot light visible entity for view")
-                .1
-        }
-    }
+    let (light, retained_view_entity) =
+        shadow_map_visible_entities_key(light_entity, extracted_view_light);
+    let (light_kind, view_kind) = match light_entity {
+        LightEntity::Directional { .. } => ("directional", "cascade"),
+        LightEntity::Point { .. } => ("point", "face"),
+        LightEntity::Spot { .. } => ("spot", "view"),
+    };
+    &shadow_map_visible_entities_query
+        .get(light)
+        .unwrap_or_else(|_| panic!("Failed to get {light_kind} light visible entities"))
+        .subviews
+        .get(&retained_view_entity)
+        .unwrap_or_else(|| {
+            panic!("Failed to get {light_kind} light visible entities for {view_kind}")
+        })
+        .1
 }
 
 /// An extraction system that determines the origin for LOD computation for

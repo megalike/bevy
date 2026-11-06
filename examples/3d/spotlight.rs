@@ -319,7 +319,7 @@ mod oracle {
         light::{
             DirectionalLightShadowMap, InvalidateShadowCache, ShadowCacheCounters,
             ShadowCacheFaults, ShadowCacheLoading, ShadowCacheState, ShadowCasterLive,
-            StaticShadowCaster,
+            ShadowViewId, StaticShadowCaster,
         },
         mesh::Indices,
         pbr::{
@@ -505,10 +505,11 @@ mod oracle {
         hashes: Vec<(u32, Entity, String, bool, String)>,
     }
 
-    /// What the oracle keeps of an audit record.
+    /// What the oracle keeps of an audit record: one view-frame (a spot
+    /// light has one shadow view).
     struct AuditedLightFrame {
         frame: u32,
-        light: Entity,
+        view: ShadowViewId,
         status: ShadowCacheAuditStatus,
         differing: u32,
         /// The light-frames the audit expected in the frame.
@@ -1481,17 +1482,17 @@ mod oracle {
             }
             match record.status {
                 ShadowCacheAuditStatus::Missing(why) => warn!(
-                    "oracle: frame {} ({}): light {:?} ({:?}) not compared: {why}",
+                    "oracle: frame {} ({}): view {:?} ({:?}) not compared: {why}",
                     record.frame,
                     scenario(record.frame),
-                    record.light,
+                    record.view,
                     record.plan,
                 ),
                 _ if record.differing > 0 => warn!(
-                    "oracle: frame {} ({}): light {:?} (layers {:?}, {:?}): {} texels differ, first at {:?}",
+                    "oracle: frame {} ({}): view {:?} (layers {:?}, {:?}): {} texels differ, first at {:?}",
                     record.frame,
                     scenario(record.frame),
-                    record.light,
+                    record.view,
                     record.layers,
                     record.plan,
                     record.differing,
@@ -1501,7 +1502,7 @@ mod oracle {
             }
             script.records.push(AuditedLightFrame {
                 frame: record.frame,
-                light: record.light,
+                view: record.view,
                 status: record.status,
                 differing: record.differing,
                 expected: record.expected,
@@ -1583,7 +1584,7 @@ mod oracle {
             );
         }
         let lights: usize = {
-            let mut lights: Vec<_> = records.iter().map(|record| record.light).collect();
+            let mut lights: Vec<_> = records.iter().map(|record| record.view).collect();
             lights.sort_unstable();
             lights.dedup();
             lights.len()

@@ -1,6 +1,7 @@
-//! A debug check of the spot light shadow cache (`bevy_light`'s
-//! `ShadowCacheSettings`) against full redraws, texel by texel:
-//! [`ShadowCacheAuditPlugin`].
+//! A debug check of the shadow cache (`bevy_light`'s `ShadowCacheSettings`)
+//! against full redraws, texel by texel, view by view:
+//! [`ShadowCacheAuditPlugin`]. Today it checks spot lights, the light type
+//! the cache caches.
 
 use alloc::{borrow::Cow, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +11,7 @@ use bevy_app::{App, Plugin, PostUpdate};
 use bevy_camera::visibility::{NoFrustumCulling, RenderLayers, ViewVisibility};
 use bevy_diagnostic::FrameCount;
 use bevy_ecs::prelude::*;
-use bevy_light::{ShadowCacheExempt, SpotLight};
+use bevy_light::{ShadowCacheExempt, ShadowViewId, SpotLight};
 use bevy_math::UVec2;
 use bevy_render::{
     render_resource::*,
@@ -22,9 +23,8 @@ use bevy_transform::TransformSystems;
 use bevy_utils::default;
 
 use crate::{
-    acknowledge_spot_shadow_caches, ExtractedPointLight, PointAndSpotLightViewEntities,
-    ShadowCachePlan, ShadowViewKey, SpotShadowCaches, ViewShadowBindings,
-    CORE_3D_SHADOW_MAP_FORMAT,
+    acknowledge_shadow_caches, ExtractedPointLight, PointAndSpotLightViewEntities, ShadowCachePlan,
+    ShadowViewCaches, ShadowViewKey, ViewShadowBindings, CORE_3D_SHADOW_MAP_FORMAT,
 };
 
 /// Checks every cached spot light's shadow map against a full redraw, every
@@ -97,9 +97,9 @@ impl Plugin for ShadowCacheAuditPlugin {
             .add_systems(ExtractSchedule, extract_audit_pairs)
             .add_systems(
                 Render,
-                audit_spot_shadow_caches
+                audit_shadow_caches
                     .in_set(RenderSystems::Cleanup)
-                    .before(acknowledge_spot_shadow_caches),
+                    .before(acknowledge_shadow_caches),
             );
     }
 }
@@ -130,7 +130,7 @@ pub struct ShadowCacheAuditTexel {
     pub static_layer: u32,
 }
 
-/// Whether an audited light-frame was compared.
+/// Whether an audited view-frame was compared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShadowCacheAuditStatus {
     /// Compared (or hashed).
@@ -143,21 +143,23 @@ pub enum ShadowCacheAuditStatus {
     Missing(&'static str),
 }
 
-/// One comparison of a cached light with its full redraw.
+/// One comparison of a cached shadow view with its full redraw.
 #[derive(Clone, Debug)]
 pub struct ShadowCacheAuditRecord {
     /// [`FrameCount`] when the frame was extracted.
     pub frame: u32,
-    /// The light-frames the audit expected in this frame (one record each):
-    /// with twins or hashes every shadowed spot light the main world
-    /// extracted, without them every cached light planned this frame.
+    /// The view-frames the audit expected in this frame (one record each):
+    /// with twins or hashes the view of every shadowed spot light the main
+    /// world extracted, without them every cached view planned this frame.
     pub expected: u32,
     /// Whether it was compared.
     pub status: ShadowCacheAuditStatus,
     /// The audit's own count of rendered frames (an application may pin
     /// [`FrameCount`]).
     pub audit_frame: u32,
-    /// The cached light (main world).
+    /// The shadow view.
+    pub view: ShadowViewId,
+    /// Its light (main world).
     pub light: Entity,
     /// The shadow map layers of the light and its twin (the light's again
     /// without twins).
@@ -617,15 +619,15 @@ fn drawn_target(
 }
 
 /// After the frame's passes, before they are acknowledged: compares each
-/// cached light's shadow map and static layer with its twin's full redraw.
+/// cached view's shadow map and static layer with its twin's full redraw.
 ///
-/// Every expected light-frame gets a record: compared, skipped as dormant, or
+/// Every expected view-frame gets a record: compared, skipped as dormant, or
 /// missing with the reason. A comparison reads the texture the views'
 /// lighting binds, and only after checking that the light and its twin drew
 /// into that texture.
-fn audit_spot_shadow_caches(
+fn audit_shadow_caches(
     pairs: Res<AuditPairs>,
-    caches: Res<SpotShadowCaches>,
+    caches: Res<ShadowViewCaches>,
     lights: Query<(
         Option<&ExtractedPointLight>,
         Option<&PointAndSpotLightViewEntities>,
@@ -659,29 +661,36 @@ fn audit_spot_shadow_caches(
         Some(first) => Ok(first),
     };
     let hashes = settings.hashes && !settings.fresh_redraws;
-    // (light, render light, twin): with twins or hashes every shadowed spot
-    // light the main world extracted, else every cached light planned.
-    let expected: Vec<(Entity, Entity, Option<Entity>)> = if settings.fresh_redraws || hashes {
-        pairs.pairs.clone()
+    // (view, its light's render entity, the twin's): with twins or hashes
+    // the view of every shadowed spot light the main world extracted, else
+    // every cached view planned.
+    let expected: Vec<(ShadowViewId, Entity, Option<Entity>)> = if settings.fresh_redraws || hashes
+    {
+        pairs
+            .pairs
+            .iter()
+            .map(|&(light, render_light, twin)| (ShadowViewId::spot(light), render_light, twin))
+            .collect()
     } else {
         let mut cached: Vec<_> = caches
-            .audited_lights()
-            .map(|(render_light, light)| (light, render_light, None))
+            .audited_views()
+            .map(|(view, render_light)| (view, render_light, None))
             .collect();
-        cached.sort_unstable_by_key(|(light, ..)| *light);
+        cached.sort_unstable_by_key(|(view, ..)| *view);
         cached
     };
     let count = expected.len() as u32;
     let mut audited = Vec::with_capacity(expected.len());
     let mut skipped = Vec::new();
-    for (light, render_light, twin) in expected {
-        let info = caches.audit(render_light);
+    for (view, render_light, twin) in expected {
+        let info = caches.audit(&view);
         let mut record = ShadowCacheAuditRecord {
             frame: pairs.frame,
             expected: count,
             status: ShadowCacheAuditStatus::Compared,
             audit_frame: pairs.audit_frame,
-            light,
+            view,
+            light: view.light,
             layers: (0, 0),
             fresh: settings.fresh_redraws,
             plan: info

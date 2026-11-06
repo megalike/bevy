@@ -1,11 +1,18 @@
-//! The render world's half of the spot light shadow cache (`bevy_light`'s
+//! The render world's half of the shadow cache (`bevy_light`'s
 //! `shadow_cache` module: [`ShadowCacheSettings`]).
 //!
-//! Each cached spot light that fits in the budget gets a static layer of its
-//! own, a depth texture that holds the shadow of its settled casters. Each
-//! frame [`SpotShadowCaches`] plans the light from what the main world found
-//! (its static revision, where its movable casters are) and from what the
-//! light's textures hold:
+//! The cache keeps its state by shadow view ([`ShadowViewId`]): a spot
+//! light's shadow map, and, reserved for later, a directional light's cascade
+//! for a camera or a point light's cube face. Each light type's adapter
+//! describes its cached views ([`CachedShadowView`]: projection, frustum,
+//! destination); today only spot lights are cached
+//! ([`ShadowViewCaches::prepare_spot_light`]).
+//!
+//! Each cached view that fits in the budget gets a static layer of its own,
+//! a depth texture that holds the shadow of its settled casters. Each frame
+//! [`ShadowViewCaches`] plans the view from what the main world found (its
+//! static revision, where its movable casters are) and from what the view's
+//! textures hold:
 //!
 //! | Plan | When | Views |
 //! | --- | --- | --- |
@@ -16,17 +23,17 @@
 //! | Fallback | no usable static layer (budget, or its restore's blit isn't compiled yet), and movable casters are or were in its frustum, or its map isn't current | one view draws every caster into the shadow map, as for an uncached light |
 //! | Dormant | it lights no view | none; the map keeps what it holds (the tiles live casters were drawn into stay written), so the frame it lights a view again plans as after any frame |
 //!
-//! A light with a usable static layer draws its static casters and its
-//! movable casters with two views
+//! A view with a usable static layer draws its static casters and its
+//! movable casters with two render views
 //! ([`ShadowViewRole::Static`], [`ShadowViewRole::Movers`]); the static views
 //! of all lights run before the movers views ([`RootNonCameraViewOrder`]), and
 //! the restore runs at the start of the movers view: one instanced quad per
-//! run of set tiles in a row of the light's [`ShadowTileMask`], or one
+//! run of set tiles in a row of the view's [`ShadowTileMask`], or one
 //! triangle over the whole layer. After the frame's passes
-//! were recorded, [`acknowledge_spot_shadow_caches`] checks that every caster
+//! were recorded, [`acknowledge_shadow_caches`] checks that every caster
 //! of a drawn static view was ready (its mesh, material and pipeline) and only
 //! then counts the static content as valid, and reports to the main world
-//! ([`ShadowCacheFeedback`]).
+//! ([`ShadowCacheFeedback`], by view and generation).
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -35,19 +42,15 @@ use bevy_app::{App, Plugin};
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer};
 use bevy_camera::{primitives::Frustum, visibility::RenderLayers};
 use bevy_core_pipeline::schedule::{Core3d, RootNonCameraView, RootNonCameraViewOrder};
-use bevy_ecs::{
-    entity::{EntityHashMap, EntityHashSet},
-    prelude::*,
-    schedule::ScheduleLabel,
-    system::SystemParam,
-};
+use bevy_ecs::{prelude::*, schedule::ScheduleLabel, system::SystemParam};
 use bevy_light::{
     spot_light_clip_from_view, spot_light_world_from_view, ShadowCacheFaults, ShadowCacheFeedback,
-    ShadowCacheLightStatus, ShadowCacheSettings, ShadowCacheState, ShadowTileMask,
+    ShadowCacheSettings, ShadowCacheState, ShadowCacheViewStatus, ShadowTileMask, ShadowViewCache,
+    ShadowViewId,
 };
-use bevy_math::{URect, UVec2, UVec4};
+use bevy_math::{Mat4, URect, UVec2, UVec4};
 use bevy_mesh::{Mesh3d, VertexBufferLayout, VertexFormat};
-use bevy_platform::collections::HashSet;
+use bevy_platform::collections::{HashMap, HashSet};
 use bevy_render::{
     batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
     diagnostic::RecordDiagnostics,
@@ -67,16 +70,16 @@ use bevy_transform::components::GlobalTransform;
 use bevy_utils::default;
 
 use crate::{
-    ExtractedPointLight, LightEntity, PendingShadowQueues, PointAndSpotLightViewEntities,
-    PreparedMaterial, PreprocessBindGroups, PreprocessPipelines, RenderMaterialInstances,
-    RenderMeshInstanceFlags, RenderMeshInstances, Shadow, ShadowView,
+    shadow_map_visible_entities_key, ExtractedPointLight, LightEntity, PendingShadowQueues,
+    PointAndSpotLightViewEntities, PreparedMaterial, PreprocessBindGroups, PreprocessPipelines,
+    RenderMaterialInstances, RenderMeshInstanceFlags, RenderMeshInstances, Shadow, ShadowView,
     SpecializedShadowMaterialPipelineCache, CORE_3D_SHADOW_MAP_FORMAT,
 };
 
-/// Adds the render world's half of the spot light shadow cache.
-pub struct SpotShadowCachePlugin;
+/// Adds the render world's half of the shadow cache.
+pub struct ShadowCachePlugin;
 
-impl Plugin for SpotShadowCachePlugin {
+impl Plugin for ShadowCachePlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shadow_restore.wesl");
 
@@ -89,13 +92,13 @@ impl Plugin for SpotShadowCachePlugin {
         };
         render_app
             .insert_resource(feedback)
-            .init_resource::<SpotShadowCaches>()
+            .init_resource::<ShadowViewCaches>()
             .init_resource::<ShadowCacheSettings>()
             .add_systems(RenderStartup, init_shadow_restore_pipeline)
             .add_systems(ExtractSchedule, extract_shadow_cache_settings)
             .add_systems(
                 Render,
-                acknowledge_spot_shadow_caches.in_set(RenderSystems::Cleanup),
+                acknowledge_shadow_caches.in_set(RenderSystems::Cleanup),
             );
     }
 }
@@ -188,16 +191,14 @@ pub(crate) struct ShadowMapRegion {
     pub size: UVec2,
 }
 
-/// The logical key of a shadow view: which light, camera (for cascades), face
-/// or cascade and role, and where it draws.
+/// The key of a render view that draws a shadow map: the logical shadow view
+/// (light, camera for cascades, face or cascade), what the render view draws
+/// of it, and where. The role and the destination aren't part of the logical
+/// identity the cache keeps its state by.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ShadowViewKey {
-    /// The light.
-    pub light: MainEntity,
-    /// The camera, for views that follow one (directional cascades).
-    pub camera: Option<MainEntity>,
-    /// The cube face or cascade.
-    pub subview: u32,
+    /// The logical shadow view.
+    pub id: ShadowViewId,
     /// What the view draws.
     pub role: ShadowViewRole,
     /// Where it draws.
@@ -207,12 +208,19 @@ pub(crate) struct ShadowViewKey {
 impl ShadowViewKey {
     /// The view's retained entity: the role is part of the subview index.
     pub fn retained_view_entity(&self) -> RetainedViewEntity {
-        RetainedViewEntity::new(
-            self.light,
-            self.camera,
-            self.role.subview_index(self.subview),
-        )
+        retained_shadow_view(&self.id, self.role)
     }
+}
+
+/// The retained entity of a role's render view of a shadow view: the light,
+/// the camera (cascades), and the face or cascade with the role in the high
+/// bits of the subview index ([`ShadowViewRole::subview_index`]).
+pub(crate) fn retained_shadow_view(id: &ShadowViewId, role: ShadowViewRole) -> RetainedViewEntity {
+    RetainedViewEntity::new(
+        MainEntity::from(id.light),
+        id.camera().map(MainEntity::from),
+        role.subview_index(id.subview_index()),
+    )
 }
 
 /// Set when a cached light's shadow view recorded its pass in this frame.
@@ -231,12 +239,12 @@ impl ShadowPassRecord {
     }
 }
 
-/// What the movers view of a cached light restores from its static layer
-/// before it draws.
+/// What the movers view of a cached shadow view restores from its static
+/// layer before it draws.
 #[derive(Component, Clone)]
 #[doc(hidden)]
 pub struct ShadowRestore {
-    /// The quads to draw: instances of [`SpotShadowCaches`]'s quad buffer.
+    /// The quads to draw: instances of [`ShadowViewCaches`]'s quad buffer.
     pub(crate) quads: core::ops::Range<u32>,
     /// 4 to draw each quad as a triangle strip; 3 for the one triangle over
     /// the whole layer.
@@ -247,25 +255,47 @@ pub struct ShadowRestore {
     pub(crate) destination_view: TextureView,
 }
 
-/// Extracted on a cached spot light's render entity, from its
-/// `SpotLightShadowCache`.
-#[derive(Component, Clone, Debug)]
+/// What the main world found for a cached shadow view this frame, from its
+/// [`ShadowViewCache`].
+#[derive(Clone, Debug)]
 #[doc(hidden)]
-pub struct ExtractedSpotShadowCache {
-    /// The revision of the light's static content.
+pub struct ExtractedShadowView {
+    /// The view.
+    pub(crate) id: ShadowViewId,
+    /// The generation of its state in the main world.
+    pub(crate) generation: u64,
+    /// The revision of the view's static content.
     pub(crate) static_revision: u64,
     /// The tiles the movable casters touch.
     pub(crate) movers_tiles: ShadowTileMask,
     /// Whether the light reaches into a view; if not, the main world found no
     /// casters for it.
     pub(crate) lights_a_view: bool,
-    /// The light has no usable static layer: all its casters are in one
-    /// list, drawn by one view ([`ShadowViewRole::Full`]), and its movers
+    /// The view has no usable static layer: all its casters are in one list,
+    /// drawn by one render view ([`ShadowViewRole::Full`]), and its movers
     /// tiles are all set while a live caster is in its frustum.
     pub(crate) single_view: bool,
 }
 
-/// What a frame does for a cached spot light.
+impl ExtractedShadowView {
+    pub(crate) fn new(id: ShadowViewId, cache: &ShadowViewCache) -> Self {
+        Self {
+            id,
+            generation: cache.generation(),
+            static_revision: cache.static_revision(),
+            movers_tiles: cache.movers_tiles().clone(),
+            lights_a_view: cache.lights_a_view(),
+            single_view: cache.single_view(),
+        }
+    }
+}
+
+/// Extracted on a cached spot light's render entity: its one shadow view.
+#[derive(Component, Clone, Debug)]
+#[doc(hidden)]
+pub struct ExtractedSpotShadowCache(pub(crate) ExtractedShadowView);
+
+/// What a frame does for a cached shadow view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShadowCachePlan {
     /// Nothing.
@@ -284,11 +314,11 @@ pub enum ShadowCachePlan {
 }
 
 impl ShadowCachePlan {
-    /// Plans a cached spot light.
+    /// Plans a cached shadow view.
     ///
-    /// - `has_layer`: the light has a static layer of the current size.
+    /// - `has_layer`: the view has a static layer of the current size.
     /// - `static_valid`: the layer holds the current static revision.
-    /// - `working_valid`: the light's shadow map is where it was last drawn
+    /// - `working_valid`: the view's shadow map is where it was last drawn
     ///   and holds the current static revision (with the movable casters of
     ///   `movers_last` on top).
     /// - `movers`: movable casters are in its frustum now, or were drawn into
@@ -340,7 +370,7 @@ impl ShadowCachePlan {
     }
 }
 
-/// A cached light's static layer: a depth texture of its own.
+/// A cached view's static layer: a depth texture of its own.
 struct StaticShadowLayer {
     texture: Texture,
     attachment_view: TextureView,
@@ -351,15 +381,15 @@ struct StaticShadowLayer {
     bytes: u64,
 }
 
-/// Where a light's shadow map is drawn: the shadow map texture and layer.
+/// Where a view's shadow map is drawn: the shadow map texture and layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WorkingDestination {
     texture: TextureId,
     layer: u32,
 }
 
-/// What the audit reads of a cached light ([`SpotShadowCaches::audit`]).
-pub(crate) struct ShadowCacheAuditLight {
+/// What the audit reads of a cached view ([`ShadowViewCaches::audit`]).
+pub(crate) struct ShadowCacheAuditView {
     /// The shadow map texture it is drawn into this frame.
     pub texture: TextureId,
     /// Its layer of the shadow map texture.
@@ -383,10 +413,10 @@ pub(crate) struct ShadowCacheAuditLight {
     pub static_layer: Option<TextureView>,
 }
 
-/// What this frame planned for a light, for [`acknowledge_spot_shadow_caches`].
+/// What this frame planned for a view, for [`acknowledge_shadow_caches`].
 struct FramePlan {
     plan: ShadowCachePlan,
-    /// Whether the light has a static layer and the blit to restore it.
+    /// Whether the view has a static layer and the blit to restore it.
     layer_usable: bool,
     static_revision: u64,
     destination: WorkingDestination,
@@ -400,13 +430,17 @@ struct FramePlan {
 /// static layer with one quad instead of a quad per run of tiles.
 const WHOLE_RESTORE_COVERAGE: f32 = 0.875;
 
-/// What the render world keeps for a cached spot light.
-struct SpotShadowCacheState {
-    main_entity: MainEntity,
+/// What the render world keeps for a cached shadow view.
+struct ShadowViewCacheState {
+    /// The main world's generation of the view's state: another one is
+    /// another view.
+    generation: u64,
+    /// The light's render entity.
+    render_light: Entity,
     static_layer: Option<StaticShadowLayer>,
     /// The static revision the static layer holds (acknowledged).
     static_content: Option<u64>,
-    /// Where the light's shadow map was drawn and which static revision it
+    /// Where the view's shadow map was drawn and which static revision it
     /// holds, as acknowledged.
     working: Option<(WorkingDestination, u64)>,
     /// The view of the shadow map layer, kept while it stays there.
@@ -415,7 +449,7 @@ struct SpotShadowCacheState {
     /// weren't restored since: what a restore must cover besides the tiles
     /// they touch now.
     written: ShadowTileMask,
-    /// Where the light's shadow map is drawn this frame, if it was planned.
+    /// Where the view's shadow map is drawn this frame, if it was planned.
     destination: Option<WorkingDestination>,
     frame: Option<FramePlan>,
     seen: bool,
@@ -423,12 +457,12 @@ struct SpotShadowCacheState {
     dormant: bool,
 }
 
-/// Static layers a light gave up, kept (and counted in the budget) until the
+/// Static layers a view gave up, kept (and counted in the budget) until the
 /// GPU can no longer use them: the render thread runs at most two frames
 /// ahead of the GPU (wgpu's default frame latency), so a layer dropped
 /// [`Self::FRAMES`] frames after its last use is released. The budget thus
 /// bounds what the static layers hold at any time, not only the layers in
-/// use; a light that would exceed it falls back until the bytes are free.
+/// use; a view that would exceed it falls back until the bytes are free.
 struct RetiringLayers<T> {
     /// (frames left, bytes, the layer).
     layers: Vec<(u32, u64, T)>,
@@ -467,12 +501,14 @@ impl<T> RetiringLayers<T> {
     }
 }
 
-/// The render world's cached spot lights, by render entity, the bytes their
-/// static layers take, and this frame's restore quads.
+/// The render world's cached shadow views, by [`ShadowViewId`], the bytes
+/// their static layers take, and this frame's restore quads.
 #[derive(Resource)]
 #[doc(hidden)]
-pub struct SpotShadowCaches {
-    lights: EntityHashMap<SpotShadowCacheState>,
+pub struct ShadowViewCaches {
+    views: HashMap<ShadowViewId, ShadowViewCacheState>,
+    /// The views extracted this frame, with their generations.
+    extracted: HashMap<ShadowViewId, u64>,
     /// The bytes of the static layers in use.
     allocated_bytes: u64,
     /// Static layers given up, until the GPU released them.
@@ -482,10 +518,11 @@ pub struct SpotShadowCaches {
     restore_quads: RawBufferVec<[f32; 4]>,
 }
 
-impl Default for SpotShadowCaches {
+impl Default for ShadowViewCaches {
     fn default() -> Self {
         Self {
-            lights: default(),
+            views: default(),
+            extracted: default(),
             allocated_bytes: 0,
             retiring: default(),
             restore_quads: RawBufferVec::new(BufferUsages::VERTEX),
@@ -493,10 +530,9 @@ impl Default for SpotShadowCaches {
     }
 }
 
-/// What [`SpotShadowCaches::prepare_light`] needs.
+/// What [`ShadowViewCaches::prepare_spot_light`] needs.
 pub(crate) struct PrepareCachedSpotLight<'a> {
     pub light_entity: Entity,
-    pub light_main_entity: MainEntity,
     pub light: &'a ExtractedPointLight,
     pub light_render_layers: &'a RenderLayers,
     pub spot_light_frustum: Option<&'a Frustum>,
@@ -515,19 +551,59 @@ pub(crate) struct PrepareCachedSpotLight<'a> {
     pub faults: ShadowCacheFaults,
 }
 
-impl SpotShadowCaches {
-    /// Starts a frame: forgets lights that are no longer cached and frees
-    /// static layers beyond the budget.
-    pub(crate) fn prepare_for_new_frame(
+/// A cached shadow view as its light type's adapter describes it to
+/// [`ShadowViewCaches::prepare_view`]: what the main world found for it, its
+/// projection and culling, the light it belongs to and where it is drawn.
+pub(crate) struct CachedShadowView<'a> {
+    /// What the main world found for the view.
+    pub extracted: &'a ExtractedShadowView,
+    /// The light's render entity.
+    pub light_entity: Entity,
+    /// The light the view's render views belong to.
+    pub light_kind: LightEntity,
+    /// The render layers its render views draw.
+    pub render_layers: &'a RenderLayers,
+    /// The view's world-from-view transform, as its shadow view renders.
+    pub world_from_view: GlobalTransform,
+    /// The view's projection, as its shadow view renders.
+    pub clip_from_view: Mat4,
+    /// The frustum its casters are culled against.
+    pub frustum: Option<&'a Frustum>,
+    /// The name of its render views' passes; the role's suffix is added.
+    pub pass_name: &'a str,
+    /// The shadow map texture it is drawn into, its layer and size.
+    pub shadow_map: &'a CachedTexture,
+    pub layer: u32,
+    pub map_size: u32,
+    pub gpu_preprocessing_mode: GpuPreprocessingMode,
+    /// The visible entities of the light's render views.
+    pub visible_entities: Option<&'a RenderShadowMapVisibleEntities>,
+    /// Meshes whose GPU data couldn't be updated this frame.
+    pub stale_meshes: &'a MainEntityHashSet,
+    /// The settled casters among the meshes culled on the GPU only.
+    pub static_gpu_culled: &'a MainEntityHashSet,
+    /// Faults to inject, for tests.
+    pub faults: ShadowCacheFaults,
+}
+
+impl ShadowViewCaches {
+    /// Starts a frame: forgets views that are no longer cached (or whose
+    /// state the main world created anew) and frees static layers beyond the
+    /// budget. `extracted`: the cached views the main world extracted.
+    pub(crate) fn prepare_for_new_frame<'a>(
         &mut self,
-        cached_lights: &Query<(), With<ExtractedSpotShadowCache>>,
+        extracted: impl Iterator<Item = &'a ExtractedShadowView>,
         settings: &ShadowCacheSettings,
     ) {
         self.retiring.tick();
+        self.extracted.clear();
+        self.extracted
+            .extend(extracted.map(|view| (view.id, view.generation)));
         let retiring = &mut self.retiring;
+        let extracted = &self.extracted;
         let mut freed = 0;
-        self.lights.retain(|entity, state| {
-            let keep = cached_lights.contains(*entity);
+        self.views.retain(|id, state| {
+            let keep = extracted.get(id) == Some(&state.generation);
             if !keep && let Some(layer) = state.static_layer.take() {
                 freed += layer.bytes;
                 retiring.retire(layer.bytes, layer);
@@ -536,16 +612,21 @@ impl SpotShadowCaches {
         });
         self.allocated_bytes -= freed;
 
-        // A smaller budget: free the layers of the last lights. The main world
-        // redraws every light when the settings change.
+        // A smaller budget: free the layers of the last views, in the order
+        // of their lights' render entities. The main world redraws every
+        // view when the settings change.
         if self.allocated_bytes > settings.budget_bytes {
-            let mut entities: Vec<_> = self.lights.keys().copied().collect();
-            entities.sort_unstable();
-            for entity in entities.into_iter().rev() {
+            let mut views: Vec<_> = self
+                .views
+                .iter()
+                .map(|(id, state)| (state.render_light, *id))
+                .collect();
+            views.sort_unstable();
+            for (_, id) in views.into_iter().rev() {
                 if self.allocated_bytes <= settings.budget_bytes {
                     break;
                 }
-                let state = self.lights.get_mut(&entity).unwrap();
+                let state = self.views.get_mut(&id).unwrap();
                 if let Some(layer) = state.static_layer.take() {
                     self.allocated_bytes -= layer.bytes;
                     state.static_content = None;
@@ -554,7 +635,7 @@ impl SpotShadowCaches {
             }
         }
 
-        for state in self.lights.values_mut() {
+        for state in self.views.values_mut() {
             state.seen = false;
             state.frame = None;
             state.destination = None;
@@ -562,22 +643,22 @@ impl SpotShadowCaches {
         self.restore_quads.clear();
     }
 
-    /// The cached spot lights planned this frame: (render entity, main
+    /// The cached views planned this frame: (view, its light's render
     /// entity).
-    pub(crate) fn audited_lights(&self) -> impl Iterator<Item = (Entity, Entity)> + '_ {
-        self.lights
+    pub(crate) fn audited_views(&self) -> impl Iterator<Item = (ShadowViewId, Entity)> + '_ {
+        self.views
             .iter()
             .filter(|(_, state)| state.frame.is_some())
-            .map(|(entity, state)| (*entity, state.main_entity.entity()))
+            .map(|(id, state)| (*id, state.render_light))
     }
 
     /// What [`ShadowCacheAuditPlugin`](crate::ShadowCacheAuditPlugin) reads
-    /// of a cached spot light (by render entity) that was planned this frame,
-    /// after the frame's passes and before they are acknowledged.
-    pub(crate) fn audit(&self, light: Entity) -> Option<ShadowCacheAuditLight> {
-        let state = self.lights.get(&light)?;
+    /// of a cached view that was planned this frame, after the frame's passes
+    /// and before they are acknowledged.
+    pub(crate) fn audit(&self, view: &ShadowViewId) -> Option<ShadowCacheAuditView> {
+        let state = self.views.get(view)?;
         let frame = state.frame.as_ref()?;
-        Some(ShadowCacheAuditLight {
+        Some(ShadowCacheAuditView {
             texture: frame.destination.texture,
             layer: frame.destination.layer,
             plan: frame.plan,
@@ -598,12 +679,67 @@ impl SpotShadowCaches {
         })
     }
 
-    /// Plans a cached spot light and sets up its views.
-    pub(crate) fn prepare_light(
+    /// The spot light adapter: describes a cached spot light's one shadow
+    /// view by its projection and plans it ([`Self::prepare_view`]).
+    pub(crate) fn prepare_spot_light(
         &mut self,
         commands: &mut Commands,
         args: PrepareCachedSpotLight,
         view_entities: &mut PointAndSpotLightViewEntities,
+        settings: &ShadowCacheSettings,
+        pipelines: (
+            &RenderDevice,
+            Option<&ShadowRestorePipeline>,
+            &PipelineCache,
+        ),
+        shadow_render_phases: &mut ViewBinnedRenderPhases<Shadow>,
+        live_shadow_mapping_lights: &mut HashSet<RetainedViewEntity>,
+    ) {
+        let spot_world_from_view = spot_light_world_from_view(&args.light.transform);
+        let angle = args
+            .light
+            .spot_light_angles
+            .expect("a cached light should be a spot light")
+            .1;
+        let spot_projection = spot_light_clip_from_view(angle, args.light.shadow_map_near_z);
+        let pass_name = format!("shadow_spot_light_{}", args.light_index);
+        self.prepare_view(
+            commands,
+            CachedShadowView {
+                extracted: &args.extracted.0,
+                light_entity: args.light_entity,
+                light_kind: LightEntity::Spot {
+                    light_entity: args.light_entity,
+                },
+                render_layers: args.light_render_layers,
+                world_from_view: GlobalTransform::from(spot_world_from_view),
+                clip_from_view: spot_projection,
+                frustum: args.spot_light_frustum,
+                pass_name: &pass_name,
+                shadow_map: args.shadow_map,
+                layer: args.layer,
+                map_size: args.map_size,
+                gpu_preprocessing_mode: args.gpu_preprocessing_mode,
+                visible_entities: args.visible_entities,
+                stale_meshes: args.stale_meshes,
+                static_gpu_culled: args.static_gpu_culled,
+                faults: args.faults,
+            },
+            &mut view_entities.0,
+            settings,
+            pipelines,
+            shadow_render_phases,
+            live_shadow_mapping_lights,
+        );
+    }
+
+    /// Plans a cached shadow view and sets up its render views (at most two,
+    /// in `view_entities`: the static view's, the movers view's).
+    pub(crate) fn prepare_view(
+        &mut self,
+        commands: &mut Commands,
+        args: CachedShadowView,
+        view_entities: &mut Vec<Entity>,
         settings: &ShadowCacheSettings,
         (render_device, restore_pipeline, pipeline_cache): (
             &RenderDevice,
@@ -614,11 +750,13 @@ impl SpotShadowCaches {
         live_shadow_mapping_lights: &mut HashSet<RetainedViewEntity>,
     ) {
         let size = args.map_size;
+        let id = args.extracted.id;
         let state = self
-            .lights
-            .entry(args.light_entity)
-            .or_insert_with(|| SpotShadowCacheState {
-                main_entity: args.light_main_entity,
+            .views
+            .entry(id)
+            .or_insert_with(|| ShadowViewCacheState {
+                generation: args.extracted.generation,
+                render_light: args.light_entity,
                 static_layer: None,
                 static_content: None,
                 working: None,
@@ -630,6 +768,7 @@ impl SpotShadowCaches {
                 dormant: false,
             });
         state.seen = true;
+        state.render_light = args.light_entity;
 
         // A static layer of another size is drawn again at the new size.
         if state
@@ -642,7 +781,7 @@ impl SpotShadowCaches {
             state.static_content = None;
             self.retiring.retire(layer.bytes, layer);
         }
-        // Stable slots: a light keeps its layer while it's cached; lights get
+        // Stable slots: a view keeps its layer while it's cached; views get
         // one in Bevy's light order while the budget lasts.
         let layer_bytes = size as u64 * size as u64 * 4;
         if state.static_layer.is_none()
@@ -661,7 +800,7 @@ impl SpotShadowCaches {
         }
         let has_layer = state.static_layer.is_some();
         // A static layer is of use only once the blit that restores it is
-        // compiled; until then the light falls back to drawing everything.
+        // compiled; until then the view falls back to drawing everything.
         let restore_ready = !args.faults.restore_not_ready
             && restore_pipeline.is_some_and(|restore_pipeline| {
                 pipeline_cache
@@ -669,8 +808,8 @@ impl SpotShadowCaches {
                     .is_some()
             });
 
-        // Its views need their lists of visible entities; a light without
-        // them this frame draws nothing and loses its place.
+        // Its render views need their lists of visible entities; a view
+        // without them this frame draws nothing and loses its place.
         let single_view = args.extracted.single_view;
         let roles: &[ShadowViewRole] = if single_view {
             &[ShadowViewRole::Full]
@@ -681,15 +820,11 @@ impl SpotShadowCaches {
             roles.iter().all(|role| {
                 visible_entities
                     .subviews
-                    .contains_key(&RetainedViewEntity::new(
-                        args.light_main_entity,
-                        None,
-                        role.subview_index(0),
-                    ))
+                    .contains_key(&retained_shadow_view(&id, *role))
             })
         });
         if !has_lists {
-            despawn_view_entities(commands, core::mem::take(&mut view_entities.0));
+            despawn_view_entities(commands, core::mem::take(view_entities));
             state.seen = false;
             return;
         }
@@ -701,11 +836,9 @@ impl SpotShadowCaches {
         let unbounded_movers = args
             .visible_entities
             .and_then(|visible_entities| {
-                visible_entities.subviews.get(&RetainedViewEntity::new(
-                    args.light_main_entity,
-                    None,
-                    roles[roles.len() - 1].subview_index(0),
-                ))
+                visible_entities
+                    .subviews
+                    .get(&retained_shadow_view(&id, roles[roles.len() - 1]))
             })
             .and_then(|(_, entities)| entities.get::<Mesh3d>())
             .is_some_and(|entities| {
@@ -741,8 +874,9 @@ impl SpotShadowCaches {
         let revision = args.extracted.static_revision;
         let static_valid = has_layer && state.static_content == Some(revision);
         let working_valid = state.working == Some((destination, revision));
-        // A light that lights no view draws nothing until it lights one again;
-        // the fault forgets in that frame what was written before.
+        // A view whose light lights no camera's view draws nothing until it
+        // lights one again; the fault forgets in that frame what was written
+        // before.
         let dormant = !args.extracted.lights_a_view;
         let drop_written = args.faults.drop_written
             || (args.faults.skip_reentry_restore && state.dormant && !dormant);
@@ -762,10 +896,10 @@ impl SpotShadowCaches {
         };
         state.destination = Some(destination);
 
-        // The views this plan draws; the others go.
-        if view_entities.0.len() != 2 {
-            despawn_view_entities(commands, core::mem::take(&mut view_entities.0));
-            view_entities.0 = vec![Entity::PLACEHOLDER; 2];
+        // The render views this plan draws; the others go.
+        if view_entities.len() != 2 {
+            despawn_view_entities(commands, core::mem::take(view_entities));
+            *view_entities = vec![Entity::PLACEHOLDER; 2];
         }
         let draws_static = plan.draws_static();
         let draws_movers = match plan {
@@ -774,7 +908,7 @@ impl SpotShadowCaches {
             _ => true,
         };
         for (index, needed) in [draws_static, draws_movers].into_iter().enumerate() {
-            let entity = &mut view_entities.0[index];
+            let entity = &mut view_entities[index];
             if needed && *entity == Entity::PLACEHOLDER {
                 *entity = commands.spawn_empty().id();
             } else if !needed && *entity != Entity::PLACEHOLDER {
@@ -804,13 +938,6 @@ impl SpotShadowCaches {
             }
         };
 
-        let spot_world_from_view = spot_light_world_from_view(&args.light.transform);
-        let angle = args
-            .light
-            .spot_light_angles
-            .expect("a cached light should be a spot light")
-            .1;
-        let spot_projection = spot_light_clip_from_view(angle, args.light.shadow_map_near_z);
         let region = ShadowMapRegion {
             texture: destination.texture,
             layer: args.layer,
@@ -835,13 +962,7 @@ impl SpotShadowCaches {
                               region: ShadowMapRegion,
                               depth_attachment: DepthStencilViewAttachment|
          -> ShadowPassRecord {
-            let key = ShadowViewKey {
-                light: args.light_main_entity,
-                camera: None,
-                subview: 0,
-                role,
-                region,
-            };
+            let key = ShadowViewKey { id, role, region };
             let record = ShadowPassRecord::default();
             let role_name = match role {
                 ShadowViewRole::Full => "",
@@ -851,7 +972,7 @@ impl SpotShadowCaches {
             commands.entity(entity).insert((
                 ShadowView {
                     depth_attachment,
-                    pass_name: format!("shadow_spot_light_{}{role_name}", args.light_index),
+                    pass_name: format!("{}{role_name}", args.pass_name),
                 },
                 ExtractedView {
                     retained_view_entity: key.retained_view_entity(),
@@ -861,18 +982,16 @@ impl SpotShadowCaches {
                         region.size.x,
                         region.size.y,
                     ),
-                    world_from_view: GlobalTransform::from(spot_world_from_view),
-                    clip_from_view: spot_projection,
+                    world_from_view: args.world_from_view,
+                    clip_from_view: args.clip_from_view,
                     clip_from_world: None,
                     target_format: CORE_3D_SHADOW_MAP_FORMAT,
                     color_grading: Default::default(),
                     invert_culling: false,
                 },
-                *args.spot_light_frustum.unwrap(),
-                LightEntity::Spot {
-                    light_entity: args.light_entity,
-                },
-                args.light_render_layers.clone(),
+                *args.frustum.unwrap(),
+                args.light_kind,
+                args.render_layers.clone(),
                 RootNonCameraView(Core3d.intern()),
                 role.order(),
                 key,
@@ -906,7 +1025,7 @@ impl SpotShadowCaches {
                 Some(0.0),
                 None,
             );
-            let entity = view_entities.0[0];
+            let entity = view_entities[0];
             let role = if single_view {
                 ShadowViewRole::Full
             } else {
@@ -925,7 +1044,7 @@ impl SpotShadowCaches {
                 None,
                 None,
             );
-            let entity = view_entities.0[1];
+            let entity = view_entities[1];
             frame.movers_view = Some(spawn_view(
                 commands,
                 entity,
@@ -1016,15 +1135,15 @@ impl SpotShadowCaches {
         state.frame = Some(frame);
     }
 
-    /// Ends planning: a light that wasn't planned this frame (hidden, out of
-    /// view) no longer has a shadow map where it was drawn. Uploads the
-    /// frame's restore quads.
+    /// Ends planning: a view that wasn't planned this frame (its light
+    /// hidden, out of view) no longer has a shadow map where it was drawn.
+    /// Uploads the frame's restore quads.
     pub(crate) fn finish_frame(
         &mut self,
         render_device: &RenderDevice,
         render_queue: &RenderQueue,
     ) {
-        for state in self.lights.values_mut() {
+        for state in self.views.values_mut() {
             if !state.seen {
                 state.working = None;
                 state.working_view = None;
@@ -1151,13 +1270,13 @@ fn init_shadow_restore_pipeline(
     });
 }
 
-/// Restores rectangles of a cached light's static layer, or all of it, into
+/// Restores rectangles of a cached view's static layer, or all of it, into
 /// its shadow map before its movers view draws: one instanced quad per
-/// rectangle writing each texel's depth. [`SpotShadowCaches::prepare_light`]
+/// rectangle writing each texel's depth. [`ShadowViewCaches::prepare_view`]
 /// plans a restore only once the blit's pipeline is compiled.
 pub(crate) fn restore_shadow_map(world: &World, restore: &ShadowRestore, ctx: &mut RenderContext) {
     let Some(quads) = world
-        .resource::<SpotShadowCaches>()
+        .resource::<ShadowViewCaches>()
         .restore_quads
         .buffer()
         .filter(|_| !restore.quads.is_empty())
@@ -1199,7 +1318,7 @@ pub(crate) fn restore_shadow_map(world: &World, restore: &ShadowRestore, ctx: &m
     pass_span.end(&mut render_pass);
 }
 
-/// What [`acknowledge_spot_shadow_caches`] checks a static view's casters
+/// What [`acknowledge_shadow_caches`] checks a static view's casters
 /// against.
 #[derive(SystemParam)]
 pub(crate) struct ShadowViewReadiness<'w, 's> {
@@ -1272,10 +1391,10 @@ impl ShadowViewReadiness<'_, '_> {
         else {
             return false;
         };
-        let LightEntity::Spot { light_entity } = light_entity else {
-            return false;
-        };
         let retained_view_entity = view.retained_view_entity;
+        // The visible entities the view's pass drew, as it looked them up.
+        let (light_entity, visible_entities_key) =
+            shadow_map_visible_entities_key(light_entity, view);
         if self.gpu_preprocessing_support.max_supported_mode != GpuPreprocessingMode::None
             && (!has_preprocess_bind_groups
                 || !self
@@ -1300,9 +1419,9 @@ impl ShadowViewReadiness<'_, '_> {
         }
         let Some(visible_entities) = self
             .visible_entities
-            .get(*light_entity)
+            .get(light_entity)
             .ok()
-            .and_then(|visible_entities| visible_entities.subviews.get(&retained_view_entity))
+            .and_then(|visible_entities| visible_entities.subviews.get(&visible_entities_key))
             .and_then(|(_, visible_entities)| visible_entities.get::<Mesh3d>())
         else {
             // Nothing visible: nothing to wait for.
@@ -1376,21 +1495,23 @@ fn written_after_pass(written: &mut ShadowTileMask, movers_now: ShadowTileMask, 
     }
 }
 
-/// After the frame's passes: counts a cached light's static content and
+/// After the frame's passes: counts a cached view's static content and
 /// shadow map as valid only if the passes that drew them were recorded and
-/// every caster of the static view was ready, and reports to the main world.
-pub(crate) fn acknowledge_spot_shadow_caches(
-    mut caches: ResMut<SpotShadowCaches>,
+/// every caster of the static view was ready, and reports to the main world,
+/// by view and generation: a report on another generation acknowledges
+/// nothing.
+pub(crate) fn acknowledge_shadow_caches(
+    mut caches: ResMut<ShadowViewCaches>,
     feedback: Res<ShadowCacheFeedback>,
     readiness: ShadowViewReadiness,
     (mut reported, mut live, mut statuses): (
-        Local<EntityHashSet>,
-        Local<EntityHashSet>,
-        Local<Vec<(MainEntity, ShadowCacheLightStatus)>>,
+        Local<HashSet<ShadowViewId>>,
+        Local<HashSet<ShadowViewId>>,
+        Local<Vec<(ShadowViewId, ShadowCacheViewStatus)>>,
     ),
 ) {
     statuses.clear();
-    for state in caches.lights.values_mut() {
+    for (id, state) in caches.views.iter_mut() {
         if let Some(frame) = state.frame.take() {
             // A Fallback frame with live casters in the map is followed by
             // another Fallback (their tiles stay written), so whether its
@@ -1427,8 +1548,9 @@ pub(crate) fn acknowledge_spot_shadow_caches(
             }
             let has_layer = state.static_layer.is_some();
             statuses.push((
-                state.main_entity,
-                ShadowCacheLightStatus {
+                *id,
+                ShadowCacheViewStatus {
+                    generation: state.generation,
                     acknowledged_static_revision: if has_layer {
                         state.static_content
                     } else {
@@ -1442,24 +1564,19 @@ pub(crate) fn acknowledge_spot_shadow_caches(
         }
     }
 
-    // The lights no longer cached are forgotten; everything but the map's
+    // The views no longer cached are forgotten; everything but the map's
     // update is done before the lock.
     live.clear();
-    live.extend(
-        caches
-            .lights
-            .values()
-            .map(|state| state.main_entity.entity()),
-    );
-    reported.retain(|entity| !live.contains(entity));
+    live.extend(caches.views.keys().copied());
+    reported.retain(|id| !live.contains(id));
     let Ok(mut map) = feedback.0.lock() else {
         return;
     };
-    for entity in reported.iter() {
-        map.remove(entity);
+    for id in reported.iter() {
+        map.remove(id);
     }
-    for (main_entity, status) in statuses.drain(..) {
-        map.insert(main_entity.entity(), status);
+    for (id, status) in statuses.drain(..) {
+        map.insert(id, status);
     }
     drop(map);
     core::mem::swap(&mut *reported, &mut *live);
@@ -1504,6 +1621,40 @@ mod tests {
         }
         // Bevy's own keys are unchanged.
         assert_eq!(ShadowViewRole::Full.subview_index(3), 3);
+        // A spot light's views keep the keys they had before views had ids;
+        // a cascade's has its camera, a face its index.
+        let light = Entity::from_raw_u32(4).unwrap();
+        let camera = Entity::from_raw_u32(8).unwrap();
+        for role in [
+            ShadowViewRole::Full,
+            ShadowViewRole::Static,
+            ShadowViewRole::Movers,
+        ] {
+            assert_eq!(
+                retained_shadow_view(&ShadowViewId::spot(light), role),
+                RetainedViewEntity::new(MainEntity::from(light), None, role.subview_index(0))
+            );
+            let cascade = ShadowViewId {
+                light,
+                subview: bevy_light::ShadowSubview::Directional { camera, cascade: 1 },
+            };
+            assert_eq!(
+                retained_shadow_view(&cascade, role),
+                RetainedViewEntity::new(
+                    MainEntity::from(light),
+                    Some(MainEntity::from(camera)),
+                    role.subview_index(1)
+                )
+            );
+            let face = ShadowViewId {
+                light,
+                subview: bevy_light::ShadowSubview::PointFace(3),
+            };
+            assert_eq!(
+                retained_shadow_view(&face, role),
+                RetainedViewEntity::new(MainEntity::from(light), None, role.subview_index(3))
+            );
+        }
         assert!(ShadowViewRole::Full.takes(true) && ShadowViewRole::Full.takes(false));
         assert!(ShadowViewRole::Static.takes(true) && !ShadowViewRole::Static.takes(false));
         assert!(!ShadowViewRole::Movers.takes(true) && ShadowViewRole::Movers.takes(false));
