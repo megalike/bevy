@@ -1412,6 +1412,17 @@ category = "3D Rendering"
 wasm = true
 
 [[example]]
+name = "shadow_cache_sun"
+path = "examples/3d/shadow_cache_sun.rs"
+doc-scrape-examples = true
+
+[package.metadata.example.shadow_cache_sun]
+name = "Shadow Cache: Sun"
+description = "A sun whose far cascade is cached, with stable far stand-ins for a camera-LOD terrain"
+category = "3D Rendering"
+wasm = false
+
+[[example]]
 name = "bloom_3d"
 path = "examples/3d/bloom_3d.rs"
 doc-scrape-examples = true

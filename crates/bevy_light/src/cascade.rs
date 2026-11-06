@@ -1,12 +1,16 @@
 //! Provides shadow cascade configuration and construction helpers.
 
 use bevy_camera::{Camera, Projection};
-use bevy_ecs::{entity::EntityHashMap, prelude::*};
+use bevy_ecs::{change_detection::DetectChangesMut, entity::EntityHashMap, prelude::*};
 use bevy_math::{ops, Mat4, Vec3A, Vec4};
 use bevy_reflect::prelude::*;
 use bevy_transform::components::GlobalTransform;
 
-use crate::{DirectionalLight, DirectionalLightShadowMap};
+use crate::{
+    stable_cascade::{far_coverage_radius, FarProjectionInputs, RetainedFarProjection},
+    DirectionalLight, DirectionalLightShadowMap, ShadowSceneBounds, StableFarCascade,
+    StableFarProjections,
+};
 
 /// Controls how cascaded shadow mapping works.
 /// Prefer using [`CascadeShadowConfigBuilder`] to construct an instance.
@@ -201,8 +205,12 @@ pub fn build_directional_light_cascades(
         &DirectionalLight,
         &CascadeShadowConfig,
         &mut Cascades,
+        Option<(&StableFarCascade, &mut StableFarProjections)>,
     )>,
+    scene_bounds: Option<Res<ShadowSceneBounds>>,
+    faults: Option<Res<crate::ShadowCacheFaults>>,
 ) {
+    let recenter = !faults.is_some_and(|faults| faults.miss_recenter);
     let views = views
         .iter()
         .filter_map(|(entity, transform, projection, camera)| {
@@ -213,12 +221,25 @@ pub fn build_directional_light_cascades(
             }
         })
         .collect::<Vec<_>>();
+    let scene_bounds = scene_bounds.and_then(|bounds| bounds.bounds());
 
-    for (transform, directional_light, cascades_config, mut cascades) in &mut lights {
+    for (transform, directional_light, cascades_config, mut cascades, mut stable_far) in &mut lights
+    {
         if !directional_light.shadow_maps_enabled {
             continue;
         }
         cascades.cascades.clear();
+        // MPS: a stable far cascade needs another cascade for close contacts.
+        // (Its retained state changes without the policy changing.)
+        let mut stable_far = stable_far
+            .as_mut()
+            .map(|(policy, projections)| (*policy, projections.bypass_change_detection()))
+            .filter(|_| cascades_config.bounds.len() >= 2);
+        if let Some((_, projections)) = stable_far.as_mut() {
+            projections
+                .retained
+                .retain(|camera, _| views.iter().any(|(view, ..)| view == camera));
+        }
 
         // It is very important to the numerical and thus visual stability of shadows that
         // `world_from_light` has orthogonal upper-left 3x3 and zero translation.
@@ -237,9 +258,32 @@ pub fn build_directional_light_cascades(
             let near_bounds = [cascades_config.minimum_distance]
                 .into_iter()
                 .chain(far_bounds.clone().map(|bound| overlap_factor * bound));
+            let last = cascades_config.bounds.len() - 1;
             let view_cascades = near_bounds
                 .zip(far_bounds)
-                .map(|(near_bound, far_bound)| {
+                .enumerate()
+                .map(|(index, (near_bound, far_bound))| {
+                    // MPS: the far cascade's stable projection, kept bit for
+                    // bit while the camera only turns.
+                    if index == last
+                        && let Some((stable_far, projections)) = stable_far.as_mut()
+                    {
+                        let inputs = FarProjectionInputs {
+                            rotation: transform.rotation(),
+                            camera: world_from_view.w_axis.truncate().into(),
+                            radius: far_coverage_radius(projection, near_bound, *far_bound),
+                            map_size: directional_light_shadow_map.size,
+                            guard: stable_far.guard,
+                            filter_texels: stable_far.filter_texels,
+                            scene_bounds,
+                        };
+                        let mut retained = projections.retained.remove(&view_entity);
+                        RetainedFarProjection::update(&mut retained, &inputs, recenter);
+                        let retained = retained.expect("built");
+                        let cascade = retained.cascade.clone();
+                        projections.retained.insert(view_entity, retained);
+                        return cascade;
+                    }
                     // Negate bounds as -z is camera forward direction.
                     let corners = projection.get_frustum_corners(-near_bound, -far_bound);
                     calculate_cascade(
