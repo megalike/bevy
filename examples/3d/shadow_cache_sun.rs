@@ -608,7 +608,9 @@ mod oracle {
             }
         }
         if let Ok(mut second) = second.single_mut() {
-            let active = !(ONE_CAMERA..STAND_INS_OFF).contains(&f);
+            // One camera owns the far layer in the quiet stretch too: with two,
+            // the layer is restored whole every frame and Kept never shows.
+            let active = !(ONE_CAMERA..STAND_INS_OFF).contains(&f) && !(QUIET..QUIET_END).contains(&f);
             if second.is_active != active {
                 second.is_active = active;
             }
