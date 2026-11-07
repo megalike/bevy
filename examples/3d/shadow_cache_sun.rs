@@ -52,8 +52,8 @@ const SETTLE: u32 = 10;
 const LOADED_AT: u32 = 40;
 /// The first and last checked frames, and the last frame.
 const CHECK_FROM: u32 = 70;
-const CHECK_TO: u32 = 900;
-const EXIT_AT: u32 = 920;
+const CHECK_TO: u32 = 980;
+const EXIT_AT: u32 = 1000;
 
 /// Terrain tiles: TILES x TILES of TILE meters, centered on the origin.
 const TILES: i32 = 8;
@@ -71,6 +71,10 @@ const CASTER_SPAWN: u32 = 660;
 const STAND_INS_OFF: u32 = 720;
 const CASTER_DESPAWN: u32 = 780;
 const FLY: u32 = 820;
+/// The camera holds and every mover stops: they settle, and the far cascade
+/// has nothing live (Kept), until QUIET_END, when they move on (promotions).
+const QUIET: u32 = 900;
+const QUIET_END: u32 = 950;
 /// The second camera is off from here to STAND_INS_OFF: the main camera owns the
 /// far layer, so its cached cascade restores tiles (Movers) instead of the
 /// whole layer.
@@ -374,7 +378,14 @@ fn swap_terrain_lods(
     }
 }
 
-fn move_movers(time: Res<Time>, mut movers: Query<(&Mover, &mut Transform)>) {
+fn move_movers(
+    time: Res<Time>,
+    frame: Res<FrameCount>,
+    mut movers: Query<(&Mover, &mut Transform)>,
+) {
+    if (QUIET..QUIET_END).contains(&frame.0) {
+        return;
+    }
     let t = time.elapsed_secs();
     for (mover, mut transform) in &mut movers {
         let angle = t * mover.speed;
@@ -516,9 +527,9 @@ mod oracle {
             }
             // Cut to the other side, then hold.
             f if (CUT..FLY).contains(&f) => look(Vec3::new(120.0, 12.0, -100.0), 2.4, -0.2),
-            // Flies fast along a line.
+            // Flies fast along a line, then holds where it stopped.
             f if f >= FLY => {
-                let t = (f - FLY) as f32;
+                let t = (f.min(QUIET) - FLY) as f32;
                 look(
                     Vec3::new(120.0 - 4.0 * t, 30.0, -100.0 + 3.0 * t),
                     2.0,
