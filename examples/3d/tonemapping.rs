@@ -3,7 +3,7 @@
 use bevy::{
     asset::UnapprovedPathMode,
     camera::Hdr,
-    core_pipeline::tonemapping::Tonemapping,
+    core_pipeline::tonemapping::{Tonemapping, TonemappingFinish},
     light::CascadeShadowConfigBuilder,
     platform::collections::HashMap,
     prelude::*,
@@ -52,6 +52,7 @@ fn main() {
                 resize_image,
                 toggle_scene,
                 toggle_tonemapping_method,
+                toggle_tonemapping_finish,
                 update_color_grading_settings,
                 update_ui,
             ),
@@ -392,9 +393,24 @@ fn update_color_grading_settings(
     }
 }
 
+fn toggle_tonemapping_finish(
+    keys: Res<ButtonInput<KeyCode>>,
+    camera: Single<(Entity, Has<TonemappingFinish>), With<Camera3d>>,
+    mut commands: Commands,
+) {
+    if keys.just_pressed(KeyCode::KeyF) {
+        let (camera, finish) = *camera;
+        if finish {
+            commands.entity(camera).remove::<TonemappingFinish>();
+        } else {
+            commands.entity(camera).insert(TonemappingFinish::default());
+        }
+    }
+}
+
 fn update_ui(
     mut text_query: Single<&mut Text, Without<SceneNumber>>,
-    settings: Single<(&Tonemapping, &ColorGrading)>,
+    settings: Single<(&Tonemapping, &ColorGrading, Has<TonemappingFinish>)>,
     current_scene: Res<CurrentScene>,
     selected_parameter: Res<SelectedParameter>,
     mut hide_ui: Local<bool>,
@@ -413,7 +429,7 @@ fn update_ui(
         return;
     }
 
-    let (tonemapping, color_grading) = *settings;
+    let (tonemapping, color_grading, finish) = *settings;
     let tonemapping = *tonemapping;
 
     let mut text = String::with_capacity(text_query.len());
@@ -506,6 +522,11 @@ fn update_ui(
         } else {
             ""
         }
+    ));
+
+    text.push_str(&format!(
+        "\n(F) Sharpening and triangular dither: {}\n",
+        if finish { "on" } else { "off" }
     ));
 
     text.push_str("\n\nColor Grading:\n");

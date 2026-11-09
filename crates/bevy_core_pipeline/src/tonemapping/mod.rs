@@ -8,8 +8,9 @@ use bevy_image::{CompressedImageFormats, Image, ImageSampler, ImageType};
 #[cfg(not(feature = "tonemapping_luts"))]
 use bevy_log::error;
 use bevy_log::warn;
+use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
-    extract_component::ExtractComponentPlugin,
+    extract_component::{ExtractComponent, ExtractComponentPlugin},
     extract_resource::{ExtractResource, ExtractResourcePlugin},
     render_asset::RenderAssets,
     render_resource::{
@@ -31,6 +32,43 @@ use bevy_utils::default;
 pub use node::tonemapping;
 
 use crate::FullscreenShader;
+
+/// MPS: a finish done inside the tonemapping pass of a [`Camera`] entity, so it costs no full-screen pass of its own:
+/// contrast-adaptive sharpening of the scene color before the tonemapping curve, and a monochrome triangular dither
+/// of the display value in place of [`DebandDither`]'s.
+///
+/// The sharpening runs on the cross of the pixel's four neighbors, by the luminance of the exposed scene color bounded
+/// to `L / (1 + L)`, so one bright pixel does not rule its neighbors and the color keeps its ratios; low local contrast
+/// takes none, so noise in flat areas is not amplified. It sees the input after any temporal anti-aliasing or
+/// upscaling, so their history never holds it. Hue rotation and white balance are not part of its luminance.
+#[derive(Component, Debug, Clone, Copy, Reflect, ExtractComponent, PartialEq)]
+#[extract_component_filter(With<Camera>)]
+#[reflect(Component, Debug, Default, PartialEq)]
+#[extract_app(RenderApp)]
+pub struct TonemappingFinish {
+    /// Sharpening strength, 0 (off) to 1. It is part of the pipeline key, quantized to thousandths: a new value
+    /// compiles a pipeline, during which the tonemapping pass is skipped, so set it once rather than animating it.
+    pub sharpening: f32,
+    /// A monochrome triangular dither of the encoded display value, one 1/255 step at its peak, fixed to the pixel;
+    /// replaces [`DebandDither::Enabled`] where both are set.
+    pub triangular_dither: bool,
+}
+
+impl Default for TonemappingFinish {
+    fn default() -> Self {
+        Self {
+            sharpening: 0.25,
+            triangular_dither: true,
+        }
+    }
+}
+
+impl TonemappingFinish {
+    /// The sharpening strength as the pipeline key holds it, thousandths.
+    fn sharpening_milli(&self) -> u16 {
+        (self.sharpening.clamp(0.0, 1.0) * 1000.0).round() as u16
+    }
+}
 
 /// 3D LUT (look up table) textures used for tonemapping
 #[derive(Resource, Clone, ExtractResource)]
@@ -88,6 +126,7 @@ impl Plugin for TonemappingPlugin {
         app.add_plugins((
             ExtractComponentPlugin::<Tonemapping>::default(),
             ExtractComponentPlugin::<DebandDither>::default(),
+            ExtractComponentPlugin::<TonemappingFinish>::default(),
         ));
 
         app.add_systems(PostUpdate, check_tonemapping_none);
@@ -175,6 +214,9 @@ pub struct TonemappingPipelineKey {
     deband_dither: DebandDither,
     tonemapping: Tonemapping,
     flags: TonemappingPipelineKeyFlags,
+    /// MPS: [`TonemappingFinish`]'s sharpening in thousandths (0: none) and its dither.
+    sharpening_milli: u16,
+    triangular_dither: bool,
 }
 
 impl SpecializedRenderPipeline for TonemappingPipeline {
@@ -192,8 +234,17 @@ impl SpecializedRenderPipeline for TonemappingPipeline {
             4,
         ));
 
-        if let DebandDither::Enabled = key.deband_dither {
+        if key.triangular_dither {
+            shader_defs.push("TRIANGULAR_DITHER".into());
+        } else if let DebandDither::Enabled = key.deband_dither {
             shader_defs.push("DEBAND_DITHER".into());
+        }
+        if key.sharpening_milli > 0 {
+            shader_defs.push("SHARPENING".into());
+            shader_defs.push(ShaderDefVal::UInt(
+                "SHARPENING_MILLI".into(),
+                key.sharpening_milli.into(),
+            ));
         }
 
         // Define shader flags depending on the color grading options in use.
@@ -320,11 +371,12 @@ pub fn prepare_view_tonemapping_pipelines(
             &ExtractedView,
             Option<&Tonemapping>,
             Option<&DebandDither>,
+            Option<&TonemappingFinish>,
         ),
         With<ViewTarget>,
     >,
 ) {
-    for (entity, view, tonemapping, dither) in view_targets.iter() {
+    for (entity, view, tonemapping, dither, finish) in view_targets.iter() {
         // As an optimization, we omit parts of the shader that are unneeded.
         let mut flags = TonemappingPipelineKeyFlags::empty();
         flags.set(
@@ -347,6 +399,8 @@ pub fn prepare_view_tonemapping_pipelines(
             deband_dither: *dither.unwrap_or(&DebandDither::Disabled),
             tonemapping: *tonemapping.unwrap_or(&Tonemapping::None),
             flags,
+            sharpening_milli: finish.map_or(0, TonemappingFinish::sharpening_milli),
+            triangular_dither: finish.is_some_and(|finish| finish.triangular_dither),
         };
         let pipeline = pipelines.specialize(&pipeline_cache, &upscaling_pipeline, key);
 
