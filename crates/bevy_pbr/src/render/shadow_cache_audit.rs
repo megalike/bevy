@@ -21,6 +21,7 @@ use bevy_render::{
     render_resource::*,
     renderer::{RenderDevice, RenderQueue},
     sync_world::RenderEntity,
+    view::ExtractedView,
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
 };
 use bevy_transform::TransformSystems;
@@ -793,7 +794,10 @@ fn audit_shadow_caches(
         Option<&PointAndSpotLightViewEntities>,
     )>,
     keys: Query<&ShadowViewKey>,
-    bindings: Query<&ViewShadowBindings>,
+    // Only the views prepared this frame: an inactive camera's render entity
+    // loses its `ExtractedView` but keeps the `ViewShadowBindings` of its last
+    // active frame (textures since replaced), and reads nothing.
+    bindings: Query<&ViewShadowBindings, With<ExtractedView>>,
     cluster_meta: Res<GlobalClusterableObjectMeta>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
@@ -807,10 +811,11 @@ fn audit_shadow_caches(
     let Some(settings) = pairs.settings.filter(|settings| settings.enabled) else {
         return;
     };
-    // The shadow map textures lighting reads: the same for every view.
+    // The shadow map textures lighting reads: the same for every view
+    // prepared this frame.
     let mut bound = bindings.iter();
     let binding = match bound.next() {
-        None => Err("no view binds a shadow map"),
+        None => Err("no prepared view binds a shadow map"),
         Some(first)
             if bound.any(|other| {
                 other.directional_light_depth_texture.id()
@@ -818,7 +823,7 @@ fn audit_shadow_caches(
                     || other.point_light_depth_texture.id() != first.point_light_depth_texture.id()
             }) =>
         {
-            Err("the views bind different shadow map textures")
+            Err("the prepared views bind different shadow map textures")
         }
         Some(first) => Ok(first),
     };
