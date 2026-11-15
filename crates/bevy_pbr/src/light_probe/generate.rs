@@ -1021,5 +1021,9 @@ pub fn generate_environment_map_light(
 }
 
 impl SyncComponent<RenderApp, EnvironmentMapGenerationPlugin> for GeneratedEnvironmentMapLight {
-    type Target = RenderEnvironmentMap;
+    type Target = (
+        RenderEnvironmentMap,
+        IntermediateTextures,
+        GeneratorBindGroups,
+    );
 }
