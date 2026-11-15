@@ -23,6 +23,10 @@ struct AtmosphereSettings {
     aerial_view_lut_max_distance: f32,
     sky_max_samples: u32,
     rendering_method: u32,
+    sun_glare_strength: f32,
+    sun_glare_wide: f32,
+    sun_highlight_knee: f32,
+    sun_glare_fade_deg: vec2<f32>,
 }
 
 /// "Atmosphere space" uses local up for the zenith so the horizon-detail

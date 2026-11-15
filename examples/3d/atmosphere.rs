@@ -64,6 +64,7 @@ fn print_controls() {
     println!("    2          - Switch to raymarched rendering method");
     println!("    3          - Switch to Earth atmosphere");
     println!("    4          - Switch to Mars atmosphere");
+    println!("    G          - Toggle the sun glare");
     println!("    Enter      - Pause/Resume sun motion");
     println!("    Up/Down    - Increase/Decrease exposure");
 }
@@ -111,6 +112,17 @@ fn atmosphere_controls(
         for mut settings in &mut camera_settings {
             settings.rendering_method = AtmosphereMode::Raymarched;
             println!("Switched to raymarched rendering method");
+        }
+    }
+
+    if keyboard_input.just_pressed(KeyCode::KeyG) {
+        for mut settings in &mut camera_settings {
+            settings.sun_glare_strength = if settings.sun_glare_strength > 0.0 {
+                0.0
+            } else {
+                0.15
+            };
+            println!("Sun glare strength: {}", settings.sun_glare_strength);
         }
     }
 

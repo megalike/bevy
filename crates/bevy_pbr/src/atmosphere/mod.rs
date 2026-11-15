@@ -55,7 +55,7 @@ use bevy_ecs::{
     system::{Commands, Query},
 };
 use bevy_light::{atmosphere::ScatteringMedium, Atmosphere};
-use bevy_math::{Mat4, Quat, UVec2, UVec3, Vec3};
+use bevy_math::{Mat4, Quat, UVec2, UVec3, Vec2, Vec3};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
     extract_component::{ExtractComponentPlugin, UniformComponentPlugin},
@@ -342,6 +342,40 @@ pub struct AtmosphereSettings {
 
     /// The rendering method to use for the atmosphere.
     pub rendering_method: AtmosphereMode,
+
+    /// The strength of the glare drawn around the sun disk on pixels that show the sky, as a
+    /// lens or an eye would spread a little of the sun's light around it.
+    ///
+    /// For the first directional light of the view, if it has a
+    /// [`SunDisk`](bevy_light::SunDisk) (further lights draw no glare), the sky gains the
+    /// light's illuminance reaching the camera (after the atmosphere's transmittance and the
+    /// planet's horizon) times `strength * (10 / b³ + wide / b²)` cd/m² per lux, where
+    /// `b = sqrt(a² + r²)`, `a` is the angle to the disk's center and `r` the disk's angular
+    /// radius, both in degrees, faded out between the angles of [`Self::sun_glare_fade_deg`].
+    /// The glare is scaled by the share of the disk that no geometry covers, estimated from the
+    /// depth buffer once per view, and is not drawn over geometry.
+    ///
+    /// `0.0` turns the glare off and compiles it out of the sky pass.
+    pub sun_glare_strength: f32,
+
+    /// The weight of the glare's wide `wide / b²` falloff, in cd/m² per lux with angles in
+    /// degrees; see [`Self::sun_glare_strength`].
+    pub sun_glare_wide: f32,
+
+    /// The angles from the sun's center, in degrees, over which the glare fades out: it is
+    /// whole below `x` and gone beyond `y`. `x` must be less than `y`.
+    pub sun_glare_fade_deg: Vec2,
+
+    /// Rolls off the sun's own light (its disk and glare) on sky pixels like a film's shoulder,
+    /// per channel and after the exposure. With `s` the sky's exposed light and `x` the sun's,
+    /// the sun's part becomes `knee * (s + x) / (knee + s + x) - knee * s / (knee + s)`: the
+    /// total approaches `knee`, the sky itself is left as it is, and the sun's falloff keeps
+    /// the color of the sun and the air.
+    ///
+    /// `0.0` turns the roll-off off. With the glare on, the disk's exposed value is then only
+    /// limited to 4096, with its hue kept, to keep it within the range of half-precision render
+    /// targets; with the glare off as well, the sky is drawn as without these settings.
+    pub sun_highlight_knee: f32,
 }
 
 impl Default for AtmosphereSettings {
@@ -359,6 +393,10 @@ impl Default for AtmosphereSettings {
             aerial_view_lut_max_distance: 3.2e4,
             sky_max_samples: 16,
             rendering_method: AtmosphereMode::LookupTexture,
+            sun_glare_strength: 0.0,
+            sun_glare_wide: 5.0,
+            sun_glare_fade_deg: Vec2::new(30.0, 40.0),
+            sun_highlight_knee: 0.0,
         }
     }
 }
@@ -378,6 +416,10 @@ pub struct GpuAtmosphereSettings {
     pub aerial_view_lut_max_distance: f32,
     pub sky_max_samples: u32,
     pub rendering_method: u32,
+    pub sun_glare_strength: f32,
+    pub sun_glare_wide: f32,
+    pub sun_highlight_knee: f32,
+    pub sun_glare_fade_deg: Vec2,
 }
 
 impl Default for GpuAtmosphereSettings {
@@ -401,6 +443,10 @@ impl From<AtmosphereSettings> for GpuAtmosphereSettings {
             aerial_view_lut_max_distance: s.aerial_view_lut_max_distance,
             sky_max_samples: s.sky_max_samples,
             rendering_method: s.rendering_method as u32,
+            sun_glare_strength: s.sun_glare_strength,
+            sun_glare_wide: s.sun_glare_wide,
+            sun_highlight_knee: s.sun_highlight_knee,
+            sun_glare_fade_deg: s.sun_glare_fade_deg,
         }
     }
 }

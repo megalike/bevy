@@ -245,6 +245,39 @@ fn sample_sun_radiance(ray_dir_ws: vec3<f32>) -> vec3<f32> {
     return sun_radiance;
 }
 
+/// The glare's factor of a directional light, the same for the whole view: the glare strength
+/// (`AtmosphereSettings::sun_glare_strength`) times the light's illuminance reaching the viewer
+/// (its color, the transmittance toward it and the share of its disk above the planet's
+/// horizon, as surfaces are lit), in lux; zero for a light without a sun disk. The pixel's part is
+/// `sun_glare_profile`.
+fn sun_glare_factor(light_i: u32) -> vec3<f32> {
+    let light = &lights.directional_lights[light_i];
+    let sun_angular_size = (*light).sun_disk_angular_size;
+    if sun_angular_size <= 0.0 || (*light).sun_disk_intensity <= 0.0 {
+        return vec3(0.0);
+    }
+    let view_pos = get_view_position();
+    let r = length(view_pos);
+    let mu_light = dot((*light).direction_to_light, normalize(view_pos));
+    return settings.sun_glare_strength * (*light).color.rgb * sample_transmittance_lut(r, mu_light)
+        * calculate_visible_sun_ratio(atmosphere, r, mu_light, sun_angular_size);
+}
+
+/// The glare's profile around a sun disk as seen along `ray_dir_ws`, in cd/m² per lux:
+/// `(10 / b³ + wide / b²)`, where `b = sqrt(a² + r²)`, `a` is the angle to the disk's center and
+/// `r` the disk's angular radius, both in degrees, faded out between the two fade angles
+/// (`AtmosphereSettings::sun_glare_fade_deg`).
+fn sun_glare_profile(to_light: vec3<f32>, ray_dir_ws: vec3<f32>, sun_angular_size: f32) -> f32 {
+    // The angle from the chord between the two unit vectors, 2 asin(c / 2) to third order: exact
+    // near the disk (no cancellation, unlike acos of a dot product), 0.1 % short at 40 degrees.
+    let chord = length(to_light - ray_dir_ws);
+    let a = degrees(chord * (1.0 + chord * chord * (1.0 / 24.0)));
+    let disk_radius = degrees(sun_angular_size * 0.5);
+    let b2 = a * a + disk_radius * disk_radius;
+    let fade = 1.0 - smoothstep(settings.sun_glare_fade_deg.x, settings.sun_glare_fade_deg.y, a);
+    return (10.0 * inverseSqrt(b2) + settings.sun_glare_wide) / b2 * fade;
+}
+
 fn calculate_visible_sun_ratio(atmosphere: Atmosphere, r: f32, mu: f32, sun_angular_size: f32) -> f32 {
     let inner_radius = atmosphere.inner_radius;
     // Calculate the angle between horizon and sun center

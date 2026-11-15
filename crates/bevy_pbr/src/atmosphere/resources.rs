@@ -172,23 +172,54 @@ impl FromWorld for RenderSkyBindGroupLayouts {
             &BindGroupLayoutEntries::with_indices(
                 ShaderStages::FRAGMENT,
                 (
-                    (0, uniform_buffer::<GpuAtmosphere>(true)),
-                    (1, uniform_buffer::<GpuAtmosphereSettings>(true)),
+                    // The vertex stage reads the atmosphere, the settings, the view, the lights,
+                    // the transmittance table and the depth when it computes, once per view, each
+                    // sun's glare factor: its light reaching the viewer and how much of its disk
+                    // geometry covers.
+                    (
+                        0,
+                        uniform_buffer::<GpuAtmosphere>(true)
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
+                    (
+                        1,
+                        uniform_buffer::<GpuAtmosphereSettings>(true)
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
                     (2, uniform_buffer::<AtmosphereTransform>(true)),
-                    (3, uniform_buffer::<ViewUniform>(true)),
-                    (4, uniform_buffer::<GpuLights>(true)),
+                    (
+                        3,
+                        uniform_buffer::<ViewUniform>(true)
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
+                    (
+                        4,
+                        uniform_buffer::<GpuLights>(true).visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
                     // scattering medium luts and sampler
                     (5, texture_2d(TextureSampleType::default())),
                     (6, texture_2d(TextureSampleType::default())),
                     (7, sampler(SamplerBindingType::Filtering)),
                     // atmosphere luts and sampler
-                    (8, texture_2d(TextureSampleType::default())), // transmittance
+                    (
+                        8,
+                        texture_2d(TextureSampleType::default())
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ), // transmittance
                     (9, texture_2d(TextureSampleType::default())), // multiscattering
                     (10, texture_2d(TextureSampleType::default())), // sky view
                     (11, texture_3d(TextureSampleType::default())), // aerial view
-                    (12, sampler(SamplerBindingType::Filtering)),
+                    (
+                        12,
+                        sampler(SamplerBindingType::Filtering)
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
                     // view depth texture
-                    (13, texture_2d(TextureSampleType::Depth)),
+                    (
+                        13,
+                        texture_2d(TextureSampleType::Depth)
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
                 ),
             ),
         );
@@ -198,23 +229,54 @@ impl FromWorld for RenderSkyBindGroupLayouts {
             &BindGroupLayoutEntries::with_indices(
                 ShaderStages::FRAGMENT,
                 (
-                    (0, uniform_buffer::<GpuAtmosphere>(true)),
-                    (1, uniform_buffer::<GpuAtmosphereSettings>(true)),
+                    // The vertex stage reads the atmosphere, the settings, the view, the lights,
+                    // the transmittance table and the depth when it computes, once per view, each
+                    // sun's glare factor: its light reaching the viewer and how much of its disk
+                    // geometry covers.
+                    (
+                        0,
+                        uniform_buffer::<GpuAtmosphere>(true)
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
+                    (
+                        1,
+                        uniform_buffer::<GpuAtmosphereSettings>(true)
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
                     (2, uniform_buffer::<AtmosphereTransform>(true)),
-                    (3, uniform_buffer::<ViewUniform>(true)),
-                    (4, uniform_buffer::<GpuLights>(true)),
+                    (
+                        3,
+                        uniform_buffer::<ViewUniform>(true)
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
+                    (
+                        4,
+                        uniform_buffer::<GpuLights>(true).visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
                     // scattering medium luts and sampler
                     (5, texture_2d(TextureSampleType::default())),
                     (6, texture_2d(TextureSampleType::default())),
                     (7, sampler(SamplerBindingType::Filtering)),
                     // atmosphere luts and sampler
-                    (8, texture_2d(TextureSampleType::default())), // transmittance
+                    (
+                        8,
+                        texture_2d(TextureSampleType::default())
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ), // transmittance
                     (9, texture_2d(TextureSampleType::default())), // multiscattering
                     (10, texture_2d(TextureSampleType::default())), // sky view
                     (11, texture_3d(TextureSampleType::default())), // aerial view
-                    (12, sampler(SamplerBindingType::Filtering)),
+                    (
+                        12,
+                        sampler(SamplerBindingType::Filtering)
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
                     // view depth texture
-                    (13, texture_2d_multisampled(TextureSampleType::Depth)),
+                    (
+                        13,
+                        texture_2d_multisampled(TextureSampleType::Depth)
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
                 ),
             ),
         );
@@ -304,6 +366,10 @@ pub(crate) struct RenderSkyPipelineId(pub CachedRenderPipelineId);
 pub(crate) struct RenderSkyPipelineKey {
     pub msaa_samples: u32,
     pub dual_source_blending: bool,
+    /// Whether the view draws a glare around the sun disks
+    /// ([`AtmosphereSettings::sun_glare_strength`](super::AtmosphereSettings::sun_glare_strength)
+    /// above zero).
+    pub sun_glare: bool,
 }
 
 impl SpecializedRenderPipeline for RenderSkyBindGroupLayouts {
@@ -318,6 +384,22 @@ impl SpecializedRenderPipeline for RenderSkyBindGroupLayouts {
         if key.dual_source_blending {
             shader_defs.push("DUAL_SOURCE_BLENDING".into());
         }
+        if key.sun_glare {
+            shader_defs.push("SUN_GLARE".into());
+        }
+
+        // With the glare, the pass's own vertex stage draws the fullscreen triangle and estimates,
+        // once per view, how much of each sun disk is covered by geometry.
+        let vertex = if key.sun_glare {
+            VertexState {
+                shader: self.fragment_shader.clone(),
+                shader_defs: shader_defs.clone(),
+                entry_point: Some("vertex".into()),
+                ..default()
+            }
+        } else {
+            self.fullscreen_shader.to_vertex_state()
+        };
 
         let dst_factor = if key.dual_source_blending {
             BlendFactor::Src1
@@ -332,7 +414,7 @@ impl SpecializedRenderPipeline for RenderSkyBindGroupLayouts {
             } else {
                 self.render_sky_msaa.clone()
             }],
-            vertex: self.fullscreen_shader.to_vertex_state(),
+            vertex,
             fragment: Some(FragmentState {
                 shader: self.fragment_shader.clone(),
                 shader_defs,
@@ -364,14 +446,17 @@ impl SpecializedRenderPipeline for RenderSkyBindGroupLayouts {
 }
 
 pub(super) fn queue_render_sky_pipelines(
-    views: Query<(Entity, &Msaa), (With<Camera>, With<ExtractedAtmosphere>)>,
+    views: Query<
+        (Entity, &Msaa, &GpuAtmosphereSettings),
+        (With<Camera>, With<ExtractedAtmosphere>),
+    >,
     pipeline_cache: Res<PipelineCache>,
     layouts: Res<RenderSkyBindGroupLayouts>,
     mut specializer: ResMut<SpecializedRenderPipelines<RenderSkyBindGroupLayouts>>,
     render_device: Res<RenderDevice>,
     mut commands: Commands,
 ) {
-    for (entity, msaa) in &views {
+    for (entity, msaa, settings) in &views {
         let id = specializer.specialize(
             &pipeline_cache,
             &layouts,
@@ -380,6 +465,7 @@ pub(super) fn queue_render_sky_pipelines(
                 dual_source_blending: render_device
                     .features()
                     .contains(WgpuFeatures::DUAL_SOURCE_BLENDING),
+                sun_glare: settings.sun_glare_strength > 0.0,
             },
         );
         commands.entity(entity).insert(RenderSkyPipelineId(id));
