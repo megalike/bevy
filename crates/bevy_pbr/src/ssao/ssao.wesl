@@ -141,7 +141,9 @@ fn ssao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let uv = (vec2<f32>(pixel_coordinates) + 0.5) / view.main_pass_viewport.zw;
 
     var pixel_depth = calculate_neighboring_depth_differences(pixel_coordinates);
-    pixel_depth += 0.00001; // Avoid depth precision issues
+    // Avoid depth precision issues. A constant offset of the reverse-z depth grows with the square of the
+    // distance and lifts far surfaces off themselves, so cap it at 0.3% of the depth (the sky keeps it).
+    pixel_depth += select(0.00001, min(0.00001, pixel_depth * 0.003), pixel_depth > 0.0);
 
     let pixel_position = reconstruct_view_space_position(pixel_depth, uv);
     let normals_size = vec2<f32>(textureDimensions(normals));
