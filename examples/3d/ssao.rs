@@ -29,7 +29,7 @@ fn setup(
 ) {
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(-2.0, 2.0, -2.0).looking_at(Vec3::ZERO, Vec3::Y),
+        near_view(),
         Hdr,
         Msaa::Off,
         ScreenSpaceAmbientOcclusion::default(),
@@ -54,8 +54,14 @@ fn setup(
     ));
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::default())),
-        MeshMaterial3d(material),
+        MeshMaterial3d(material.clone()),
         Transform::from_xyz(1.0, 0.0, 0.0),
+    ));
+    // A large ground plane, to show SSAO on distant surfaces (F switches to a far view).
+    commands.spawn((
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(4000.0, 4000.0))),
+        MeshMaterial3d(material),
+        Transform::from_xyz(0.0, -1.5, 0.0),
     ));
     commands.spawn((
         Mesh3d(meshes.add(Sphere::new(0.4).mesh().uv(72, 36))),
@@ -87,14 +93,23 @@ fn setup(
     ));
 }
 
+fn near_view() -> Transform {
+    Transform::from_xyz(-2.0, 2.0, -2.0).looking_at(Vec3::ZERO, Vec3::Y)
+}
+
+fn far_view() -> Transform {
+    Transform::from_xyz(-200.0, 150.0, -200.0).looking_at(Vec3::new(200.0, -1.5, 200.0), Vec3::Y)
+}
+
 fn update(
     camera: Single<
         (
             Entity,
+            &mut Transform,
             Option<&ScreenSpaceAmbientOcclusion>,
             Option<&TemporalJitter>,
         ),
-        With<Camera>,
+        (With<Camera>, Without<SphereMarker>),
     >,
     mut text: Single<&mut Text>,
     mut sphere: Single<&mut Transform, With<SphereMarker>>,
@@ -104,7 +119,7 @@ fn update(
 ) {
     sphere.translation.y = ops::sin(time.elapsed_secs() / 1.7) * 0.7;
 
-    let (camera_entity, ssao, temporal_jitter) = *camera;
+    let (camera_entity, mut camera_transform, ssao, temporal_jitter) = camera.into_inner();
     let current_ssao = ssao.cloned().unwrap_or_default();
 
     let mut commands = commands.entity(camera_entity);
@@ -166,6 +181,13 @@ fn update(
             },
             || keycode.just_pressed(KeyCode::ArrowLeft),
         );
+    if keycode.just_pressed(KeyCode::KeyF) {
+        *camera_transform = if *camera_transform == near_view() {
+            far_view()
+        } else {
+            near_view()
+        };
+    }
     if keycode.just_pressed(KeyCode::Digit1) {
         commands.remove::<ScreenSpaceAmbientOcclusion>();
     }
@@ -210,6 +232,8 @@ fn update(
         Some(_) => "(Space) Enabled",
         None => "(Space) Disabled",
     });
+
+    text.push_str("\n\n(F) Near / far view");
 }
 
 #[derive(Component)]
